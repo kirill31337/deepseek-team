@@ -17,6 +17,14 @@ BLOCK = (b'\n\n' + BEGIN + b'\n[model_providers.deepseek]\n' +
          b'\n' + END + b'\n')
 
 
+CODEX_HOOK_COMMAND = 'deepseek-team coordinator-hook'
+CODEX_HOOK_EVENTS = {
+    'SessionStart': {'matcher': 'startup|resume|clear|compact', 'context': True},
+    'UserPromptSubmit': {'matcher': None, 'context': True},
+    'PreToolUse': {'matcher': 'Bash|apply_patch|Edit|Write', 'context': False},
+    'Stop': {'matcher': None, 'context': False},
+}
+
 class ConfigError(Exception):
     pass
 
@@ -123,6 +131,131 @@ def remove_provider(home):
     parse_config(updated)
     write_config(home, raw, updated)
     return True
+
+
+def _hook_group(spec):
+    handler = {
+        'type': 'command',
+        'command': CODEX_HOOK_COMMAND,
+        'timeout': 10,
+        'statusMessage': 'DeepSeek Team coordination policy',
+    }
+    if spec.get('context'):
+        handler['additionalContextLimit'] = 2400
+    group = {'hooks': [handler]}
+    if spec.get('matcher') is not None:
+        group['matcher'] = spec['matcher']
+    return group
+
+
+def _strip_codex_hooks(data):
+    hooks = data.get('hooks', {})
+    if hooks is None:
+        hooks = {}
+    if not isinstance(hooks, dict):
+        raise ConfigError('Codex hooks.json hooks must be an object.')
+    changed = False
+    for event in list(hooks):
+        groups = hooks[event]
+        if not isinstance(groups, list):
+            raise ConfigError('Codex hooks.json event entries must be arrays.')
+        kept = []
+        for group in groups:
+            if not isinstance(group, dict):
+                kept.append(group)
+                continue
+            handlers = group.get('hooks')
+            if not isinstance(handlers, list):
+                kept.append(group)
+                continue
+            filtered = [handler for handler in handlers if not (
+                isinstance(handler, dict) and handler.get('command') == CODEX_HOOK_COMMAND)]
+            if len(filtered) != len(handlers):
+                changed = True
+            if filtered:
+                copy = dict(group)
+                copy['hooks'] = filtered
+                kept.append(copy)
+        if kept:
+            hooks[event] = kept
+        else:
+            hooks.pop(event, None)
+    if hooks:
+        data['hooks'] = hooks
+    else:
+        data.pop('hooks', None)
+    return changed
+
+
+def install_codex_hooks(home):
+    """Install one stable user-level hook definition; projects opt in via init."""
+    home = Path(home)
+    home.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path = home / 'hooks.json'
+    raw = read_regular(path)
+    try:
+        data = json.loads((raw or b'{}').decode('utf-8'))
+    except (ValueError, UnicodeError):
+        raise ConfigError('Codex hooks.json is invalid; existing content was preserved.') from None
+    if not isinstance(data, dict):
+        raise ConfigError('Codex hooks.json must contain an object.')
+    _strip_codex_hooks(data)
+    hooks = data.setdefault('hooks', {})
+    for event, spec in CODEX_HOOK_EVENTS.items():
+        hooks.setdefault(event, []).append(_hook_group(spec))
+    updated = (json.dumps(data, indent=2, sort_keys=True) + '\n').encode()
+    if raw == updated:
+        return False
+    mode = stat.S_IMODE(path.stat().st_mode) if raw is not None else 0o600
+    atomic_write(path, updated, raw, mode)
+    return True
+
+
+def remove_codex_hooks(home):
+    home = Path(home)
+    path = home / 'hooks.json'
+    raw = read_regular(path)
+    if raw is None:
+        return False
+    try:
+        data = json.loads(raw.decode('utf-8'))
+    except (ValueError, UnicodeError):
+        raise ConfigError('Codex hooks.json is invalid; no hooks were removed.') from None
+    if not isinstance(data, dict):
+        raise ConfigError('Codex hooks.json must contain an object.')
+    changed = _strip_codex_hooks(data)
+    if not changed:
+        return False
+    if data:
+        updated = (json.dumps(data, indent=2, sort_keys=True) + '\n').encode()
+        atomic_write(path, updated, raw, stat.S_IMODE(path.stat().st_mode))
+    else:
+        if read_regular(path) != raw:
+            raise ConfigError('Codex hooks.json changed concurrently; retry.')
+        path.unlink()
+        sync_directory(home)
+    return True
+
+
+def codex_hooks_status(home):
+    raw = read_regular(Path(home) / 'hooks.json')
+    if raw is None:
+        return False
+    try:
+        data = json.loads(raw.decode('utf-8'))
+    except (ValueError, UnicodeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    count = 0
+    for groups in data.get('hooks', {}).values():
+        if not isinstance(groups, list):
+            continue
+        for group in groups:
+            for handler in group.get('hooks', []) if isinstance(group, dict) else []:
+                if isinstance(handler, dict) and handler.get('command') == CODEX_HOOK_COMMAND:
+                    count += 1
+    return count == len(CODEX_HOOK_EVENTS)
 
 
 def save_key(value):
