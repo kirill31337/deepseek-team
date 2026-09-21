@@ -1,3 +1,70 @@
+# Version 0.5.0 verification
+
+Date: 2026-09-22. Release scope: persistent coordinator task state, observable delegation-process enforcement for Codex, managed worker accounting/readiness, selective source preparation, and preserved 25/50/75 access semantics.
+
+## Final release-candidate gate
+
+Code SHA **377c33f11043ecf593b610f5471db43fd39f4848** passed all three release gates:
+
+- GitHub Actions **Tests** run **35667826235**:
+  - Python **3.11, 3.12 and 3.13** all passed;
+  - Python 3.11 reported `Ran 212 tests` and `OK (skipped=12)`;
+  - both wheel and sdist built successfully;
+  - both console aliases reported `deepseek-team 0.5.0`;
+  - Ubuntu Bubblewrap/AppArmor smoke passed.
+- GitHub Actions **Delegation verification** run **35667826277**:
+  - installed **Codex CLI 0.155.1** and **Claude Code 2.1.278**;
+  - the real worker-permission suite reported `Ran 9 tests ... OK`;
+  - the existing demo still reported: `25/read-only PASS; 50/full-access fix+test PASS; 75/full-access three parallel copies + integrated tests PASS; 75/read-only PASS`;
+  - a separate real Codex coordinator/new-session test reported `Ran 1 test ... OK`;
+  - that coordinator test observed a real lifecycle hook, registered a distribution, attempted duplicate source mutation, and verified the PreToolUse denial occurred before the file changed.
+- GitHub Actions **Release verification** run **35667826281**:
+  - built `codex_deepseek_team-0.5.0.tar.gz` and `codex_deepseek_team-0.5.0-py3-none-any.whl`;
+  - clean-installed the wheel and verified `deepseek-team 0.5.0`;
+  - installed **v0.4.0** through its normal `install.py`, created a 75/full-access attached Codex project and private credential, then upgraded the same prefix with 0.5.0;
+  - verified project settings, credential hash and existing managed project binding were preserved;
+  - verified the stable user-level Codex hook set was installed automatically on update without re-running project `init`;
+  - invoked the installed 0.5.0 coordinator hook in a fresh synthetic session and observed the pre-plan mutation denial;
+  - uploaded the release-candidate distribution artifact.
+
+No live DeepSeek inference or paid provider request was required for these gates. Real Codex/Claude binaries were driven against local offline provider fixtures where model protocol behavior was needed.
+
+## Regression for the reported 75/full-access failure mode
+
+The required regression is covered by coordination policy tests and Codex lifecycle integration:
+
+- a substantial 75/full-access plan that delegates one implementation but keeps separable tests, fixtures and documentation with the coordinator under reasons such as "quality ownership" or "release work" is rejected as insufficient distribution;
+- merely having any worker/review assignment is not accepted as proof that 75% is being applied;
+- 50/full-access cannot be satisfied by a review-only worker when worker-eligible implementation/test/docs work exists;
+- technical reasons such as unavailable dependencies must be recorded from runner/preflight evidence rather than free-form coordinator prose;
+- self-asserted `user_explicit` metadata is not treated as deterministic proof of a semantic user instruction;
+- genuinely small work can stay local, but the small-task exemption is structurally limited to one concrete non-wildcard scope;
+- new unplanned source scope after a worker result is blocked until the distribution is revised.
+
+## Persistent state and attribution
+
+The coordination ledger persists session/task/deliverable/assignment/workspace ids, criteria, dependencies, checks, results, dispositions and structured constraints outside the repository. SessionStart after compaction re-injects the recorded task state, including completed review results.
+
+Managed runner start/finish accounting is automatic. Coordinator-prepared source imported with `workspace import` is snapshotted before worker execution and kept separate from worker-only file deltas. Declared checks are run after the worker inside the same sparse sandbox and stored with exit codes.
+
+Missing command/path/check requirements are detected before provider credential access. A command visible only on the host PATH is rejected if it is unavailable inside the actual worker sandbox.
+
+## Coordinator integration limits
+
+Codex enforcement uses supported lifecycle hooks. `PreToolUse` can deny supported mutation calls before execution and `Stop` can force a continuation when task state is incomplete. DeepSeek Team installs one stable user-level hook definition and activates it only for repositories previously attached with the package-managed Codex block.
+
+**Codex itself owns hook trust.** DeepSeek Team neither bypasses nor claims to infer that native trust state. CI uses Codex's explicit test-only trust bypass so the hook mechanics are reproducible without interactive UI.
+
+Claude Code receives the same managed instructions, persistent ledger and worker accounting, but coordinator distribution enforcement is **instruction-driven** in 0.5.0; no Claude PreToolUse technical gate is claimed.
+
+Hooks are not presented as a universal interception boundary. Future/specialized Codex tool surfaces that do not traverse the supported lifecycle hook path require re-verification.
+
+## Review note
+
+A GitHub Copilot Code Review was requested through GitHub's official reviewer API on PR #1. The repository/account did not retain the Copilot reviewer request and no Copilot review was produced, so this release does **not** claim an independent Copilot review. A separate manual diff/security review found and fixed additional issues before the final gate, including Edit/Write hook-path handling and removal of a self-asserted user-override bypass.
+
+---
+
 # Version 0.4.0 verification
 
 Date: 2026-09-21. Release scope: configurable 25/50/75 delegation profiles, independent read-only/full-access policy, reusable managed development copies, and preserved legacy exact-file writer behavior. Release publication follows a green final release-candidate gate on this same implementation line.
