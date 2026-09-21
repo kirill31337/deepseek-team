@@ -95,6 +95,39 @@ class StateAndDistributionTests(CoordinationCase):
         })
         self.assertEqual(coordination.validate_task(self.repo, task["id"]), [])
 
+    def test_technical_retention_reason_requires_runner_record_not_free_text(self):
+        task = self.start()
+        coordination.plan_task(self.repo, task["id"], {
+            "classification": "substantial",
+            "deliverables": [
+                {"id": "impl", "kind": "implementation", "scope": ["a.py"],
+                 "executor": "coordinator",
+                 "retention": {"code": "runner_unavailable", "evidence": "I claim the runner is unavailable"},
+                 "acceptance": ["done"], "dependencies": [], "checks": []},
+                {"id": "review", "kind": "review", "scope": ["a.py"],
+                 "executor": "worker", "acceptance": ["findings"], "dependencies": [], "checks": []},
+            ],
+        })
+        issues = coordination.validate_task(self.repo, task["id"])
+        self.assertTrue(any("impl" in issue for issue in issues), issues)
+        coordination.record_constraint(self.repo, task["id"], "impl",
+                                       "runner_unavailable", "runtime capability probe failed")
+        self.assertEqual(coordination.validate_task(self.repo, task["id"]), [])
+
+    def test_50_full_access_review_only_does_not_satisfy_implementation_delegation(self):
+        task = self.start(50, "full-access")
+        coordination.plan_task(self.repo, task["id"], {
+            "classification": "substantial",
+            "deliverables": [
+                {"id": "impl", "kind": "implementation", "scope": ["a.py"],
+                 "executor": "coordinator", "acceptance": ["done"], "dependencies": [], "checks": []},
+                {"id": "review", "kind": "review", "scope": ["a.py"],
+                 "executor": "worker", "acceptance": ["review"], "dependencies": [], "checks": []},
+            ],
+        })
+        issues = coordination.validate_task(self.repo, task["id"])
+        self.assertTrue(any("implementation" in item.lower() for item in issues), issues)
+
     def test_readonly_override_never_expands_write_access(self):
         task = self.start(75, "read-only")
         coordination.plan_task(self.repo, task["id"], {
