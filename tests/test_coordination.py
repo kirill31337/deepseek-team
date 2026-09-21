@@ -351,6 +351,30 @@ class CodexHookTests(CoordinationCase):
         self.assertEqual(same["id"], task["id"])
         self.assertEqual(same["assignments"][0]["result_summary"], "important finding")
 
+    def test_pretooluse_tracks_edit_and_write_file_paths(self):
+        self.hook("UserPromptSubmit", prompt="implement feature")
+        task = coordination.latest_task(self.repo, "sess-1")
+        coordination.plan_task(self.repo, task["id"], {
+            "classification": "substantial",
+            "deliverables": [
+                {"id": "impl", "kind": "implementation", "scope": ["a.py"],
+                 "executor": "worker", "acceptance": ["done"], "dependencies": [], "checks": []},
+            ],
+        })
+        for tool_name, tool_input in [
+            ("Edit", {"file_path": "a.py", "old_string": "1", "new_string": "2"}),
+            ("Write", {"path": "a.py", "content": "VALUE = 2\n"}),
+        ]:
+            with self.subTest(tool=tool_name):
+                denied = self.hook("PreToolUse", tool_name=tool_name,
+                                   tool_use_id="tool-" + tool_name.lower(),
+                                   tool_input=tool_input)
+                self.assertEqual(
+                    denied["hookSpecificOutput"]["permissionDecision"], "deny")
+                self.assertIn(
+                    "pending worker",
+                    denied["hookSpecificOutput"]["permissionDecisionReason"].lower())
+
     def test_pretooluse_blocks_coordinator_edit_before_valid_distribution(self):
         self.hook("UserPromptSubmit", prompt="implement feature")
         denied = self.hook("PreToolUse", tool_name="apply_patch",
