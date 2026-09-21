@@ -10,7 +10,7 @@ import unittest
 from unittest import mock
 from contextlib import redirect_stdout
 
-from codex_deepseek_team import delegation_cli, doctor, project, sandbox, settings, worker
+from codex_deepseek_team import delegation_cli, development, doctor, project, sandbox, settings, worker
 
 
 class RepoCase(unittest.TestCase):
@@ -112,6 +112,29 @@ class PolicyResolutionTests(RepoCase):
         self.assertEqual(shown['delegation_level'], 75)
         self.assertEqual(shown['effective_access'], 'read-only')
         self.assertIn('project:', shown['sources']['access'])
+
+
+class ManagedRuntimeMountTests(RepoCase):
+    def test_home_npm_runtime_mounts_package_not_entire_user_prefix(self):
+        prefix = self.home / '.local'
+        package = prefix / 'lib/node_modules/@vendor/runtime'
+        package.mkdir(parents=True)
+        target = package / 'cli.js'
+        target.write_text('console.log("fixture")\n')
+        launcher = prefix / 'bin/runtime'
+        launcher.parent.mkdir(parents=True)
+        launcher.symlink_to(Path('../lib/node_modules/@vendor/runtime/cli.js'))
+
+        with mock.patch.object(development.sys, 'executable', '/usr/bin/python3'), \
+             mock.patch.object(development.sys, 'base_prefix', '/usr'), \
+             mock.patch.object(development.shutil, 'which', return_value='/usr/bin/node'):
+            roots = development.runtime_roots([str(launcher)])
+
+        self.assertNotIn(prefix, roots)
+        self.assertIn(launcher, roots)
+        self.assertIn(package, roots)
+        for root in roots:
+            self.assertNotEqual(root, self.home)
 
 
 class LegacyCompatibilityTests(unittest.TestCase):
