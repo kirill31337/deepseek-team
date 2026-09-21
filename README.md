@@ -333,15 +333,20 @@ Bubblewrap + AppArmor materially tighten host isolation, but DeepSeek Team is **
 
 ```bash
 deepseek-team sandbox status
+deepseek-team config show --effective
 deepseek-team doctor --runtime codex --offline
 deepseek-team doctor --runtime claude --offline
 deepseek-team doctor --runtime both --offline
+
+# Verify the managed full-access capability surface selected by policy
+deepseek-team doctor --runtime both --offline --delegation-level 50 --access auto
+
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
 `doctor --offline` verifies local sandbox/runtime capabilities without a DeepSeek API request or key validation. `doctor --live` makes billable DeepSeek calls, uses a synthetic repository, and verifies that selected read-only workers do not modify it.
 
-Offline tests use synthetic credentials/transports. GitHub Actions runs the full unittest suite, builds/installs the wheel and exercises both console aliases on Python 3.11, 3.12 and 3.13. A separate Ubuntu job attempts a live Bubblewrap/AppArmor capability smoke test; hosted-runner kernel restrictions are reported separately from deterministic unit-test results. A green CI matrix is not evidence of a live DeepSeek inference request.
+Offline tests use synthetic credentials/transports. GitHub Actions runs the full unittest suite, builds/installs the wheel and exercises both console aliases on Python 3.11, 3.12 and 3.13. A separate Ubuntu sandbox job exercises Bubblewrap/AppArmor. The dedicated **Delegation verification** workflow additionally installs pinned real Codex/Claude versions and drives their actual tool/protocol surfaces against an offline local provider fixture: read-only write denial, full-access unlisted-file creation/local tests, parallel isolated copies, explicit recovery and provider-vs-execution failure classification are checked without a real DeepSeek key or paid request. A green CI matrix is not evidence of a live DeepSeek inference request.
 
 ## Update and remove
 
