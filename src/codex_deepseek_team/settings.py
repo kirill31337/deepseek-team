@@ -207,10 +207,15 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
         'delegate less and briefly explain why. The coordinator owns architecture, '
         'security decisions, final verification and integration.\n'
     )
-    profiles = {
+    full_profiles = {
         25: 'Delegate bounded research, diagnosis and independent review. The coordinator performs the main implementation.',
         50: 'Delegate independent implementation slices and their tests before implementing the same work yourself. Define architecture, interfaces and acceptance criteria first.',
         75: 'Delegate most separable implementation, tests, documentation and independent review before doing that same work yourself. Use up to three workers only for genuinely independent assignments.',
+    }
+    read_only_profiles = {
+        25: 'Delegate bounded research, diagnosis and independent review. The coordinator performs the main implementation.',
+        50: 'Delegate substantial investigation, design validation, test planning and independent review before the coordinator implements the corresponding changes.',
+        75: 'Delegate most separable analysis, diagnostics, design validation, test planning and independent review. Use up to three read-only workers only for genuinely independent assignments.',
     }
     if policy.effective_access == 'full-access':
         access = (
@@ -231,7 +236,8 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
             'The coordinator performs implementation. Do not override an explicit '
             'read-only setting merely to meet the target percentage.\n'
         )
-    guidance = profiles[policy.delegation_level] if policy.effective_access == 'full-access' else profiles[25]
+    guidance = (full_profiles if policy.effective_access == 'full-access'
+                else read_only_profiles)[policy.delegation_level]
     return (f'### Effective delegation profile: {policy.delegation_level}% / {policy.effective_access}\n'
             + common + guidance + '\n' + access
             + 'While a worker runs, work on independent tasks. Wait for its completed result; '
