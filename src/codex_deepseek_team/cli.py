@@ -41,6 +41,9 @@ def main(argv=None):
         print('This release supports Linux with Python 3.11+ and Codex and/or Claude Code.', file=sys.stderr)
         return 78
     from . import config, doctor, sandbox, worker
+    if argv and argv[0] == 'coordinator-hook':
+        from . import codex_hooks
+        return codex_hooks.main()
     if argv and argv[0] in ('config', 'workspace'):
         from . import delegation_cli
         return delegation_cli.main(argv)
