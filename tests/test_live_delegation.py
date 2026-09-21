@@ -75,6 +75,9 @@ else:
         (root/'partial.py').write_text('partial')
         print(json.dumps({'type':'result','is_error':True,'result':'fixture task failed'}))
         raise SystemExit(9)
+    elif task['mode']=='providerfail':
+        (root/'provider_partial.py').write_text('provider partial')
+        raise SystemExit(1)
     result=subprocess.run([sys.executable,'-m','unittest','discover','-q'],capture_output=True,text=True)
     assert result.returncode==0,result.stdout+result.stderr
     (root/'build').mkdir(exist_ok=True)
@@ -180,6 +183,25 @@ class LiveDemoTests(LiveBase):
         # A successful dirty copy can be reused without recovery or reset.
         self.assertEqual(managed.run(self.args(self.task('fix',sibling)),self.policy(50),worker,copy),0)
         self.assertEqual((copy.path/'partial.py').read_text(),'completed')
+
+
+    def test_provider_failure_is_distinguished_even_when_runtime_output_is_malformed(self):
+        copy, sibling = [workspace.create(self.source,self.state) for _ in range(2)]
+        class FailedRelay:
+            def __init__(self,*_args,**_kwargs):
+                self.failures=[503]
+            def __enter__(self):
+                return self
+            def __exit__(self,*_args):
+                return False
+        with patch.object(relay,'ProviderRelay',FailedRelay):
+            with self.assertRaises(worker.WorkerError):
+                managed.run(self.args(self.task('providerfail',sibling)),
+                            self.policy(50),worker,copy)
+        record=workspace.load(self.state,copy.id).metadata
+        self.assertEqual(record['status'],'failed')
+        self.assertEqual(record['error_kind'],'provider')
+        self.assertTrue((copy.path/'provider_partial.py').exists())
 
 
 class InstalledRuntimeTests(LiveBase):
