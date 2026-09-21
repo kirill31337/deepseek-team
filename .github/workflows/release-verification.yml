@@ -1,7 +1,7 @@
 name: Release verification
 on:
   push:
-    branches: [deepseek/coordination-enforcement]
+    branches: [main, deepseek/coordination-enforcement]
 
 jobs:
   install-upgrade:
