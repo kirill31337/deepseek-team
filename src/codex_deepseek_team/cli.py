@@ -80,6 +80,11 @@ def main(argv=None):
     setter.add_argument('--stdin', action='store_true', help='Read from a pipe; never pass a key as a command argument.')
     auth_commands.add_parser('status', help='Report whether a usable key is present, without displaying it.')
     auth_commands.add_parser('remove', help='Delete the saved key; environment overrides are unaffected.')
+    hooks_cmd = commands.add_parser('hooks', help='Manage stable user-level Codex coordination hooks.')
+    hooks_commands = hooks_cmd.add_subparsers(dest='hooks_command', required=True)
+    hooks_commands.add_parser('install', help='Install/update package-owned user-level Codex hooks.')
+    hooks_commands.add_parser('status', help='Report whether the exact package hook set is installed.')
+    hooks_commands.add_parser('remove', help='Remove only package-owned Codex hook handlers.')
     sandbox_cmd = commands.add_parser('sandbox', help='Inspect or manage Linux Bubblewrap/AppArmor isolation.')
     sandbox_commands = sandbox_cmd.add_subparsers(dest='sandbox_command', required=True)
     sandbox_commands.add_parser('status', help='Probe Bubblewrap and the effective AppArmor/userns backend.')
@@ -95,8 +100,11 @@ def main(argv=None):
             runtimes = _runtimes(args.runtime)
             if 'codex' in runtimes:
                 changed = config.configure(worker.codex_home())
+                hooks_changed = config.install_codex_hooks(worker.codex_home())
                 print('DeepSeek Codex provider configured.' if changed else 'Compatible DeepSeek Codex provider already configured.')
+                print('Codex coordination hooks installed.' if hooks_changed else 'Codex coordination hooks already installed.')
                 print('Codex primary model and OpenAI authentication were preserved.')
+                print('Codex requires one native hook review/trust via /hooks; the stable definition persists across package updates.')
             if 'claude' in runtimes:
                 print('Claude Code runtime uses an isolated DeepSeek child environment; Claude configuration/auth were not changed.')
             if not args.no_key and not worker.load_api_key().strip():
@@ -109,7 +117,9 @@ def main(argv=None):
             runtimes = _runtimes(args.runtime)
             if 'codex' in runtimes:
                 changed = config.remove_provider(worker.codex_home())
+                hooks_changed = config.remove_codex_hooks(worker.codex_home())
                 print('Managed Codex provider removed.' if changed else 'No package-owned Codex provider block to remove.')
+                print('Managed Codex coordination hooks removed.' if hooks_changed else 'No package-owned Codex hooks to remove.')
             if 'claude' in runtimes:
                 print('No package-owned Claude configuration exists; nothing was changed.')
         elif args.command in ['init', 'detach']:
@@ -134,6 +144,20 @@ def main(argv=None):
                 present = bool(worker.load_api_key().strip())
                 print('Key available; value omitted.' if present else 'No key configured.')
                 return 0 if present else 78
+        elif args.command == 'hooks':
+            home = worker.codex_home()
+            if args.hooks_command == 'install':
+                changed = config.install_codex_hooks(home)
+                print('Codex coordination hooks installed.' if changed else 'Codex coordination hooks already installed.')
+                print('Review/trust this stable user-level definition once in Codex with /hooks.')
+            elif args.hooks_command == 'remove':
+                print('Codex coordination hooks removed.' if config.remove_codex_hooks(home)
+                      else 'No package-owned Codex coordination hooks were present.')
+            else:
+                installed = config.codex_hooks_status(home)
+                print('Codex coordination hooks installed; native trust state is managed by Codex /hooks.'
+                      if installed else 'Codex coordination hooks are not installed.')
+                return 0 if installed else 78
         elif args.command == 'sandbox':
             if args.sandbox_command == 'status':
                 return _sandbox_status(sandbox)
