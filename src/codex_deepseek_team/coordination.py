@@ -29,9 +29,8 @@ PROTECTED_COORDINATOR_KINDS = {
     "architecture", "security", "integration", "final_verification",
     "commit_push", "production", "secret_signing",
 }
-ACCEPTED_RETENTION = {
-    "user_explicit", "secret_or_signing", "runner_unavailable",
-    "dependency_unavailable", "environment_incompatible", "not_separable",
+TECHNICAL_RETENTION = {
+    "runner_unavailable", "dependency_unavailable", "environment_incompatible",
 }
 
 
@@ -165,7 +164,7 @@ def open_task(root: Path, *, session_id: str, turn_id: str, prompt: str,
             "base_head": _head(root), "created_at": now, "updated_at": now,
             "status": "planning", "classification": None, "small_evidence": None,
             "policy": policy.as_dict(), "deliverables": [], "assignments": [],
-            "coordinator_events": [],
+            "coordinator_events": [], "constraints": [],
         }
         _atomic(path, task)
         return task
@@ -294,13 +293,31 @@ def plan_task(root: Path, task_id: str, plan: dict) -> dict:
         return task
 
 
-def _retention_ok(deliverable: dict) -> bool:
+def _retention_ok(task: dict, deliverable: dict) -> bool:
     retention = deliverable.get("retention")
     if not isinstance(retention, dict):
         return False
     code = retention.get("code")
     evidence = retention.get("evidence")
-    return code in ACCEPTED_RETENTION and isinstance(evidence, str) and len(evidence.strip()) >= 5
+    if not isinstance(evidence, str) or len(evidence.strip()) < 5:
+        return False
+    if code in TECHNICAL_RETENTION:
+        return any(
+            row.get("deliverable_id") == deliverable.get("id")
+            and row.get("code") == code
+            and row.get("source") == "runner"
+            for row in task.get("constraints", [])
+        )
+    if code == "secret_or_signing":
+        return (deliverable.get("kind") == "metadata"
+                and retention.get("sensitive") is True)
+    if code == "user_explicit":
+        hashes = set(task.get("prompt_hashes", [])) | {task.get("prompt_sha256")}
+        return (retention.get("source") == "user"
+                and retention.get("prompt_sha256") in hashes)
+    # Semantic "not separable" is represented by classification=small rather
+    # than accepted as a deterministic fact on a substantial task.
+    return False
 
 
 def validate_task(root: Path, task_id: str) -> list[str]:
@@ -314,26 +331,32 @@ def validate_task(root: Path, task_id: str) -> list[str]:
     access = policy["effective_access"]
     issues = []
     worker_count = 0
+    worker_write_count = 0
     eligible_count = 0
+    eligible_write_count = 0
     for item in task.get("deliverables", []):
         kind, executor = item["kind"], item["executor"]
         if executor == "worker":
             worker_count += 1
+            if kind in WORKER_WRITE_KINDS:
+                worker_write_count += 1
         eligible = kind in WORKER_READ_KINDS if access == "read-only" else (
             kind in WORKER_WRITE_KINDS or kind in WORKER_READ_KINDS)
         if eligible:
             eligible_count += 1
+            if kind in WORKER_WRITE_KINDS:
+                eligible_write_count += 1
         if executor == "coordinator" and kind in PROTECTED_COORDINATOR_KINDS:
             continue
         if executor == "coordinator" and eligible:
             if access == "read-only" and kind in WORKER_WRITE_KINDS:
                 continue
-            if level >= 75 and not _retention_ok(item):
+            if level >= 75 and not _retention_ok(task, item):
                 issues.append(f"{item['id']}: worker-eligible {kind} retained by coordinator without a supported constraint")
     if level >= 75 and access == "full-access" and eligible_count and worker_count == 0:
         issues.append("75/full-access requires worker assignment for separable worker-eligible deliverables")
-    if level == 50 and access == "full-access" and eligible_count >= 2 and worker_count == 0:
-        issues.append("50/full-access requires at least one worker implementation slice when separable work exists")
+    if level == 50 and access == "full-access" and eligible_write_count and worker_write_count == 0:
+        issues.append("50/full-access requires at least one worker implementation/test/docs slice when worker-eligible implementation exists")
     return issues
 
 
@@ -394,6 +417,28 @@ def use_result(root: Path, task_id: str, assignment_id: str,
         return task
 
 
+def record_constraint(root: Path, task_id: str, deliverable_id: str,
+                      code: str, evidence: str, source: str = "runner") -> dict:
+    if code not in TECHNICAL_RETENTION:
+        raise CoordinationError("Only technical runner constraints may be recorded automatically.", 64)
+    if source != "runner" or not evidence.strip():
+        raise CoordinationError("Technical constraints require runner evidence.", 64)
+    with _lock(root):
+        task = load_task(root, task_id)
+        if deliverable_id not in {d.get("id") for d in task.get("deliverables", [])}:
+            raise CoordinationError("Constraint references unknown deliverable.", 64)
+        task.setdefault("constraints", []).append({
+            "deliverable_id": deliverable_id,
+            "code": code,
+            "evidence": evidence[:1000],
+            "source": source,
+            "at": time.time(),
+        })
+        task["updated_at"] = time.time()
+        _atomic(_task_path(root, task_id), task)
+        return task
+
+
 def record_coordinator_event(root: Path, task_id: str, kind: str,
                              paths: list[str] | None = None) -> None:
     with _lock(root):
@@ -431,9 +476,11 @@ def _command_available(copy, token: str) -> bool:
 def ensure_assignment_ready(root: Path, task_id: str, assignment_id: str, copy) -> dict:
     """Fail preparation before provider access when declared prerequisites are absent."""
     task = load_task(root, task_id)
-    if copy.metadata.get('base_head') != task.get('base_head'):
-        raise CoordinationError('Workspace source version does not match the coordination task base HEAD.', 78)
     item = assignment_deliverable(task, assignment_id)
+    if copy.metadata.get('base_head') != task.get('base_head'):
+        record_constraint(root, task_id, item['id'], 'environment_incompatible',
+                          'workspace base HEAD does not match coordination task base HEAD')
+        raise CoordinationError('Workspace source version does not match the coordination task base HEAD.', 78)
     missing = []
     for dep in item.get('dependencies', []):
         if not isinstance(dep, dict) or dep.get('kind') not in ('command', 'path'):
@@ -456,8 +503,10 @@ def ensure_assignment_ready(root: Path, task_id: str, assignment_id: str, copy) 
         if not _command_available(copy, parts[0]):
             missing.append('check-command:' + parts[0])
     if missing:
+        evidence = 'missing declared dependencies/check runtime: ' + ', '.join(sorted(set(missing)))
+        record_constraint(root, task_id, item['id'], 'dependency_unavailable', evidence)
         raise CoordinationError(
-            'Preparation missing declared dependencies/check runtime: ' + ', '.join(sorted(set(missing))) +
+            'Preparation ' + evidence +
             '. Prepare the owned workspace explicitly; stubs are not equivalent verification.', 78)
     return item
 
