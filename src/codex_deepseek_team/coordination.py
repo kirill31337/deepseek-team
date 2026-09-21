@@ -317,10 +317,6 @@ def _retention_ok(task: dict, deliverable: dict) -> bool:
     if code == "secret_or_signing":
         return (deliverable.get("kind") == "metadata"
                 and retention.get("sensitive") is True)
-    if code == "user_explicit":
-        hashes = set(task.get("prompt_hashes", [])) | {task.get("prompt_sha256")}
-        return (retention.get("source") == "user"
-                and retention.get("prompt_sha256") in hashes)
     # Semantic "not separable" is represented by classification=small rather
     # than accepted as a deterministic fact on a substantial task.
     return False
