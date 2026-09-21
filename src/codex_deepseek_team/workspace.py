@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -295,6 +296,49 @@ def load(state: Path, identifier: str) -> Workspace:
         return copy
     except (OSError, ValueError, KeyError, TypeError):
         raise WorkspaceError('Workspace is missing, unsafe or foreign; no files were changed.') from None
+
+
+def _credential_like(name: Path) -> bool:
+    lower = name.name.lower()
+    return (lower in {'.env', 'auth.json', 'api-key', '.npmrc', '.pypirc', '.netrc',
+                      '.git-credentials', 'id_rsa', 'id_ed25519'}
+            or (lower.startswith('.env.') and lower not in {'.env.example', '.env.sample', '.env.template'})
+            or name.suffix.lower() in {'.pem', '.key', '.p12', '.pfx', '.jks', '.keystore'}
+            or any(part.lower() in {'.ssh', '.aws', '.azure', '.kube', '.gnupg'} for part in name.parts))
+
+
+def import_paths(copy: Workspace, paths: list[str]) -> list[str]:
+    """Explicitly copy selected source files into an owned workspace as coordinator preparation."""
+    if not paths:
+        raise WorkspaceError('workspace import requires at least one --include FILE.', 64)
+    imported = []
+    with copy.lock():
+        source_root = copy.source.resolve()
+        work_root = copy.path.resolve()
+        for value in paths:
+            rel = Path(value)
+            if rel.is_absolute() or '..' in rel.parts or not rel.parts:
+                raise WorkspaceError('Imported paths must be repository-relative ordinary files.', 64)
+            if _credential_like(rel):
+                raise WorkspaceError(f'Refusing credential-like source path: {rel}.', 78)
+            source = source_root / rel
+            try:
+                info = source.lstat()
+            except FileNotFoundError:
+                raise WorkspaceError(f'Selected source path does not exist: {rel}.', 66) from None
+            if source.is_symlink() or not stat.S_ISREG(info.st_mode):
+                raise WorkspaceError(f'Selected source path must be an ordinary non-symlink file: {rel}.', 78)
+            destination = work_root / rel
+            parent = destination.parent
+            parent.mkdir(parents=True, exist_ok=True)
+            if not parent.resolve().is_relative_to(work_root):
+                raise WorkspaceError('Imported path escaped the owned workspace.', 78)
+            shutil.copyfile(source, destination)
+            os.chmod(destination, stat.S_IMODE(info.st_mode))
+            imported.append(rel.as_posix())
+        copy.metadata['prepared_paths'] = sorted(set(copy.metadata.get('prepared_paths', [])) | set(imported))
+        copy.save()
+    return sorted(imported)
 
 
 def prepare(copy: Workspace, command: list[str], *, recover: bool = False) -> int:

@@ -44,6 +44,9 @@ def main(argv=None):
     if argv and argv[0] == 'coordinator-hook':
         from . import codex_hooks
         return codex_hooks.main()
+    if argv and argv[0] == 'coordination':
+        from . import coordination_cli
+        return coordination_cli.main(argv)
     if argv and argv[0] in ('config', 'workspace'):
         from . import delegation_cli
         return delegation_cli.main(argv)
