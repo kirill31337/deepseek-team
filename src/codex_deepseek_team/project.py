@@ -5,7 +5,6 @@ coordinator-native root instruction file. Every byte outside the owned region is
 preserved verbatim: line endings are not normalized and user text is not dropped.
 """
 import os
-import json
 from pathlib import Path
 import stat
 import subprocess
@@ -19,14 +18,6 @@ END_MARKER = b"<!-- codex-deepseek-team:managed-block:end -->"
 DATA_FILE = Path(__file__).resolve().parent / "data" / "delegation.md"
 DEFAULT_MODE = 0o644
 TARGETS = {'codex': 'AGENTS.md', 'claude': 'CLAUDE.md'}
-CODEX_HOOK_COMMAND = 'deepseek-team coordinator-hook'
-CODEX_HOOKS = {
-    'SessionStart': {'matcher': '^(startup|resume|compact)$', 'context': True},
-    'UserPromptSubmit': {'matcher': None, 'context': True},
-    'PreToolUse': {'matcher': '^(Bash|apply_patch)$', 'context': False},
-    'PostToolUse': {'matcher': '^(Bash|apply_patch)$', 'context': False},
-    'Stop': {'matcher': None, 'context': False},
-}
 
 
 class ProjectError(Exception):
@@ -188,96 +179,20 @@ def _prepare_detach(repository, runtime):
     return target, original, mode, updated, remove
 
 
-def _codex_hook_group(event, spec):
-    handler = {
-        'type': 'command',
-        'command': CODEX_HOOK_COMMAND,
-        'timeout': 10,
-        'statusMessage': 'DeepSeek Team coordination policy',
-    }
-    if spec.get('context'):
-        handler['additionalContextLimit'] = 2200
-    group = {'hooks': [handler]}
-    if spec.get('matcher') is not None:
-        group['matcher'] = spec['matcher']
-    return group
-
-
-def _strip_package_hooks(data):
-    hooks = data.get('hooks', {})
-    if not isinstance(hooks, dict):
-        raise ProjectError('.codex/hooks.json hooks must be an object')
-    changed = False
-    for event in list(hooks):
-        groups = hooks[event]
-        if not isinstance(groups, list):
-            raise ProjectError('.codex/hooks.json event groups must be arrays')
-        kept = []
-        for group in groups:
-            if not isinstance(group, dict):
-                kept.append(group)
-                continue
-            handlers = group.get('hooks')
-            if not isinstance(handlers, list):
-                kept.append(group)
-                continue
-            filtered = [h for h in handlers if not (
-                isinstance(h, dict) and h.get('command') == CODEX_HOOK_COMMAND)]
-            if len(filtered) != len(handlers):
-                changed = True
-            if filtered:
-                copy = dict(group)
-                copy['hooks'] = filtered
-                kept.append(copy)
-        if kept:
-            hooks[event] = kept
-        else:
-            hooks.pop(event, None)
-    return changed
-
-
-def _update_codex_hooks(repository, remove=False):
-    directory = repository / '.codex'
-    target = directory / 'hooks.json'
-    original = None
-    mode = DEFAULT_MODE
-    if target.exists() or target.is_symlink():
-        original, existing_mode = _read_agents(target)
-        mode = existing_mode if existing_mode is not None else DEFAULT_MODE
-        try:
-            data = json.loads((original or b'{}').decode('utf-8'))
-        except (ValueError, UnicodeError):
-            raise ProjectError('cannot safely update invalid .codex/hooks.json') from None
-        if not isinstance(data, dict):
-            raise ProjectError('.codex/hooks.json must contain an object')
-    else:
-        data = {}
-    changed = _strip_package_hooks(data)
-    hooks = data.setdefault('hooks', {})
-    if not remove:
-        for event, spec in CODEX_HOOKS.items():
-            hooks.setdefault(event, []).append(_codex_hook_group(event, spec))
-        changed = True
-    if remove and not hooks:
-        data.pop('hooks', None)
-    if remove and not data:
-        if original is not None:
-            os.unlink(target)
-            sync_directory(directory)
-            try:
-                directory.rmdir()
-            except OSError:
-                pass
-            return True
-        return changed
-    raw = (json.dumps(data, indent=2, sort_keys=True) + '\n').encode()
-    if original == raw:
+def is_attached(root, runtime='codex'):
+    """Return whether this package owns a managed block for the coordinator."""
+    if runtime not in TARGETS:
+        raise ProjectError("coordinator must be codex or claude")
+    repository = _repository_root(root)
+    content, _mode = _read_agents(repository / TARGETS[runtime])
+    if content is None:
         return False
-    if not directory.exists():
-        directory.mkdir(mode=0o755)
-        sync_directory(repository)
-    _write_atomic(target, original, mode, raw)
-    return True
+    marks = _locate(content)
+    if marks is None:
+        return False
+    begin, finish = marks
+    _original_state(content, begin)
+    return finish > begin
 
 
 def attach(root, coordinator='codex'):
@@ -291,8 +206,6 @@ def attach(root, coordinator='codex'):
             continue
         _write_atomic(target, original, mode if mode is not None else DEFAULT_MODE, updated)
         changed = True
-    if 'codex' in runtimes:
-        changed = _update_codex_hooks(repository, remove=False) or changed
     return changed
 
 
@@ -313,6 +226,4 @@ def detach(root, coordinator='codex'):
         else:
             _write_atomic(target, original, mode, updated)
         changed = True
-    if 'codex' in runtimes:
-        changed = _update_codex_hooks(repository, remove=True) or changed
     return changed
