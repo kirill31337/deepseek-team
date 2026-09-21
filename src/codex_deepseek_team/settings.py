@@ -203,14 +203,18 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
         raise SettingsError('Instruction runtime must be codex or claude.')
     common = (
         'Percentages are target profiles of useful work, not call/token/line quotas. '
-        'Do not manufacture tasks to reach a percentage. For tiny or inseparable tasks, '
-        'delegate less and briefly explain why. The coordinator owns architecture, '
-        'security decisions, final verification and integration.\n'
+        'Do not manufacture tasks to reach a percentage. For a genuinely small single-output '
+        'task, record the small classification and concrete scope instead of creating a fake worker. '
+        'The coordinator owns architecture, security decisions, final verification, integration, '
+        'secrets/signing, commit/push and production actions. These responsibilities do not by '
+        'themselves reserve ordinary implementation, tests, fixtures, documentation or non-secret '
+        'metadata from workers. Do not calculate an actual useful-work percentage from calls, '
+        'deliverable counts, lines or files.\n'
     )
     full_profiles = {
         25: 'Delegate bounded research, diagnosis and independent review. The coordinator performs the main implementation.',
-        50: 'Delegate independent implementation slices and their tests before implementing the same work yourself. Define architecture, interfaces and acceptance criteria first.',
-        75: 'Delegate most separable implementation, tests, documentation and independent review before doing that same work yourself. Use up to three workers only for genuinely independent assignments.',
+        50: 'Delegate at least one separable implementation/test/docs slice when such work exists; coordinator defines architecture/interfaces and integrates.',
+        75: 'Delegate most separable implementation, tests, fixtures, documentation, non-secret metadata and independent review before doing that same work yourself. Use up to three workers only for genuinely independent assignments.',
     }
     read_only_profiles = {
         25: 'Delegate bounded research, diagnosis and independent review. The coordinator performs the main implementation.',
@@ -220,28 +224,44 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
     if policy.effective_access == 'full-access':
         access = (
             'Full-access is development inside an owned isolated copy, not host access. '
-            'Prepare a copy with `deepseek-team workspace create` and dependencies with '
-            '`deepseek-team workspace prepare ID -- COMMAND ...` yourself; never ask the '
-            'user to perform this routine preparation. Alternatively worker auto-creates '
-            'a copy from committed HEAD. Uncommitted source work is NOT copied or cleaned. '
-            'Assign sufficient context, a goal and acceptance criteria. Allow the worker '
-            'to create/edit/delete any project files and run local tests/builds. Reuse '
-            '`--workspace ID` for iterations; inspect failed copies before explicitly '
-            'using `--resume-after-failure`. Never automatically redo a failed implementation.\n'
+            'Allow the worker to create/edit/delete project files in its assigned copy and run '
+            'declared local checks. Prepare missing dependencies with workspace prepare. If selected '
+            'uncommitted source is required, import only those files with workspace import; it is '
+            'recorded as coordinator-prepared source, not worker output. Host SDK/JDK/tools are not '
+            'assumed to exist inside the sandbox.\n'
         )
     else:
         access = (
-            'Actual access is read-only, regardless of the target level. Assign analysis, '
-            'diagnostics and review only; no project writes or mutating tests/builds. '
-            'The coordinator performs implementation. Do not override an explicit '
-            'read-only setting merely to meet the target percentage.\n'
+            'Actual access is read-only, regardless of the target level. Assign analysis, diagnostics '
+            'and review only; project writes and mutating tests/builds remain coordinator work. '
+            'Do not expand access merely to satisfy the target profile.\n'
         )
     guidance = (full_profiles if policy.effective_access == 'full-access'
                 else read_only_profiles)[policy.delegation_level]
+    if runtime == 'codex':
+        process = (
+            'Codex process integration: after project init and native hook trust, SessionStart/'
+            'UserPromptSubmit provide the current coordination task id. For every substantial task, '
+            'before coordinator source edits, submit a concrete JSON distribution with '
+            '`deepseek-team coordination plan --task TASK_ID`; include deliverable id/kind/scope, '
+            'executor, acceptance criteria, dependencies and checks. Run each worker assignment with '
+            '`deepseek-team worker --runtime codex --coord-task TASK_ID --coord-assignment ASSIGNMENT_ID`. '
+            'The runner records start/result/workspace/checks automatically. After reviewing a result, '
+            'record its use with `deepseek-team coordination use ...`. New substantial scope requires '
+            'a revised plan. Codex PreToolUse technically blocks source mutation while the distribution '
+            'is missing/noncompliant, blocks unplanned scope, and blocks duplicate work owned by a '
+            'pending worker assignment; Stop prevents silent completion with pending/undispositioned '
+            'worker results. Native hook trust is controlled by Codex and is not inferred by this package.\n'
+        )
+    else:
+        process = (
+            'Claude coordinator integration is instruction-driven in this release: use the same '
+            'distribution principles and managed worker runner, but DeepSeek Team does not claim a '
+            'Claude PreToolUse technical gate. Worker filesystem/network permissions remain technically '
+            'sandboxed; coordinator compliance with distribution instructions depends on Claude Code.\n'
+        )
     return (f'### Effective delegation profile: {policy.delegation_level}% / {policy.effective_access}\n'
-            + common + guidance + '\n' + access
-            + 'While a worker runs, work on independent tasks. Wait for its completed result; '
-            'silence alone is not failure. Review the actual diff and evidence without '
-            'repeating the whole investigation or rewriting correct code. Workers do not '
-            'stage, commit, push, publish, deploy, access production services or delegate.\n'
-            + f'Run: `deepseek-team worker --runtime {runtime}`; retain the required OS sandbox.\n')
+            + common + guidance + '\n' + access + process
+            + 'While a worker runs, work only on independent scope. Review the actual diff and recorded '
+            'checks without repeating the whole investigation or rewriting correct code. Workers never '
+            'stage, commit, push, publish, deploy, access production services or delegate.\n')
