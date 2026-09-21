@@ -6,7 +6,7 @@ One Linux package for **Codex and/or Claude Code coordinators** delegating bound
 
 The percentages are **target work-distribution profiles**, not measured token/time/line quotas and not promises of exact useful contribution. Small or inseparable tasks may delegate less. Without any new settings, behavior remains compatible: the default is **25% + access=auto → read-only**.
 
-Version **0.4.0** adds configurable delegation profiles and managed full-access development copies while preserving the legacy exact-file writer. The release supports **Linux, Python 3.11+, Git, Bubblewrap, and Codex CLI and/or Claude Code CLI**. Ubuntu has first-class AppArmor setup for its restricted unprivileged-user-namespace policy. A DeepSeek API key is required for live work. There are no Python runtime dependencies; Bubblewrap/AppArmor are system components.
+Version **0.5.0** adds persistent coordination state and Codex lifecycle enforcement so the selected delegation profile changes observable coordinator behavior in new sessions instead of remaining only guidance text. The release supports **Linux, Python 3.11+, Git, Bubblewrap, and Codex CLI and/or Claude Code CLI**. Ubuntu has first-class AppArmor setup for its restricted unprivileged-user-namespace policy. A DeepSeek API key is required for live work. There are no Python runtime dependencies; Bubblewrap/AppArmor are system components.
 
 ## Ubuntu install — recommended
 
@@ -27,8 +27,10 @@ Then configure whichever coordinator(s) you use:
 ```bash
 # Codex only
 deepseek-team setup --runtime codex
+deepseek-team hooks status
 deepseek-team doctor --runtime codex --offline
 deepseek-team init --coordinator codex
+# In Codex, review/trust the stable hook definition once with /hooks.
 
 # Claude Code only
 deepseek-team setup --runtime claude
@@ -192,6 +194,69 @@ Project settings live in `.deepseek-team.toml`; global settings live under the u
 `config show --effective --instructions --runtime codex|claude` renders the current coordinator guidance. Managed AGENTS.md/CLAUDE.md blocks tell the coordinator to resolve this current policy before each assignment instead of relying on a stale percentage embedded in the file.
 
 `doctor` resolves and prints the same effective policy. When effective access is full-access it checks the managed runtime capability surface that will actually be used; it refuses to validate full-access with `--os-sandbox off`.
+
+## Coordinator process enforcement
+
+DeepSeek Team 0.5.0 adds a small persistent coordination ledger outside the repository. It records session/task ids, deliverables, worker assignments, workspace ids, declared dependencies/checks, worker-only file deltas, results, dispositions and technical constraints. It is deliberately **not** a scheduler or project-management system.
+
+For Codex, `deepseek-team setup --runtime codex` and the standard installer place one stable user-level lifecycle hook definition in `$CODEX_HOME/hooks.json`. The hook is inert unless the current repository has already been explicitly attached with `deepseek-team init --coordinator codex`. Codex owns native hook trust; review/trust the stable definition once with Codex `/hooks`. DeepSeek Team does not bypass or infer that decision.
+
+Supported Codex hook behavior is split deliberately:
+
+- `SessionStart` and `UserPromptSubmit` restore/inject the current coordination state, including after compaction;
+- `PreToolUse` can technically deny coordinator source mutation before execution when the distribution is missing/noncompliant, when a new scope was not planned, or when the path is still owned by a pending worker assignment;
+- `Stop` prevents silent completion while assignments are pending or completed worker results have no disposition.
+
+At **75/full-access**, ordinary separable implementation, tests, fixtures, documentation and non-secret metadata are worker-eligible by default. Merely running one implementation/review worker does not satisfy the profile if the coordinator then retains the remaining worker-eligible work without a supported constraint. At **50/full-access**, a review-only worker does not substitute for delegating an available implementation/test/docs slice. Access remains independent: an explicit read-only override never becomes writable.
+
+Before a substantial Codex task mutates source, the coordinator registers concrete deliverables:
+
+```bash
+deepseek-team coordination plan --task TASK_ID <<'JSON'
+{
+  "classification": "substantial",
+  "deliverables": [
+    {
+      "id": "implementation",
+      "kind": "implementation",
+      "scope": ["src/example.py"],
+      "executor": "worker",
+      "acceptance": ["focused behavior implemented"],
+      "dependencies": [{"kind": "command", "value": "python3"}],
+      "checks": ["python3 -m unittest tests.test_example -q"]
+    }
+  ]
+}
+JSON
+```
+
+The assignment returned by that plan is tied to the runner:
+
+```bash
+deepseek-team worker --runtime codex \
+  --coord-task TASK_ID --coord-assignment ASSIGNMENT_ID <<'TASK'
+Implement the assigned deliverable and satisfy its registered acceptance criteria.
+TASK
+```
+
+Runner start/completion, workspace id, worker-only delta and declared checks are recorded automatically. After coordinator inspection:
+
+```bash
+deepseek-team coordination use --task TASK_ID --assignment ASSIGNMENT_ID \
+  --disposition incorporated --evidence "reviewed diff and accepted result"
+```
+
+If an assignment needs selected uncommitted source, import only the required files:
+
+```bash
+deepseek-team workspace import WORKSPACE_ID --include path/to/needed.py
+```
+
+Those files are recorded as coordinator-prepared input, not worker authorship. Declared dependencies are also checked **inside the actual worker sandbox before the provider credential is read**. Host-only JDK/SDK/tools are not assumed to exist in full-access. Missing dependencies must be prepared explicitly with `workspace prepare`; replacing them with stubs is not treated as equivalent verification.
+
+For Claude Code, the same ledger/runner accounting and managed instructions are available, but coordinator distribution enforcement is **instruction-driven** in 0.5.0. DeepSeek Team does not claim a Claude PreToolUse technical gate.
+
+The 25/50/75 value remains a **target policy, not a measured productivity percentage**. DeepSeek Team records observable facts; it does not convert call counts, files, lines, tokens, task bullets or subjective outcomes into a fake "actual contribution %" metric.
 
 ## Project integration
 
