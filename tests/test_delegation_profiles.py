@@ -124,15 +124,19 @@ class ManagedRuntimeMountTests(RepoCase):
         launcher = prefix / 'bin/runtime'
         launcher.parent.mkdir(parents=True)
         launcher.symlink_to(Path('../lib/node_modules/@vendor/runtime/cli.js'))
+        node = prefix / 'bin/node'
+        node.write_text('#!/bin/sh\n')
+        node.chmod(0o700)
 
         with mock.patch.object(development.sys, 'executable', '/usr/bin/python3'), \
              mock.patch.object(development.sys, 'base_prefix', '/usr'), \
-             mock.patch.object(development.shutil, 'which', return_value='/usr/bin/node'):
+             mock.patch.object(development.shutil, 'which', return_value=str(node)):
             roots = development.runtime_roots([str(launcher)])
 
         self.assertNotIn(prefix, roots)
         self.assertIn(launcher, roots)
         self.assertIn(package, roots)
+        self.assertIn(node, roots)
         for root in roots:
             self.assertNotEqual(root, self.home)
 
