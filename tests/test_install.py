@@ -53,6 +53,35 @@ class InstallTests(unittest.TestCase):
         self.assertIn([team, 'sandbox', 'install-apparmor'], calls)
         self.assertIn([team, 'sandbox', 'status'], calls)
 
+    def test_standard_install_with_codex_installs_stable_coordination_hooks(self):
+        calls = []
+        def run(args, **kwargs):
+            calls.append(list(args))
+            return subprocess.CompletedProcess(args, 0, '', '')
+        with mock.patch.object(installer.venv.EnvBuilder, 'create', side_effect=self.simulate_venv), \
+             mock.patch.object(installer.shutil, 'which', return_value='/usr/bin/codex'), \
+             mock.patch.object(installer.subprocess, 'run', side_effect=run):
+            self.assertEqual(installer.main(self.args), 0)
+        team = str(self.prefix / 'venv/bin/deepseek-team')
+        self.assertIn([team, 'hooks', 'install'], calls)
+
+    def test_repeat_upgrade_reinstalls_same_hook_definition_without_project_scan(self):
+        calls = []
+        def run(args, **kwargs):
+            calls.append(list(args))
+            return subprocess.CompletedProcess(args, 0, '', '')
+        with mock.patch.object(installer.venv.EnvBuilder, 'create', side_effect=self.simulate_venv), \
+             mock.patch.object(installer.shutil, 'which', return_value='/usr/bin/codex'), \
+             mock.patch.object(installer.subprocess, 'run', side_effect=run):
+            self.assertEqual(installer.main(self.args), 0)
+            self.assertEqual(installer.main(self.args), 0)
+        team = str(self.prefix / 'venv/bin/deepseek-team')
+        hook_calls = [call for call in calls if call == [team, 'hooks', 'install']]
+        self.assertEqual(len(hook_calls), 2)
+        flattened = '\n'.join(' '.join(call) for call in calls)
+        self.assertNotIn(' init ', flattened)
+        self.assertNotIn('find ', flattened)
+
     def test_plain_install_never_invokes_privileged_sandbox_setup(self):
         calls = []
         def run(args, **kwargs):
