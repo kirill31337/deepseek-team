@@ -35,7 +35,7 @@ def main(argv):
         show.add_argument('--runtime', choices=('codex', 'claude'), default='codex')
         policy_options(show)
     else:
-        for name in ('create', 'show', 'diff', 'prepare'):
+        for name in ('create', 'show', 'diff', 'prepare', 'import'):
             sub = subs.add_parser(name)
             sub.add_argument('--state-dir', type=Path, default=Path.home() / '.local/state/codex-deepseek')
             if name == 'create':
@@ -46,6 +46,9 @@ def main(argv):
                 sub.add_argument('--json', action='store_true')
             if name == 'prepare':
                 sub.add_argument('--resume-after-failure', action='store_true')
+            if name == 'import':
+                sub.add_argument('--include', action='append', required=True, metavar='FILE',
+                                 help='Explicit repository-relative dirty file to copy; repeat as needed.')
         # A literal -- separates the trusted coordinator command from our options.
     command = []
     inputs = list(argv[1:])
@@ -85,6 +88,10 @@ def main(argv):
                     else workspace.load(args.state_dir, args.id))
             if args.command == 'prepare':
                 return workspace.prepare(copy, command, recover=args.resume_after_failure)
+            if args.command == 'import':
+                imported = workspace.import_paths(copy, args.include)
+                print('Imported coordinator-prepared source: ' + ', '.join(imported))
+                return 0
             if args.command == 'diff':
                 print(copy.diff(), end='')
             elif getattr(args, 'json', False):
