@@ -91,10 +91,15 @@ def runtime_roots(executables: list[str]) -> list[Path]:
             parts = candidate.parts
             if 'node_modules' in parts:
                 index = parts.index('node_modules')
-                prefix = Path(*parts[:index])
-                if prefix.name == 'lib':
-                    prefix = prefix.parent
-                roots.add(prefix)
+                tail = parts[index + 1:]
+                if not tail:
+                    raise DevelopmentError('Preparation: malformed npm runtime path.')
+                package_parts = 2 if tail[0].startswith('@') else 1
+                if len(tail) < package_parts:
+                    raise DevelopmentError('Preparation: malformed scoped npm runtime path.')
+                # Expose only the concrete global package, never its whole user
+                # prefix (for example ~/.local, which may also contain keyrings).
+                roots.add(Path(*parts[:index + 1 + package_parts]))
             elif candidate == Path(sys.base_prefix) and candidate != Path('/'):
                 roots.add(candidate)
             else:
@@ -138,6 +143,9 @@ def layout(backend: sandbox.SandboxBackend, work: Path, home: Path, control: Pat
     args += ['--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp',
              '--dir', '/var', '--tmpfs', '/var/tmp', '--dir', '/run']
     for root in runtime_roots(executables):
+        # The sparse namespace intentionally does not mount the host's parent
+        # tree. Create empty destination parents, then expose only this root.
+        args += ['--dir', str(root.parent)]
         if root.is_symlink():
             args += ['--symlink', os.readlink(root), str(root)]
         elif root.exists():
