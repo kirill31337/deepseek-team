@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import shutil
 import tempfile
 import venv
 
@@ -101,6 +102,12 @@ def main(argv=None):
                     published.append((binary, entrypoint))
             if binary.resolve() != entrypoint.resolve():
                 raise ValueError(f'Command {binary.name} changed concurrently; the other command was preserved.')
+        if shutil.which('codex'):
+            hook_result = subprocess.run(
+                [str(environment / 'bin/deepseek-team'), 'hooks', 'install'],
+                check=False)
+            if hook_result.returncode:
+                print('Warning: Codex coordination hooks could not be installed; run deepseek-team setup --runtime codex --no-key after fixing ~/.codex/hooks.json.', file=sys.stderr)
         if args.with_sandbox:
             _install_ubuntu_sandbox(environment / 'bin/deepseek-team')
         print('Installed commands: ' + ', '.join(str(binary) for binary, _ in links))
