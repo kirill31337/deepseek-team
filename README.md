@@ -1,10 +1,12 @@
 # DeepSeek Team
 
-One Linux package for **Codex and/or Claude Code coordinators** delegating bounded coding work to DeepSeek workers. Workers are read-only by default and can opt into source creation/editing inside a clean linked Git worktree.
+One Linux package for **Codex and/or Claude Code coordinators** delegating bounded coding work to DeepSeek workers. The current source supports configurable **25/50/75% delegation profiles**, independent `read-only/full-access` policy, reusable isolated development copies, and the legacy exact-file writer.
 
-**The coordinator owns:** scope, architecture, security decisions, final diff review, tests and integration. **DeepSeek contributes:** focused research, review, boilerplate, tests and bounded implementation. The coordinator should verify the result rather than repeat the entire delegated investigation.
+**The coordinator owns:** scope, architecture, security decisions, final diff review, integration, commits and production actions. **DeepSeek contributes:** focused research/review and, when full-access is selected, independent implementation, local tests/builds and documentation inside a dedicated copy. The coordinator should verify useful evidence instead of automatically repeating the whole delegated investigation or rewriting correct code.
 
-Version **0.3.0** supports **Linux, Python 3.11+, Git, Bubblewrap, and Codex CLI and/or Claude Code CLI**. Ubuntu has first-class AppArmor setup for its restricted unprivileged-user-namespace policy. A DeepSeek API key is required for live work. There are no Python runtime dependencies; Bubblewrap/AppArmor are system components.
+The percentages are **target work-distribution profiles**, not measured token/time/line quotas and not promises of exact useful contribution. Small or inseparable tasks may delegate less. Without any new settings, behavior remains compatible: the default is **25% + access=auto → read-only**.
+
+The repository currently reports version **0.3.0**; this feature work does not itself publish a release. The source supports **Linux, Python 3.11+, Git, Bubblewrap, and Codex CLI and/or Claude Code CLI**. Ubuntu has first-class AppArmor setup for its restricted unprivileged-user-namespace policy. A DeepSeek API key is required for live work. There are no Python runtime dependencies; Bubblewrap/AppArmor are system components.
 
 ## Ubuntu install — recommended
 
@@ -94,9 +96,11 @@ Worker startup is fail-closed by default:
 
 There is no automatic unsandboxed fallback.
 
-## Codex and Claude use Bubblewrap differently
+## Isolation modes
 
-DeepSeek Team deliberately does **not** put both coordinator CLIs inside the same outer namespace.
+The existing read-only and legacy exact-file writer paths retain their hybrid runtime-specific boundary. Managed development copies used by the new full-access mode use a stricter sparse outer Bubblewrap boundary for **both** runtimes.
+
+### Legacy/read-only runtime boundary
 
 ### Codex worker
 
@@ -129,9 +133,17 @@ Claude Code does not provide the same native Linux Bubblewrap boundary for these
 
 Claude itself still runs `--bare`, with no session persistence. Built-in tools are restricted to `Read,Glob,Grep` for review and `Read,Glob,Grep,Edit,Write` for writer work; Bash, web tools and agents are absent, MCP tools are explicitly denied, and writer approval rules are path-scoped `Edit(./exact/file)` entries.
 
-### Network boundary
+### Managed full-access boundary
 
-The coordinator CLI must reach the DeepSeek API, so the outer Claude Bubblewrap policy intentionally **does not unshare the network namespace**. This release does not claim network isolation. Network-facing model tools remain excluded by the Claude tool surface, while Codex keeps its own sandbox/network policy.
+Managed development copies are not the legacy writer sandbox. For both Codex and Claude, DeepSeek Team surrounds the runtime with a sparse Bubblewrap namespace that exposes only the owned working copy, required runtime prefixes, a temporary HOME and a per-run control directory. Git administrative files are remounted read-only. The namespace uses `--unshare-net`; the worker cannot reach arbitrary host/network services.
+
+DeepSeek API access is provided only through a fixed-destination host relay connected to the namespace through a per-run Unix socket and namespace-local loopback bridge. The real provider credential stays in the host-side relay; the isolated runtime sees only a synthetic local credential. The relay is not a general proxy and accepts only the provider endpoints needed by the supported runtime protocols.
+
+Full-access therefore means **full development access to the assigned copy**, not full host access. It does not grant access to the user's other checkouts, dirty source checkout, secrets, production databases, system services, deployment credentials, publishing or Git integration/commits.
+
+### Legacy network boundary
+
+The legacy Claude review/exact-file path still must reach DeepSeek directly, so that older outer Claude sandbox intentionally does **not** unshare the network namespace. Network-facing model tools remain excluded by the Claude tool surface, while legacy Codex keeps its own sandbox/network policy.
 
 ## DeepSeek credential
 
@@ -144,6 +156,43 @@ deepseek-team auth status    # availability only
 
 The saved key is `~/.config/codex-deepseek/api-key`, directory mode `700`, file mode `600`. `DEEPSEEK_API_KEY` overrides it. For automation, pipe a secret manager to `deepseek-team auth set --stdin`. Never put a key in command arguments, repository files or worker prompts.
 
+## Delegation profiles and access
+
+Settings are layered independently:
+
+`CLI arguments > project settings > global settings > defaults`.
+
+| Profile | `access=auto` | Intended practice |
+| --- | --- | --- |
+| **25%** | `read-only` | Bounded research, diagnosis and review; coordinator performs the main implementation. |
+| **50%** | `full-access` | Delegate independent implementation slices and their tests before doing the same work locally; coordinator owns architecture/interfaces and integration. |
+| **75%** | `full-access` | Delegate most separable implementation, tests, docs and independent review; use up to three workers only when assignments are genuinely independent. |
+
+Access is independent of the target percentage. An explicit `read-only` remains read-only at 50/75, and an explicit `full-access` can be selected at 25. Changing the percentage does not overwrite an explicit access choice; return access to `auto` when you want profile defaults again.
+
+Examples:
+
+```bash
+# Project policy
+deepseek-team config set --project --delegation-level 50 --access auto
+
+# User-wide policy
+deepseek-team config set --global --delegation-level 25 --access read-only
+
+# Effective values plus the source of each field
+deepseek-team config show --effective
+deepseek-team config show --effective --json
+
+# One-job override
+deepseek-team worker --runtime codex --delegation-level 75 --access full-access
+```
+
+Project settings live in `.deepseek-team.toml`; global settings live under the user's XDG config directory. Settings are snapshotted when a new job starts and do not change permissions of an already running process.
+
+`config show --effective --instructions --runtime codex|claude` renders the current coordinator guidance. Managed AGENTS.md/CLAUDE.md blocks tell the coordinator to resolve this current policy before each assignment instead of relying on a stale percentage embedded in the file.
+
+`doctor` resolves and prints the same effective policy. When effective access is full-access it checks the managed runtime capability surface that will actually be used; it refuses to validate full-access with `--os-sandbox off`.
+
 ## Project integration
 
 `init` manages one marked instruction block in the coordinator-native file:
@@ -152,7 +201,9 @@ The saved key is `~/.config/codex-deepseek/api-key`, directory mode `700`, file 
 - Claude Code: `CLAUDE.md`
 - `--coordinator both`: both files
 
-Existing bytes outside the managed block and file permissions are preserved. Managed instructions require the OS sandbox and explicitly tell coordinators **not** to add `--os-sandbox off`; if the sandbox is unavailable, fix it or continue locally.
+Existing bytes outside the managed block and file permissions are preserved. Managed instructions require the OS sandbox and explicitly tell coordinators **not** to add `--os-sandbox off`; if the sandbox is unavailable, fix it or continue locally. At 50/75 full-access the guidance explicitly says to delegate an independent implementation slice **before** the coordinator independently implements the same slice, while architecture, final verification and integration remain coordinator-owned.
+
+Changing project settings refreshes package-owned managed blocks when present, without changing surrounding user text. The block still resolves the current policy before every new assignment.
 
 Re-run `init` after package upgrades to refresh the managed block:
 
@@ -184,7 +235,49 @@ TASK
 
 `--runtime auto` prefers Codex when both CLIs are available, otherwise Claude Code. Package-managed instructions use an explicit runtime so coordinator behavior does not silently switch.
 
-## Delegate code creation/editing
+## Managed full-access development
+
+With effective `full-access`, `deepseek-team worker` creates an owned isolated copy from the source repository's **committed HEAD** unless an existing owned workspace is supplied. The worker may create, edit and delete previously unlisted project files and may run local tests/builds using dependencies prepared in that copy.
+
+The original checkout is never cleaned or adopted. Dirty, untracked and ignored user files remain untouched and are **not silently copied** into the worker environment. If the task depends on them, the coordinator must deliberately provide safe source context rather than asking the user to clean their checkout.
+
+Typical one-shot use:
+
+```bash
+deepseek-team worker --runtime claude --delegation-level 50 --access full-access <<'TASK'
+Implement the bounded parser fix.
+Acceptance criteria:
+- preserve the public parser API;
+- add a regression test for empty input;
+- run the focused local tests;
+- report changed files and checks actually run.
+TASK
+```
+
+For prepared dependencies or sequential iterations, explicitly create/reuse an owned workspace:
+
+```bash
+deepseek-team workspace create /path/to/project
+# note the printed workspace ID
+
+deepseek-team workspace prepare WORKSPACE_ID -- python3 -m venv .venv
+deepseek-team workspace prepare WORKSPACE_ID -- .venv/bin/pip install -r requirements.txt
+
+deepseek-team worker --runtime codex --workspace WORKSPACE_ID --access full-access <<'TASK'
+Implement the assigned change and run the relevant local tests.
+TASK
+
+deepseek-team workspace diff WORKSPACE_ID
+```
+
+A successful modified workspace can be reused for another iteration. If execution fails after partial edits, files and a recorded diff are retained. A further implementation does **not** start automatically; inspect the workspace first, then continue explicitly with `--resume-after-failure --workspace WORKSPACE_ID`.
+
+Up to three workers may run concurrently. Each full-access assignment owns a separate copy and lock; one worker cannot see another worker's copy or the user's source checkout. The coordinator remains responsible for final review, integration, committing, pushing and deployment.
+
+## Legacy exact-file writer
+
+The pre-existing `--write --allow-write` mode remains available when a precise file allowlist is desired. It keeps the clean linked-worktree requirement, forbids worker-run tests/builds, and verifies the exact allowed paths after execution. It is intentionally narrower than managed full-access and cannot be combined with `--access` or `--workspace`.
+
 
 Start from a committed baseline and use a **clean linked worktree** on a dedicated `codex/` or `deepseek/` branch:
 
