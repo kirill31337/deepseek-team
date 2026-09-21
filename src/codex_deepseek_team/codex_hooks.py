@@ -111,10 +111,10 @@ def handle(payload: dict) -> dict:
                 deliverable for deliverable in task.get("deliverables", [])
                 if any(_overlap(path, scope) for scope in deliverable.get("scope", []))
             ]
-            if task.get("classification") == "substantial" and not matching:
+            if not matching:
                 return _deny(
                     f"Unplanned mutation scope {path}. Revisit the distribution before "
-                    "starting a new substantial block of work.")
+                    "starting a new block of work.")
             for deliverable in matching:
                 assignment = next((row for row in task.get("assignments", [])
                                    if row.get("deliverable_id") == deliverable.get("id")), None)

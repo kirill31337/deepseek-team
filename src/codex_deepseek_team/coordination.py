@@ -254,8 +254,14 @@ def plan_task(root: Path, task_id: str, plan: dict) -> dict:
     if classification not in ("substantial", "small"):
         raise CoordinationError("classification must be substantial or small.", 64)
     deliverables = [_normalize_deliverable(x) for x in plan.get("deliverables", [])]
-    if classification == "small" and (len(deliverables) != 1 or not plan.get("small_evidence")):
-        raise CoordinationError("Small tasks require one deliverable and concrete small_evidence.", 64)
+    if classification == "small":
+        if len(deliverables) != 1 or not plan.get("small_evidence"):
+            raise CoordinationError("Small tasks require one deliverable and concrete small_evidence.", 64)
+        scopes = deliverables[0].get("scope", [])
+        if len(scopes) != 1 or any("*" in value or "?" in value or "[" in value for value in scopes):
+            raise CoordinationError(
+                "Small-task exemption requires one concrete non-wildcard scope; "
+                "otherwise register a substantial distribution.", 64)
     root = _project_root(root)
     with _lock(root):
         task = load_task(root, task_id)
