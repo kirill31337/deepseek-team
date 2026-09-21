@@ -256,6 +256,22 @@ class ReadinessAndAttributionTests(CoordinationCase):
 
 
 
+class WorkspaceImportCliTests(CoordinationCase):
+    def test_workspace_import_cli_copies_only_explicit_selected_file(self):
+        from codex_deepseek_team import delegation_cli
+        copy = workspace.create(self.repo, self.state)
+        (self.repo / "selected.py").write_text("selected\n")
+        (self.repo / "other.py").write_text("other\n")
+        code = delegation_cli.main([
+            "workspace", "import", "--state-dir", str(self.state),
+            copy.id, "--include", "selected.py",
+        ])
+        self.assertEqual(code, 0)
+        self.assertEqual((copy.path / "selected.py").read_text(), "selected\n")
+        self.assertFalse((copy.path / "other.py").exists())
+        loaded = workspace.load(self.state, copy.id)
+        self.assertIn("selected.py", loaded.metadata["prepared_paths"])
+
 class CoordinationCliTests(CoordinationCase):
     def test_plan_cli_persists_machine_readable_assignments_and_rejects_bad_75_plan(self):
         from codex_deepseek_team import coordination_cli
