@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from codex_deepseek_team import project, settings
+from codex_deepseek_team import project, settings, workspace
 
 try:
     from codex_deepseek_team import coordination, codex_hooks
@@ -150,6 +150,33 @@ class StateAndDistributionTests(CoordinationCase):
                                 evidence="reproduced and fixed as defect #2")
         reloaded = coordination.load_task(self.repo, task["id"])
         self.assertEqual(reloaded["assignments"][0]["disposition"]["kind"], "reproduced")
+
+
+class ReadinessAndAttributionTests(CoordinationCase):
+    def test_missing_declared_command_fails_readiness_before_worker(self):
+        task = self.start()
+        planned = coordination.plan_task(self.repo, task["id"], {
+            "classification": "substantial",
+            "deliverables": [
+                {"id": "jvm", "kind": "implementation", "scope": ["a.py"],
+                 "executor": "worker", "acceptance": ["jvm tests pass"],
+                 "dependencies": [{"kind": "command", "value": "definitely-missing-jdk-tool"}],
+                 "checks": ["definitely-missing-jdk-tool test"]},
+            ],
+        })
+        copy = workspace.create(self.repo, self.state)
+        with self.assertRaises(coordination.CoordinationError) as caught:
+            coordination.ensure_assignment_ready(self.repo, task["id"],
+                                                 planned["assignments"][0]["id"], copy)
+        self.assertIn("missing", str(caught.exception).lower())
+
+    def test_snapshot_attributes_only_worker_delta_not_coordinator_preparation(self):
+        copy = workspace.create(self.repo, self.state)
+        (copy.path / "prepared.py").write_text("prepared by coordinator\n")
+        before = workspace.content_snapshot(copy)
+        (copy.path / "a.py").write_text("VALUE = 2\n")
+        self.assertEqual(workspace.changed_since(copy, before), ["a.py"])
+
 
 
 class CodexHookTests(CoordinationCase):
