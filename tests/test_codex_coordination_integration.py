@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 import threading
 import unittest
+import unittest.mock
 
 from codex_deepseek_team import config, coordination, project, settings
 
@@ -192,7 +193,9 @@ class RealCodexCoordinatorHookTests(unittest.TestCase):
                 self.assertIsNotNone(state["assignment_id"], str(tool_outputs))
                 self.assertEqual((repo / "a.py").read_text(), "VALUE = 1\n",
                                  "Coordinator mutation reached disk despite pending worker assignment")
-                task = coordination.load_task(repo, state["task_id"])
+                with unittest.mock.patch.dict(
+                        os.environ, {"DEEPSEEK_TEAM_STATE_DIR": str(root / "state")}):
+                    task = coordination.load_task(repo, state["task_id"])
                 self.assertEqual(task["assignments"][0]["status"], "planned")
                 self.assertEqual(task["assignments"][0]["id"], state["assignment_id"])
                 combined = "\n".join(tool_outputs) + result.stdout + result.stderr
