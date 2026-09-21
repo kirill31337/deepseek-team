@@ -73,6 +73,14 @@ class PolicyResolutionTests(RepoCase):
         self.assertEqual(cli.sources['delegation_level'], 'cli')
         self.assertEqual(cli.sources['access'], 'cli')
 
+    def test_read_only_override_keeps_high_delegation_target_without_write_authority(self):
+        policy = settings.resolve(self.repo, delegation_level=75, access='read-only')
+        text = settings.instructions(policy, 'codex')
+        self.assertIn('Delegate most separable analysis', text)
+        self.assertIn('up to three read-only workers', text)
+        self.assertIn('Actual access is read-only', text)
+        self.assertNotIn('Allow the worker to create/edit/delete any project files', text)
+
     def test_invalid_values_fail_closed(self):
         with self.assertRaises(settings.SettingsError):
             settings.resolve(self.repo, delegation_level=40)
