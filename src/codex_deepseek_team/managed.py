@@ -62,6 +62,7 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
                                      requested_access=policy.access, effective_access=policy.effective_access,
                                      configuration_sources=dict(policy.sources), runtime=runtime)
                 copy.save()
+                provider = None
                 try:
                     with relay.ProviderRelay(control / 'provider.sock', key) as provider:
                         timeout = max(0.001, args.timeout - (time.monotonic() - started)) if args.timeout else None
@@ -91,7 +92,12 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
                     return code
                 except BaseException as error:
                     code = 130 if isinstance(error, KeyboardInterrupt) else getattr(error, 'code', 71)
-                    kind = 'verification' if isinstance(error, workspace.WorkspaceError) and code == 73 else 'execution'
+                    if isinstance(error, workspace.WorkspaceError) and code == 73:
+                        kind = 'verification'
+                    elif provider is not None and getattr(provider, 'failures', ()):
+                        kind = 'provider'
+                    else:
+                        kind = 'execution'
                     try:
                         copy.finish('failed', error_kind=kind, exit_code=code)
                     except (workspace.WorkspaceError, OSError):
