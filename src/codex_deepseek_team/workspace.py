@@ -202,6 +202,42 @@ class Workspace:
         self.save()
 
 
+def content_snapshot(copy: Workspace) -> dict[str, str]:
+    """Hash visible tracked/untracked project content for worker attribution."""
+    copy.verify()
+    names = git(copy.path, 'ls-files', '--cached', '--others', '--exclude-standard', '-z')
+    result = {}
+    for raw in names.split(b'\0'):
+        if not raw:
+            continue
+        name = os.fsdecode(raw)
+        path = copy.path / name
+        digest = hashlib.sha256()
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            result[name] = 'missing'
+            continue
+        digest.update(str(stat.S_IMODE(info.st_mode)).encode() + b'\0')
+        if path.is_symlink():
+            digest.update(b'L' + os.fsencode(os.readlink(path)))
+        elif path.is_file():
+            digest.update(b'F')
+            with path.open('rb') as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b''):
+                    digest.update(chunk)
+        else:
+            digest.update(b'O')
+        result[name] = digest.hexdigest()
+    return result
+
+
+def changed_since(copy: Workspace, before: dict[str, str]) -> list[str]:
+    after = content_snapshot(copy)
+    return sorted(name for name in set(before) | set(after)
+                  if before.get(name) != after.get(name))
+
+
 def create(source: Path, state: Path = DEFAULT_STATE) -> Workspace:
     try:
         source = project_root(source, required=True)

@@ -15,6 +15,8 @@ from pathlib import Path
 import re
 import stat
 import subprocess
+import shutil
+import shlex
 import tempfile
 import time
 from typing import Any
@@ -341,6 +343,63 @@ def record_coordinator_event(root: Path, task_id: str, kind: str,
         })
         task["updated_at"] = time.time()
         _atomic(_task_path(root, task_id), task)
+
+
+def assignment_deliverable(task: dict, assignment_id: str) -> dict:
+    row = _assignment(task, assignment_id)
+    for item in task.get('deliverables', []):
+        if item.get('id') == row.get('deliverable_id'):
+            return item
+    raise CoordinationError('Assignment deliverable is missing.', 64)
+
+
+def _command_available(copy, token: str) -> bool:
+    if token.startswith('./') or '/' in token:
+        path = (copy.path / token).resolve() if not Path(token).is_absolute() else Path(token)
+        try:
+            return path.is_file() and os.access(path, os.X_OK)
+        except OSError:
+            return False
+    search = os.pathsep.join([
+        str(copy.path / '.venv/bin'),
+        str(copy.path / 'node_modules/.bin'),
+        os.environ.get('PATH', ''),
+    ])
+    return shutil.which(token, path=search) is not None
+
+
+def ensure_assignment_ready(root: Path, task_id: str, assignment_id: str, copy) -> dict:
+    """Fail preparation before provider access when declared prerequisites are absent."""
+    task = load_task(root, task_id)
+    if copy.metadata.get('base_head') != task.get('base_head'):
+        raise CoordinationError('Workspace source version does not match the coordination task base HEAD.', 78)
+    item = assignment_deliverable(task, assignment_id)
+    missing = []
+    for dep in item.get('dependencies', []):
+        if not isinstance(dep, dict) or dep.get('kind') not in ('command', 'path'):
+            raise CoordinationError('Dependencies must use kind=command or kind=path.', 64)
+        value = str(dep.get('value') or '')
+        if dep['kind'] == 'command':
+            if not value or not _command_available(copy, value):
+                missing.append('command:' + value)
+        else:
+            path = copy.path / value
+            if not value or not path.exists():
+                missing.append('path:' + value)
+    for command in item.get('checks', []):
+        try:
+            parts = shlex.split(command)
+        except ValueError:
+            raise CoordinationError('Invalid declared verification command.', 64) from None
+        if not parts:
+            raise CoordinationError('Empty declared verification command.', 64)
+        if not _command_available(copy, parts[0]):
+            missing.append('check-command:' + parts[0])
+    if missing:
+        raise CoordinationError(
+            'Preparation missing declared dependencies/check runtime: ' + ', '.join(sorted(set(missing))) +
+            '. Prepare the owned workspace explicitly; stubs are not equivalent verification.', 78)
+    return item
 
 
 def summary(task: dict) -> str:
