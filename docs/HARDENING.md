@@ -1,5 +1,31 @@
 # Worker boundary hardening
 
+## Unreleased — configurable delegation and managed development copies
+
+The 25/50/75 delegation levels are policy for **how the coordinator distributes work**, not a security primitive and not a measured utilization percentage. Security-relevant access is resolved separately as `auto | read-only | full-access` with precedence `CLI > project > global > defaults`. The resolved policy is snapshotted for each new job.
+
+`read-only` remains enforced by launch permissions. In managed-copy mode the whole runtime is inside a Bubblewrap namespace with the project copy mounted read-only; model instructions are additional guidance, not the write barrier.
+
+`full-access` means development access to one package-owned copy only. It is **not** host full access. The managed boundary for both Codex and Claude uses:
+
+- a sparse mount namespace rather than a read-only bind of the host root;
+- only required system/runtime files plus the assigned copy, temporary HOME and control directory;
+- `--unshare-user --unshare-pid --unshare-ipc --unshare-uts --unshare-net`;
+- dropped capabilities and disabled nested user namespaces;
+- the working tree writable, but its `.git` administrative directory remounted read-only;
+- no visibility of the original checkout or sibling workers;
+- no direct network route to provider or host services;
+- a per-run Unix-socket provider capability with a fixed DeepSeek destination and endpoint allowlist;
+- the real DeepSeek credential retained only in the host-side relay.
+
+The runtime may create/edit/delete arbitrary project files and run local tests/builds inside that copy. This is intentionally broader than the legacy exact-file writer, but publication, deployment, production services, secrets and Git integration/commits remain coordinator-owned.
+
+Owned workspaces are created from committed HEAD. Source dirty/untracked/ignored files are neither cleaned nor silently copied. Reopening a copy verifies its identity and Git administrative digest; another worker cannot take an active copy because an exclusive owner lock is required. A failed/interrupted copy is retained and cannot be resumed without explicit `--resume-after-failure`; no automatic implementation retry is performed over uncertain state.
+
+The legacy `--write --allow-write` path remains unchanged for users who want an exact file allowlist. It continues to use the older writer rules and does not gain test/build permission.
+
+Managed AGENTS.md/CLAUDE.md text describes the current policy but is not treated as containment. The worker and doctor independently resolve policy and verify the actual runtime/sandbox surface before access is granted.
+
 ## 0.3.0 — Bubblewrap + Ubuntu AppArmor (2026-09-16)
 
 DeepSeek Team now requires a usable Linux Bubblewrap backend before a worker reads the DeepSeek credential. There is no automatic unsandboxed fallback. An explicit `--os-sandbox off` exists only for diagnosis/legacy compatibility, prints a warning, and is never emitted by managed `AGENTS.md` / `CLAUDE.md` instructions.
