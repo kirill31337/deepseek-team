@@ -89,7 +89,8 @@ class StateAndDistributionTests(CoordinationCase):
                  "executor": "coordinator", "acceptance": ["decision"], "dependencies": [], "checks": []},
                 {"id": "release", "kind": "metadata", "scope": ["signed-release"],
                  "executor": "coordinator",
-                 "retention": {"code": "secret_or_signing", "evidence": "signing key is coordinator-only"},
+                 "retention": {"code": "secret_or_signing", "sensitive": True,
+                               "evidence": "signing key is coordinator-only"},
                  "acceptance": ["signed"], "dependencies": [], "checks": []},
             ],
         })
