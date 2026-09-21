@@ -213,6 +213,10 @@ class CoordinationCliTests(CoordinationCase):
 
 
 class CodexHookTests(CoordinationCase):
+    def setUp(self):
+        super().setUp()
+        project.attach(self.repo, coordinator="codex")
+
     def hook(self, name, **extra):
         payload = {
             "session_id": "sess-1", "turn_id": "turn-1", "cwd": str(self.repo),
