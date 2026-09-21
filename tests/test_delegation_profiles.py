@@ -73,6 +73,21 @@ class PolicyResolutionTests(RepoCase):
         self.assertEqual(cli.sources['delegation_level'], 'cli')
         self.assertEqual(cli.sources['access'], 'cli')
 
+    def test_codex_instructions_require_coordination_protocol_not_percentage_counting(self):
+        policy = settings.resolve(self.repo, delegation_level=75, access='full-access')
+        text = settings.instructions(policy, 'codex')
+        self.assertIn('coordination plan', text)
+        self.assertIn('--coord-task', text)
+        self.assertIn('coordination use', text)
+        self.assertIn('Codex PreToolUse', text)
+        self.assertIn('Do not calculate an actual useful-work percentage', text)
+
+    def test_claude_instructions_label_process_as_instruction_driven(self):
+        policy = settings.resolve(self.repo, delegation_level=75, access='full-access')
+        text = settings.instructions(policy, 'claude')
+        self.assertIn('instruction-driven', text)
+        self.assertNotIn('Claude PreToolUse gate', text)
+
     def test_read_only_override_keeps_high_delegation_target_without_write_authority(self):
         policy = settings.resolve(self.repo, delegation_level=75, access='read-only')
         text = settings.instructions(policy, 'codex')
