@@ -181,7 +181,7 @@ class RealCodexCoordinatorHookTests(unittest.TestCase):
                 )
                 result = subprocess.run([
                     binary, "exec", "--strict-config", "--ephemeral", "--json",
-                    "--sandbox", "workspace-write", "--dangerously-bypass-hook-trust",
+                    "--sandbox", "danger-full-access", "--dangerously-bypass-hook-trust",
                     "-C", str(repo),
                     "Implement the feature. Follow all project and lifecycle-hook instructions."
                 ], env=env, text=True, capture_output=True, timeout=45, check=False)
