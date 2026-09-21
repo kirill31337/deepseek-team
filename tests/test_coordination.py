@@ -96,6 +96,26 @@ class StateAndDistributionTests(CoordinationCase):
         })
         self.assertEqual(coordination.validate_task(self.repo, task["id"]), [])
 
+    def test_user_explicit_retention_is_not_self_asserted_by_coordinator(self):
+        task = self.start()
+        coordination.plan_task(self.repo, task["id"], {
+            "classification": "substantial",
+            "deliverables": [
+                {"id": "impl", "kind": "implementation", "scope": ["a.py"],
+                 "executor": "coordinator",
+                 "retention": {
+                     "code": "user_explicit", "source": "user",
+                     "prompt_sha256": task["prompt_sha256"],
+                     "evidence": "coordinator claims user wanted local implementation"
+                 },
+                 "acceptance": ["done"], "dependencies": [], "checks": []},
+                {"id": "review", "kind": "review", "scope": ["a.py"],
+                 "executor": "worker", "acceptance": ["findings"], "dependencies": [], "checks": []},
+            ],
+        })
+        issues = coordination.validate_task(self.repo, task["id"])
+        self.assertTrue(any("impl" in item for item in issues), issues)
+
     def test_technical_retention_reason_requires_runner_record_not_free_text(self):
         task = self.start()
         coordination.plan_task(self.repo, task["id"], {
