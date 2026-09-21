@@ -22,7 +22,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from codex_deepseek_team import managed, relay, sandbox, settings, worker, workspace
+from codex_deepseek_team import coordination, managed, relay, sandbox, settings, worker, workspace
 
 DRIVER = r'''#!/usr/bin/env python3
 import errno,json,os,pathlib,socket,subprocess,sys
@@ -103,7 +103,8 @@ class LiveBase(unittest.TestCase):
         self.source.mkdir()
         self.state = self.root / 'state'
         self.env_patch = patch.dict(os.environ, {'XDG_CONFIG_HOME': str(self.root / 'config'),
-                                               'DEEPSEEK_API_KEY': 'actual-host-credential'})
+                                               'DEEPSEEK_API_KEY': 'actual-host-credential',
+                                               'DEEPSEEK_TEAM_STATE_DIR': str(self.state)})
         self.env_patch.start()
         self.addCleanup(self.env_patch.stop)
         (self.source / 'calc.py').write_text('def add(a,b): return a-b\n')
@@ -117,7 +118,8 @@ class LiveBase(unittest.TestCase):
     def args(self, task, **changes):
         args = dict(task=task, os_sandbox='required', attempts=1, attempts_explicit=False,
                     runtime='claude', codex='codex', claude=str(self.driver),
-                    state_dir=self.state, timeout=40, resume_after_failure=False)
+                    state_dir=self.state, timeout=40, resume_after_failure=False,
+                    coord_task=None, coord_assignment=None)
         args.update(changes)
         return SimpleNamespace(**args)
 
@@ -184,6 +186,32 @@ class LiveDemoTests(LiveBase):
         self.assertEqual(managed.run(self.args(self.task('fix',sibling)),self.policy(50),worker,copy),0)
         self.assertEqual((copy.path/'partial.py').read_text(),'completed')
 
+
+    def test_managed_runner_automatically_records_assignment_checks_and_worker_delta(self):
+        copy = workspace.create(self.source, self.state)
+        policy = self.policy(50)
+        task = coordination.open_task(
+            self.source, session_id='session-runner', turn_id='turn-runner',
+            prompt='implement fix', policy=policy)
+        planned = coordination.plan_task(self.source, task['id'], {
+            'classification': 'substantial',
+            'deliverables': [{
+                'id': 'impl', 'kind': 'implementation', 'scope': ['calc.py', 'test_calc.py'],
+                'executor': 'worker', 'acceptance': ['sum fixed'],
+                'dependencies': [{'kind': 'command', 'value': 'python3'}],
+                'checks': ['python3 -m unittest discover -q'],
+            }],
+        })
+        aid = planned['assignments'][0]['id']
+        args = self.args(self.task('fix', copy), coord_task=task['id'], coord_assignment=aid)
+        self.assertEqual(managed.run(args, policy, worker, copy), 0)
+        record = coordination.load_task(self.source, task['id'])
+        assignment = record['assignments'][0]
+        self.assertEqual(assignment['status'], 'succeeded')
+        self.assertEqual(assignment['workspace_id'], copy.id)
+        self.assertTrue(any(row['exit_code'] == 0 for row in assignment['checks']))
+        self.assertIn('calc.py', assignment['worker_changes'])
+        self.assertNotIn('calc.py', assignment['prepared_changes'])
 
     def test_provider_failure_is_distinguished_even_when_runtime_output_is_malformed(self):
         copy, sibling = [workspace.create(self.source,self.state) for _ in range(2)]
