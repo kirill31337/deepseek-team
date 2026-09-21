@@ -190,6 +190,46 @@ def latest_task(root: Path, session_id: str) -> dict | None:
     return max(rows, key=lambda x: x.get("updated_at", 0), default=None)
 
 
+def active_task(root: Path, session_id: str) -> dict | None:
+    task = latest_task(root, session_id)
+    if task is not None and task.get('status') != 'completed':
+        return task
+    return None
+
+
+def begin_turn(root: Path, *, session_id: str, turn_id: str, prompt: str,
+               policy: settings.Policy) -> dict:
+    """Reuse unfinished work across Stop continuations and compaction."""
+    existing = active_task(root, session_id)
+    if existing is None:
+        task = open_task(root, session_id=session_id, turn_id=turn_id,
+                         prompt=prompt, policy=policy)
+        task.setdefault('turns', [turn_id])
+        task.setdefault('prompt_hashes', [task['prompt_sha256']])
+        _atomic(_task_path(root, task['id']), task)
+        return task
+    with _lock(root):
+        task = load_task(root, existing['id'])
+        turns = task.setdefault('turns', [])
+        if turn_id not in turns:
+            turns.append(turn_id)
+        task.setdefault('prompt_hashes', []).append(
+            hashlib.sha256(prompt.encode('utf-8', errors='replace')).hexdigest())
+        task['updated_at'] = time.time()
+        _atomic(_task_path(root, task['id']), task)
+        return task
+
+
+def complete_task(root: Path, task_id: str) -> dict:
+    with _lock(root):
+        task = load_task(root, task_id)
+        task['status'] = 'completed'
+        task['completed_at'] = time.time()
+        task['updated_at'] = task['completed_at']
+        _atomic(_task_path(root, task_id), task)
+        return task
+
+
 def _normalize_deliverable(raw: dict) -> dict:
     if not isinstance(raw, dict):
         raise CoordinationError("Each deliverable must be an object.", 64)
@@ -220,14 +260,23 @@ def plan_task(root: Path, task_id: str, plan: dict) -> dict:
     root = _project_root(root)
     with _lock(root):
         task = load_task(root, task_id)
-        old = {a["deliverable_id"]: a for a in task.get("assignments", [])
-               if a.get("status") not in ("planned",)}
+        previous = {a["deliverable_id"]: a for a in task.get("assignments", [])}
+        incoming_ids = {item["id"] for item in deliverables}
+        historical_missing = [
+            row["deliverable_id"] for row in task.get("assignments", [])
+            if row.get("status") not in ("planned",) and row.get("deliverable_id") not in incoming_ids
+        ]
+        if historical_missing:
+            raise CoordinationError(
+                "Plan revision cannot remove started/completed worker deliverables: " +
+                ", ".join(historical_missing) +
+                ". Add a new deliverable id for revised scope.", 64)
         assignments = []
         for item in deliverables:
             if item["executor"] != "worker":
                 continue
-            if item["id"] in old:
-                assignments.append(old[item["id"]])
+            if item["id"] in previous:
+                assignments.append(previous[item["id"]])
                 continue
             assignment_id = "as-" + hashlib.sha256(
                 f"{task_id}\0{item['id']}".encode()).hexdigest()[:16]
