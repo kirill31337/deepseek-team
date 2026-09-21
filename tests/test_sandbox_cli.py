@@ -67,6 +67,31 @@ class DoctorSandboxTests(unittest.TestCase):
         self.assertEqual(code, 0)
         os_check.assert_not_called()
 
+    def test_doctor_reports_codex_coordination_layers_without_claiming_trust(self):
+        backend = sandbox.SandboxBackend(('/usr/bin/bwrap',), '/usr/bin/bwrap', 'direct')
+        policy = mock.Mock(effective_access='read-only')
+        policy.delegation_level = 75
+        policy.access = 'read-only'
+        policy.sources = {'delegation_level': 'project:x', 'access': 'project:x'}
+        with mock.patch.object(doctor, 'resolve_policy', return_value=policy), \
+             mock.patch.object(doctor.worker, 'resolve_os_sandbox', return_value=(sandbox, backend)), \
+             mock.patch.object(doctor, 'selected_runtimes', return_value=('codex',)), \
+             mock.patch.object(doctor, 'check_policy_runtime'), \
+             mock.patch.object(doctor, 'coordination_status',
+                               return_value=('installed', 'attached', 'native trust must be checked with Codex /hooks')), \
+             mock.patch('codex_deepseek_team.settings.describe', return_value='policy'), \
+             mock.patch('sys.stdout', new_callable=io.StringIO) as output:
+            code = doctor.main(['--offline', '--runtime', 'codex'])
+        self.assertEqual(code, 0)
+        text = output.getvalue()
+        self.assertIn('Coordination hooks: installed', text)
+        self.assertIn('Project coordination binding: attached', text)
+        self.assertIn('native trust must be checked', text)
+        self.assertNotIn('trusted: yes', text.lower())
+
+    def test_doctor_labels_claude_coordinator_as_instruction_driven(self):
+        self.assertIn('instruction-driven', doctor.coordination_status('claude')[2])
+
     def test_live_worker_call_forwards_required_os_sandbox(self):
         with mock.patch.object(doctor.subprocess, 'run', return_value=SimpleNamespace(returncode=0)) as run:
             doctor.call('task', cwd='.', runtime='claude', os_sandbox='required')
