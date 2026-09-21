@@ -82,6 +82,34 @@ class ConfigTests(unittest.TestCase):
             with self.assertRaises(config.ConfigError):
                 config.save_key(key)
 
+    def test_codex_hooks_install_is_user_level_stable_and_reversible(self):
+        custom = {
+            "hooks": {
+                "SessionStart": [{"hooks": [{"type": "command", "command": "custom-hook"}]}]
+            }
+        }
+        (self.home / "hooks.json").write_text(__import__("json").dumps(custom))
+        self.assertTrue(config.install_codex_hooks(self.home))
+        installed = __import__("json").loads((self.home / "hooks.json").read_text())
+        text = (self.home / "hooks.json").read_text()
+        self.assertIn("custom-hook", text)
+        self.assertIn("deepseek-team coordinator-hook", text)
+        self.assertIn("SessionStart", installed["hooks"])
+        self.assertIn("UserPromptSubmit", installed["hooks"])
+        self.assertIn("PreToolUse", installed["hooks"])
+        self.assertIn("Stop", installed["hooks"])
+        self.assertNotIn("PostToolUse", [
+            key for key, groups in installed["hooks"].items()
+            if any(h.get("command") == "deepseek-team coordinator-hook"
+                   for g in groups for h in g.get("hooks", []) if isinstance(h, dict))
+        ])
+        before = (self.home / "hooks.json").read_bytes()
+        self.assertFalse(config.install_codex_hooks(self.home))
+        self.assertEqual((self.home / "hooks.json").read_bytes(), before)
+        self.assertTrue(config.remove_codex_hooks(self.home))
+        self.assertIn("custom-hook", (self.home / "hooks.json").read_text())
+        self.assertNotIn("deepseek-team coordinator-hook", (self.home / "hooks.json").read_text())
+
     def test_invalid_key_does_not_replace_existing_key(self):
         key = secrets.token_hex(24)
         with mock.patch.dict(os.environ, {'HOME': str(self.home)}, clear=True):

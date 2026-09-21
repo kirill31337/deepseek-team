@@ -242,6 +242,29 @@ class CodexHookTests(CoordinationCase):
         self.assertIn("important initial review", text)
         self.assertIn(aid, text)
 
+    def test_stop_continuation_reuses_same_task_instead_of_losing_assignments(self):
+        self.hook("UserPromptSubmit", prompt="implement feature")
+        task = coordination.latest_task(self.repo, "sess-1")
+        planned = coordination.plan_task(self.repo, task["id"], {
+            "classification": "substantial",
+            "deliverables": [
+                {"id": "review", "kind": "review", "scope": ["a.py"],
+                 "executor": "worker", "acceptance": ["findings"], "dependencies": [], "checks": []},
+            ],
+        })
+        aid = planned["assignments"][0]["id"]
+        coordination.assignment_started(self.repo, task["id"], aid, "ws", "codex", [])
+        coordination.assignment_finished(self.repo, task["id"], aid, "succeeded", "important finding", [], [])
+        blocked = self.hook("Stop", stop_hook_active=False)
+        self.assertEqual(blocked["decision"], "block")
+        follow = dict(session_id="sess-1", turn_id="turn-2", cwd=str(self.repo),
+                      hook_event_name="UserPromptSubmit", prompt=blocked["reason"],
+                      model="gpt", permission_mode="default")
+        codex_hooks.handle(follow)
+        same = coordination.latest_task(self.repo, "sess-1")
+        self.assertEqual(same["id"], task["id"])
+        self.assertEqual(same["assignments"][0]["result_summary"], "important finding")
+
     def test_pretooluse_blocks_coordinator_edit_before_valid_distribution(self):
         self.hook("UserPromptSubmit", prompt="implement feature")
         denied = self.hook("PreToolUse", tool_name="apply_patch",
@@ -266,6 +289,25 @@ class CodexHookTests(CoordinationCase):
         self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
         self.assertIn("worker", denied["hookSpecificOutput"]["permissionDecisionReason"].lower())
 
+    def test_pretooluse_blocks_new_unplanned_scope_after_worker_result(self):
+        self.hook("UserPromptSubmit", prompt="implement feature")
+        task = coordination.latest_task(self.repo, "sess-1")
+        planned = coordination.plan_task(self.repo, task["id"], {
+            "classification": "substantial",
+            "deliverables": [
+                {"id": "impl", "kind": "implementation", "scope": ["a.py"],
+                 "executor": "worker", "acceptance": ["done"], "dependencies": [], "checks": []},
+            ],
+        })
+        aid = planned["assignments"][0]["id"]
+        coordination.assignment_started(self.repo, task["id"], aid, "ws", "codex", [])
+        coordination.assignment_finished(self.repo, task["id"], aid, "succeeded", "done", ["a.py"], [])
+        coordination.use_result(self.repo, task["id"], aid, "incorporated", "accepted")
+        denied = self.hook("PreToolUse", tool_name="apply_patch", tool_use_id="tool-new",
+                           tool_input={"command": "*** Add File: docs/new.md\n+text\n"})
+        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("unplanned", denied["hookSpecificOutput"]["permissionDecisionReason"].lower())
+
     def test_stop_requires_completed_worker_result_to_be_dispositioned(self):
         self.hook("UserPromptSubmit", prompt="review")
         task = coordination.latest_task(self.repo, "sess-1")
@@ -280,35 +322,31 @@ class CodexHookTests(CoordinationCase):
         coordination.assignment_started(self.repo, task["id"], aid, "ws", "codex", [])
         coordination.assignment_finished(self.repo, task["id"], aid, "succeeded",
                                          "useful review", [], [])
-        stopped = self.hook("Stop")
-        self.assertFalse(stopped["continue"])
-        self.assertIn("disposition", stopped["stopReason"].lower())
+        stopped = self.hook("Stop", stop_hook_active=False)
+        self.assertEqual(stopped["decision"], "block")
+        self.assertIn("disposition", stopped["reason"].lower())
         coordination.use_result(self.repo, task["id"], aid, "incorporated", "applied finding")
-        allowed = self.hook("Stop")
+        allowed = self.hook("Stop", stop_hook_active=False)
         self.assertTrue(allowed.get("continue", True))
+        self.assertEqual(coordination.load_task(self.repo, task["id"])["status"], "completed")
 
 
-class ProjectHookInstallTests(CoordinationCase):
-    def test_codex_attach_installs_managed_hooks_without_destroying_user_hooks(self):
-        dot = self.repo / ".codex"
-        dot.mkdir()
-        hookfile = dot / "hooks.json"
-        hookfile.write_text(json.dumps({
-            "hooks": {"PreToolUse": [{"matcher": "^Custom$", "hooks": [
-                {"type": "command", "command": "custom-hook"}]}]}
-        }))
-        project.attach(self.repo, coordinator="codex")
-        data = json.loads(hookfile.read_text())
-        self.assertIn("custom-hook", hookfile.read_text())
-        self.assertIn("SessionStart", data["hooks"])
-        self.assertIn("UserPromptSubmit", data["hooks"])
-        self.assertIn("PreToolUse", data["hooks"])
-        self.assertIn("Stop", data["hooks"])
-        self.assertIn("deepseek-team coordinator-hook", hookfile.read_text())
-        project.detach(self.repo, coordinator="codex")
-        data = json.loads(hookfile.read_text())
-        self.assertIn("custom-hook", hookfile.read_text())
-        self.assertNotIn("deepseek-team coordinator-hook", hookfile.read_text())
+class ProjectBindingTests(CoordinationCase):
+    def test_project_attach_is_activation_marker_without_repo_local_hooks(self):
+        self.assertTrue(project.attach(self.repo, coordinator="codex"))
+        self.assertTrue(project.is_attached(self.repo, "codex"))
+        self.assertFalse((self.repo / ".codex/hooks.json").exists())
+        self.assertTrue(project.detach(self.repo, coordinator="codex"))
+        self.assertFalse(project.is_attached(self.repo, "codex"))
+
+    def test_global_hook_is_inert_for_unattached_project(self):
+        result = codex_hooks.handle({
+            "session_id": "s", "turn_id": "t", "cwd": str(self.repo),
+            "hook_event_name": "UserPromptSubmit", "prompt": "implement",
+            "model": "gpt", "permission_mode": "default",
+        })
+        self.assertEqual(result, {})
+        self.assertFalse((self.state / "coordination").exists())
 
 
 if __name__ == "__main__":
