@@ -36,6 +36,11 @@ def _mutation(payload: dict) -> tuple[bool, list[str]]:
     command = data.get("command", "") if isinstance(data, dict) else ""
     if tool == "apply_patch":
         return True, _paths_from_apply_patch(command)
+    if tool in ("Edit", "Write"):
+        if not isinstance(data, dict):
+            return True, []
+        path = data.get("file_path") or data.get("path")
+        return True, [str(path)] if isinstance(path, str) and path else []
     if tool != "Bash":
         return False, []
     if "deepseek-team coordination" in command or "deepseek-team worker" in command:
