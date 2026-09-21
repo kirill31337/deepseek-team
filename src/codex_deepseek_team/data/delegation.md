@@ -8,7 +8,12 @@ deepseek-team config show --effective --instructions --runtime {runtime}
 
 Percentages are target work-distribution profiles, not measured contribution. Never
 derive an "actual percentage" from calls, tasks, files, lines, tokens, time, or a
-subjective list of bullets.
+subjective list of bullets. Access remains independent of the target profile:
+explicit read-only always remains read-only.
+
+Keep the required Linux OS sandbox enabled for managed workers. Do not add
+--os-sandbox off to ordinary coordination flows and do not weaken Ubuntu AppArmor
+user-namespace restrictions to make delegation pass.
 
 ### Process
 
