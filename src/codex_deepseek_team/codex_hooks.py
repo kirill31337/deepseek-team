@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import re
 
-from . import coordination, settings
+from . import coordination, project, settings
 
 
 def _context(text: str, event: str) -> dict:
@@ -52,12 +52,17 @@ def handle(payload: dict) -> dict:
     root = settings.project_root(cwd)
     if root is None:
         return {}
+    try:
+        if not project.is_attached(root, 'codex'):
+            return {}
+    except project.ProjectError:
+        return {}
     session = str(payload.get("session_id") or "")
     if not session:
         return {}
     if event == "UserPromptSubmit":
         policy = settings.resolve(root)
-        task = coordination.open_task(
+        task = coordination.begin_turn(
             root, session_id=session, turn_id=str(payload.get("turn_id") or "turn"),
             prompt=str(payload.get("prompt") or ""), policy=policy)
         text = (
@@ -94,36 +99,50 @@ def handle(payload: dict) -> dict:
         issues = coordination.validate_task(root, task["id"])
         if issues:
             return _deny("DeepSeek Team distribution gate: " + "; ".join(issues))
-        for assignment in task.get("assignments", []):
-            if assignment.get("status") not in ("planned", "running"):
-                continue
-            deliverable = next((d for d in task["deliverables"]
-                                if d["id"] == assignment["deliverable_id"]), None)
-            if not deliverable:
-                continue
-            for path in paths:
-                if any(_overlap(path, scope) for scope in deliverable["scope"]):
+        policy = task.get("policy", {})
+        if not paths and task.get("classification") == "substantial" and (
+                int(policy.get("delegation_level", 25)) >= 75
+                and policy.get("effective_access") == "full-access"):
+            return _deny(
+                "Unscoped mutating Bash cannot be mapped to the registered 75/full-access "
+                "distribution. Revise the plan or use a file edit whose scope can be checked.")
+        for path in paths:
+            matching = [
+                deliverable for deliverable in task.get("deliverables", [])
+                if any(_overlap(path, scope) for scope in deliverable.get("scope", []))
+            ]
+            if task.get("classification") == "substantial" and not matching:
+                return _deny(
+                    f"Unplanned mutation scope {path}. Revisit the distribution before "
+                    "starting a new substantial block of work.")
+            for deliverable in matching:
+                assignment = next((row for row in task.get("assignments", [])
+                                   if row.get("deliverable_id") == deliverable.get("id")), None)
+                if assignment and assignment.get("status") in ("planned", "running"):
                     return _deny(
                         f"Path {path} belongs to pending worker assignment {assignment['id']}; "
                         "wait for/review that result before duplicating implementation.")
-        return {}
-    if event == "PostToolUse":
-        is_mutation, paths = _mutation(payload)
-        if is_mutation:
-            coordination.record_coordinator_event(root, task["id"], "mutation", paths)
+        coordination.record_coordinator_event(root, task["id"], "mutation_requested", paths)
         return {}
     if event == "Stop":
         issues = coordination.validate_task(root, task["id"])
-        if issues:
-            return {"continue": False, "stopReason": "Distribution remains noncompliant: " + "; ".join(issues)}
         pending = [a["id"] for a in task.get("assignments", [])
                    if a.get("status") in ("planned", "running")]
-        if pending:
-            return {"continue": False, "stopReason": "Worker assignments are still pending: " + ", ".join(pending)}
         undisposed = [a["id"] for a in task.get("assignments", [])
                       if a.get("status") in ("succeeded", "failed") and not a.get("disposition")]
+        reasons = []
+        if issues:
+            reasons.append("Distribution remains noncompliant: " + "; ".join(issues))
+        if pending:
+            reasons.append("Worker assignments are still pending: " + ", ".join(pending))
         if undisposed:
-            return {"continue": False, "stopReason": "Completed worker results require a recorded disposition: " + ", ".join(undisposed)}
+            reasons.append("Completed worker results require a recorded disposition: " + ", ".join(undisposed))
+        if reasons:
+            reason = " ".join(reasons)
+            if not payload.get("stop_hook_active"):
+                return {"decision": "block", "reason": reason}
+            return {"continue": False, "stopReason": reason, "systemMessage": reason}
+        coordination.complete_task(root, task["id"])
         return {"continue": True}
     return {}
 
