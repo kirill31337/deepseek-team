@@ -143,6 +143,38 @@ class StateAndDistributionTests(CoordinationCase):
         self.assertEqual(coordination.load_task(self.repo, task["id"])["policy"]["effective_access"], "read-only")
         self.assertEqual(coordination.validate_task(self.repo, task["id"]), [])
 
+    def test_small_task_rejects_broad_scope_and_unplanned_second_file(self):
+        task = self.start()
+        with self.assertRaises(coordination.CoordinationError):
+            coordination.plan_task(self.repo, task["id"], {
+                "classification": "small",
+                "small_evidence": "claimed small",
+                "deliverables": [
+                    {"id": "small", "kind": "implementation", "scope": ["src/*"],
+                     "executor": "coordinator", "acceptance": ["done"],
+                     "dependencies": [], "checks": []},
+                ],
+            })
+        coordination.plan_task(self.repo, task["id"], {
+            "classification": "small",
+            "small_evidence": "single localized file edit",
+            "deliverables": [
+                {"id": "small", "kind": "implementation", "scope": ["a.py"],
+                 "executor": "coordinator", "acceptance": ["done"],
+                 "dependencies": [], "checks": []},
+            ],
+        })
+        project.attach(self.repo, coordinator="codex")
+        denied = codex_hooks.handle({
+            "session_id": "sess-1", "turn_id": "turn-1", "cwd": str(self.repo),
+            "hook_event_name": "PreToolUse", "tool_name": "apply_patch",
+            "tool_use_id": "tool-small",
+            "tool_input": {"command": "*** Add File: b.py\n+VALUE = 2\n"},
+            "model": "gpt", "permission_mode": "default",
+        })
+        self.assertEqual(denied["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("unplanned", denied["hookSpecificOutput"]["permissionDecisionReason"].lower())
+
     def test_small_single_deliverable_can_remain_local_without_worker(self):
         task = self.start()
         coordination.plan_task(self.repo, task["id"], {
