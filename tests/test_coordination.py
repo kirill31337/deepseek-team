@@ -170,12 +170,45 @@ class ReadinessAndAttributionTests(CoordinationCase):
                                                  planned["assignments"][0]["id"], copy)
         self.assertIn("missing", str(caught.exception).lower())
 
+    def test_selected_dirty_source_is_imported_explicitly_without_copying_secrets(self):
+        copy = workspace.create(self.repo, self.state)
+        (self.repo / "dirty.py").write_text("selected dirty change\n")
+        (self.repo / ".env").write_text("SECRET=never-copy\n")
+        workspace.import_paths(copy, ["dirty.py"])
+        self.assertEqual((copy.path / "dirty.py").read_text(), "selected dirty change\n")
+        self.assertFalse((copy.path / ".env").exists())
+        self.assertIn("dirty.py", workspace.load(self.state, copy.id).metadata["prepared_paths"])
+        with self.assertRaises(workspace.WorkspaceError):
+            workspace.import_paths(copy, [".env"])
+
     def test_snapshot_attributes_only_worker_delta_not_coordinator_preparation(self):
         copy = workspace.create(self.repo, self.state)
         (copy.path / "prepared.py").write_text("prepared by coordinator\n")
         before = workspace.content_snapshot(copy)
         (copy.path / "a.py").write_text("VALUE = 2\n")
         self.assertEqual(workspace.changed_since(copy, before), ["a.py"])
+
+
+
+class CoordinationCliTests(CoordinationCase):
+    def test_plan_cli_persists_machine_readable_assignments_and_rejects_bad_75_plan(self):
+        from codex_deepseek_team import coordination_cli
+        task = self.start()
+        bad = {
+            "classification": "substantial",
+            "deliverables": [
+                {"id": "impl", "kind": "implementation", "scope": ["a.py"],
+                 "executor": "worker", "acceptance": ["done"], "dependencies": [], "checks": []},
+                {"id": "tests", "kind": "test", "scope": ["tests/*"],
+                 "executor": "coordinator", "acceptance": ["tests"], "dependencies": [], "checks": []},
+            ],
+        }
+        with mock.patch("sys.stdin", new=__import__("io").StringIO(json.dumps(bad))):
+            self.assertEqual(coordination_cli.main([
+                "coordination", "plan", "--path", str(self.repo), "--task", task["id"]
+            ]), 78)
+        saved = coordination.load_task(self.repo, task["id"])
+        self.assertEqual(len(saved["assignments"]), 1)
 
 
 
