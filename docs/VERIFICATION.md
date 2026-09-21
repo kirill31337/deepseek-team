@@ -1,3 +1,60 @@
+# Delegation profiles / managed full-access verification
+
+Date: 2026-09-21. This section verifies the feature branch `deepseek/delegation-profiles`; it does **not** publish a release or update an installed working-project copy.
+
+## Verified code gate
+
+Code SHA **5aa74b9ff63f3229169a75495dd47684719d8085** passed both required workflows:
+
+- GitHub Actions **Tests** run **35636312526**:
+  - Python **3.11, 3.12 and 3.13** all passed;
+  - Python 3.11 reported `Ran 179 tests` and `OK (skipped=9)`;
+  - the wheel/sdist built and installed successfully;
+  - both `deepseek-team --version` and the legacy `codex-deepseek-team --version` executed successfully;
+  - the Ubuntu AppArmor/Bubblewrap smoke job passed.
+- GitHub Actions **Delegation verification** run **35636312503**:
+  - installed pinned **Codex CLI 0.154.0** and **Claude Code 2.1.273**;
+  - used Bubblewrap/AppArmor on Ubuntu 24.04;
+  - used an offline local provider fixture, not a real DeepSeek credential or paid API request;
+  - reported `Ran 7 tests ... OK`.
+
+The dedicated demo reported:
+
+```text
+DEMO: 25/read-only PASS; 50/full-access fix+test PASS; 75/full-access three parallel copies + integrated tests PASS; 75/read-only PASS
+```
+
+## Covered feature contracts
+
+- `25/50/75` profiles and `access=auto|read-only|full-access` resolve independently.
+- Effective precedence is `CLI > project > global > defaults`, with the source of each value reported.
+- Defaults remain backward-compatible: `25 + auto -> read-only`.
+- Explicit access survives delegation-level changes until changed back to `auto`.
+- `75 + read-only` keeps a high delegation target for analysis/review while retaining a real write prohibition.
+- Legacy `--write --allow-write` remains available and conflicting new access/workspace flags are rejected.
+- Managed full-access creates an owned copy from committed HEAD, never cleans/adopts the user's checkout, and does not silently copy dirty/untracked/ignored source files.
+- A full-access worker can create previously unlisted files and run local tests/builds inside its assigned copy.
+- Successful dirty owned copies can be reused for sequential iterations.
+- Failed/partial copies are retained; continuation requires explicit `--resume-after-failure`; no automatic implementation retry occurs.
+- Three independent workers can operate in parallel on separate copies; sibling copies and the original checkout are not visible inside the sandbox.
+- Both real Codex and real Claude permission/protocol surfaces are exercised for read-only and full-access modes.
+- Managed runtime mounts are sparse: npm runtimes expose the concrete launcher/package rather than a mixed user prefix such as `~/.local`.
+- Managed full-access uses a private network namespace with only the fixed provider relay capability; the real provider credential remains host-side.
+- Provider failures remain classified as provider failures even when the runtime emits malformed/empty protocol output; partial files remain preserved.
+- Managed AGENTS.md/CLAUDE.md refreshes preserve user content outside the owned block and resolve the current effective policy before new assignments.
+- `doctor` resolves the same policy as config/worker/instructions and checks the managed runtime capability surface when effective access is full-access.
+
+## Deliberate limits
+
+- Percentages are policy targets, not measurements of tokens, lines, wall-clock time, useful contribution or savings.
+- Small/inseparable tasks may delegate less; the system does not manufacture work to hit a percentage.
+- Full-access is full development access only to an owned isolated copy. Commits, integration, pushing, publishing, deployment, production databases/services and secrets remain coordinator-owned.
+- The dedicated verification uses real coordinator binaries but an offline provider fixture. It is not proof of a successful live DeepSeek inference.
+- The existing billable `doctor --live` remains the separate end-to-end provider-routing check.
+- This feature work does not add a task scheduler and preserves the three-worker limit and unlimited total timeout default.
+
+---
+
 # Version 0.3.0 verification
 
 Date: 2026-09-16. Release scope: Linux, Python 3.11+, Codex CLI and/or Claude Code CLI coordinating DeepSeek workers with required Bubblewrap/AppArmor-aware OS isolation.
