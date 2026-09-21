@@ -21,7 +21,13 @@ DEFAULT_MODE = 0o644
 TARGETS = {'codex': 'AGENTS.md', 'claude': 'CLAUDE.md'}
 CODEX_HOOK_COMMAND = 'deepseek-team coordinator-hook'
 CODEX_HOOKS = {
-    'SessionStart': {'matcher': '^(startup|resume|compact)
+    'SessionStart': {'matcher': '^(startup|resume|compact)$', 'context': True},
+    'UserPromptSubmit': {'matcher': None, 'context': True},
+    'PreToolUse': {'matcher': '^(Bash|apply_patch)$', 'context': False},
+    'PostToolUse': {'matcher': '^(Bash|apply_patch)$', 'context': False},
+    'Stop': {'matcher': None, 'context': False},
+}
+
 
 class ProjectError(Exception):
     """Raised for an invalid or ambiguous target; existing content is untouched."""
