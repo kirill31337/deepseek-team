@@ -32,7 +32,10 @@ class RealCodexCoordinatorHookTests(unittest.TestCase):
         state = {"step": 0, "task_id": None, "assignment_id": None}
         synthetic_key = secrets.token_hex(24)
 
-        # Codex may finish an async plugin-cache cleanup just after the main process exits.\n        # Cleanup races are not part of the coordinator-hook assertion surface.\n        with tempfile.TemporaryDirectory(prefix="dst-codex-coordinator-", ignore_cleanup_errors=True) as directory:\n            root = Path(directory)
+        # Codex may finish an async plugin-cache cleanup just after the main process exits.
+        # Cleanup races are not part of the coordinator-hook assertion surface.
+        with tempfile.TemporaryDirectory(prefix="dst-codex-coordinator-", ignore_cleanup_errors=True) as directory:
+            root = Path(directory)
             home = root / "codex-home"
             home.mkdir(mode=0o700)
             repo = root / "repo"
