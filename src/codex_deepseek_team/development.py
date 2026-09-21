@@ -108,7 +108,13 @@ def runtime_roots(executables: list[str]) -> list[Path]:
     if node:
         resolved = Path(node).resolve()
         if not resolved.is_relative_to('/usr') and resolved.parent.name == 'bin':
-            roots.add(resolved.parent.parent)
+            node_root = resolved.parent.parent
+            # ~/.local is a mixed user-data prefix, not a dedicated Node
+            # installation. Mount only node itself in that layout.
+            if node_root == Path.home() / '.local':
+                roots.add(resolved)
+            else:
+                roots.add(node_root)
     for path in roots:
         if path in (Path('/'), Path.home(), Path('/home'), Path('/root'), Path('/tmp'), Path('/var')):
             raise DevelopmentError('Preparation: unsafe runtime prefix; use a dedicated software installation.')
