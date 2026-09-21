@@ -1,6 +1,6 @@
-# Delegation profiles / managed full-access verification
+# Version 0.4.0 verification
 
-Date: 2026-09-21. This section verifies the feature branch `deepseek/delegation-profiles`; it does **not** publish a release or update an installed working-project copy.
+Date: 2026-09-21. Release scope: configurable 25/50/75 delegation profiles, independent read-only/full-access policy, reusable managed development copies, and preserved legacy exact-file writer behavior. Release publication follows a green final release-candidate gate on this same implementation line.
 
 ## Verified code gate
 

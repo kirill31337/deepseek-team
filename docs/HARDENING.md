@@ -1,6 +1,6 @@
 # Worker boundary hardening
 
-## Unreleased — configurable delegation and managed development copies
+## 0.4.0 — configurable delegation and managed development copies (2026-09-21)
 
 The 25/50/75 delegation levels are policy for **how the coordinator distributes work**, not a security primitive and not a measured utilization percentage. Security-relevant access is resolved separately as `auto | read-only | full-access` with precedence `CLI > project > global > defaults`. The resolved policy is snapshotted for each new job.
 

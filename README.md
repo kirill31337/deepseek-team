@@ -6,7 +6,7 @@ One Linux package for **Codex and/or Claude Code coordinators** delegating bound
 
 The percentages are **target work-distribution profiles**, not measured token/time/line quotas and not promises of exact useful contribution. Small or inseparable tasks may delegate less. Without any new settings, behavior remains compatible: the default is **25% + access=auto → read-only**.
 
-The repository currently reports version **0.3.0**; this feature work does not itself publish a release. The source supports **Linux, Python 3.11+, Git, Bubblewrap, and Codex CLI and/or Claude Code CLI**. Ubuntu has first-class AppArmor setup for its restricted unprivileged-user-namespace policy. A DeepSeek API key is required for live work. There are no Python runtime dependencies; Bubblewrap/AppArmor are system components.
+Version **0.4.0** adds configurable delegation profiles and managed full-access development copies while preserving the legacy exact-file writer. The release supports **Linux, Python 3.11+, Git, Bubblewrap, and Codex CLI and/or Claude Code CLI**. Ubuntu has first-class AppArmor setup for its restricted unprivileged-user-namespace policy. A DeepSeek API key is required for live work. There are no Python runtime dependencies; Bubblewrap/AppArmor are system components.
 
 ## Ubuntu install — recommended
 
