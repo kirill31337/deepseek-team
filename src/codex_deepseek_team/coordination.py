@@ -57,10 +57,21 @@ def _project_root(root: Path) -> Path:
 
 def _project_dir(root: Path) -> Path:
     root = _project_root(root)
+    state = _state_root()
+    state.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        os.chmod(state, 0o700)
+    except OSError:
+        pass
+    info = state.lstat()
+    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
+            or info.st_mode & 0o077):
+        raise CoordinationError("Coordination state root must be private and user-owned.")
     key = hashlib.sha256(os.fsencode(str(root))).hexdigest()[:24]
-    directory = _state_root() / "coordination" / key
+    directory = state / "coordination" / key
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     try:
+        os.chmod(directory.parent, 0o700)
         os.chmod(directory, 0o700)
     except OSError:
         pass
