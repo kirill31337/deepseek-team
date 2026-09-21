@@ -1,0 +1,70 @@
+name: Release verification
+on:
+  push:
+    branches: [deepseek/coordination-enforcement]
+
+jobs:
+  install-upgrade:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install current Codex
+        run: npm install -g @openai/codex@0.155.1
+      - name: Build release candidate
+        run: |
+          python -m pip install build
+          python -m build
+          python -m venv "$RUNNER_TEMP/clean"
+          "$RUNNER_TEMP/clean/bin/pip" install dist/codex_deepseek_team-0.5.0-py3-none-any.whl
+          test "$("$RUNNER_TEMP/clean/bin/deepseek-team" --version)" = "deepseek-team 0.5.0"
+      - name: Verify 0.4 to 0.5 standard installer upgrade
+        shell: bash
+        run: |
+          set -euo pipefail
+          export HOME="$RUNNER_TEMP/home"
+          export CODEX_HOME="$HOME/.codex"
+          mkdir -p "$HOME" "$CODEX_HOME"
+          OLD="$RUNNER_TEMP/v040"
+          PREFIX="$RUNNER_TEMP/prefix"
+          BIN="$RUNNER_TEMP/bin"
+          PROJECT="$RUNNER_TEMP/project"
+          git worktree add --detach "$OLD" v0.4.0
+          mkdir -p "$PROJECT"
+          git -C "$PROJECT" init -q
+          printf 'VALUE = 1\n' > "$PROJECT/a.py"
+          git -C "$PROJECT" add a.py
+          git -C "$PROJECT" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm base
+          python "$OLD/install.py" --prefix "$PREFIX" --bin-dir "$BIN"
+          "$BIN/deepseek-team" config set --project --path "$PROJECT" --delegation-level 75 --access full-access
+          "$BIN/deepseek-team" init --coordinator codex "$PROJECT"
+          printf 'synthetic-upgrade-key' | "$BIN/deepseek-team" auth set --stdin
+          BEFORE_AGENTS="$(sha256sum "$PROJECT/AGENTS.md" | awk '{print $1}')"
+          BEFORE_SETTINGS="$(cat "$PROJECT/.deepseek-team.toml")"
+          BEFORE_KEY="$(sha256sum "$HOME/.config/codex-deepseek/api-key" | awk '{print $1}')"
+          python install.py --prefix "$PREFIX" --bin-dir "$BIN"
+          test "$("$BIN/deepseek-team" --version)" = "deepseek-team 0.5.0"
+          "$BIN/deepseek-team" hooks status
+          "$BIN/deepseek-team" auth status
+          test "$(sha256sum "$PROJECT/AGENTS.md" | awk '{print $1}')" = "$BEFORE_AGENTS"
+          test "$(cat "$PROJECT/.deepseek-team.toml")" = "$BEFORE_SETTINGS"
+          test "$(sha256sum "$HOME/.config/codex-deepseek/api-key" | awk '{print $1}')" = "$BEFORE_KEY"
+          export DEEPSEEK_TEAM_STATE_DIR="$RUNNER_TEMP/state"
+          OUT="$(printf '%s' '{"session_id":"upgrade-session","turn_id":"turn-1","cwd":"'"$PROJECT"'","hook_event_name":"UserPromptSubmit","prompt":"implement feature","model":"fixture","permission_mode":"default"}' | "$BIN/deepseek-team" coordinator-hook)"
+          printf '%s\n' "$OUT" | grep -q 'coordination task task-'
+          DENY="$(printf '%s' '{"session_id":"upgrade-session","turn_id":"turn-1","cwd":"'"$PROJECT"'","hook_event_name":"PreToolUse","tool_name":"apply_patch","tool_use_id":"t1","tool_input":{"command":"*** Update File: a.py\\n@@\\n"},"model":"fixture","permission_mode":"default"}' | "$BIN/deepseek-team" coordinator-hook)"
+          printf '%s\n' "$DENY" | grep -q '"permissionDecision": "deny"'
+          git worktree remove --force "$OLD"
+      - name: Upload release candidate artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepseek-team-0.5.0-dist
+          path: dist/*
