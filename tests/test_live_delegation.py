@@ -170,7 +170,18 @@ class LiveDemoTests(LiveBase):
             managed.run(self.args(self.task('resume',sibling)),self.policy(50),worker,copy)
         self.assertEqual((copy.path/'partial.py').read_text(),'partial')
         args=self.args(self.task('resume',sibling),resume_after_failure=True)
-        self.assertEqual(managed.run(args,self.policy(50),worker,copy),0)
+        raw_results=[]
+        execute=worker.execute
+        def capture(*call_args):
+            result=execute(*call_args)
+            raw_results.append(result)
+            return result
+        try:
+            with patch.object(worker,'execute',side_effect=capture):
+                recovery_code=managed.run(args,self.policy(50),worker,copy)
+        except worker.WorkerError as error:
+            self.fail('Recovery protocol failure: '+repr(error.args)+' raw='+repr(raw_results))
+        self.assertEqual(recovery_code,0,repr(raw_results))
         self.assertEqual((copy.path/'partial.py').read_text(),'completed')
         # A successful dirty copy can be reused without recovery or reset.
         self.assertEqual(managed.run(self.args(self.task('fix',sibling)),self.policy(50),worker,copy),0)
