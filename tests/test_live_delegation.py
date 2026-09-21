@@ -213,6 +213,38 @@ class LiveDemoTests(LiveBase):
         self.assertIn('calc.py', assignment['worker_changes'])
         self.assertNotIn('calc.py', assignment['prepared_changes'])
 
+    def test_host_only_dependency_is_rejected_by_sandbox_preflight_before_key_read(self):
+        copy, sibling = [workspace.create(self.source, self.state) for _ in range(2)]
+        policy = self.policy(50)
+        hostbin = self.root / 'hostbin'
+        hostbin.mkdir()
+        tool = hostbin / 'host-only-jdk'
+        tool.write_text('#!/bin/sh\nexit 0\n')
+        tool.chmod(0o700)
+        task = coordination.open_task(
+            self.source, session_id='session-deps', turn_id='turn-deps',
+            prompt='run jvm work', policy=policy)
+        planned = coordination.plan_task(self.source, task['id'], {
+            'classification': 'substantial',
+            'deliverables': [{
+                'id': 'jvm', 'kind': 'implementation', 'scope': ['calc.py'],
+                'executor': 'worker', 'acceptance': ['done'],
+                'dependencies': [{'kind': 'command', 'value': 'host-only-jdk'}],
+                'checks': [],
+            }],
+        })
+        aid = planned['assignments'][0]['id']
+        args = self.args(self.task('fix', sibling), coord_task=task['id'], coord_assignment=aid)
+        path = str(hostbin) + os.pathsep + os.environ.get('PATH', '')
+        with patch.dict(os.environ, {'PATH': path}), patch.object(worker, 'load_api_key') as key:
+            with self.assertRaises(worker.WorkerError) as caught:
+                managed.run(args, policy, worker, copy)
+        key.assert_not_called()
+        self.assertIn('sandbox', str(caught.exception).lower())
+        record = coordination.load_task(self.source, task['id'])
+        self.assertTrue(any(row['code'] == 'dependency_unavailable'
+                            for row in record['constraints']))
+
     def test_provider_failure_is_distinguished_even_when_runtime_output_is_malformed(self):
         copy, sibling = [workspace.create(self.source,self.state) for _ in range(2)]
         class FailedRelay:
