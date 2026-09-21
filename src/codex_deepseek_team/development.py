@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import subprocess
 import sys
 
@@ -180,6 +181,41 @@ def write_launch(control: Path, binary: str, runtime: str, env: dict[str, str], 
     command = runtime_command(binary, runtime, writable=writable, path=env['PATH'])
     (control / 'launch.json').write_text(json.dumps({'command': command, 'env': env}))
     (control / 'launch.json').chmod(0o400)
+
+
+def missing_requirements(args: list[str], env: dict[str, str], item: dict) -> list[str]:
+    """Check declared commands/paths from inside the actual sparse sandbox."""
+    checks = []
+    for dep in item.get('dependencies', []):
+        kind = dep.get('kind') if isinstance(dep, dict) else None
+        value = str(dep.get('value') or '') if isinstance(dep, dict) else ''
+        if kind == 'command':
+            checks.append(('command:' + value, 'command -v -- ' + shlex.quote(value) + ' >/dev/null 2>&1'))
+        elif kind == 'path':
+            if Path(value).is_absolute() or '..' in Path(value).parts:
+                checks.append(('path:' + value, 'false'))
+            else:
+                checks.append(('path:' + value, 'test -e -- ' + shlex.quote(value)))
+    for command in item.get('checks', []):
+        try:
+            parts = shlex.split(command)
+        except ValueError:
+            return ['check-command:invalid']
+        if not parts:
+            return ['check-command:empty']
+        checks.append(('check-command:' + parts[0],
+                       'command -v -- ' + shlex.quote(parts[0]) + ' >/dev/null 2>&1'))
+    missing = []
+    for label, script in checks:
+        try:
+            result = subprocess.run([*args, '--', '/bin/sh', '-lc', script],
+                                    env=env, text=True, capture_output=True,
+                                    timeout=15, check=False)
+        except (OSError, subprocess.SubprocessError):
+            raise DevelopmentError('Preparation: sandbox dependency probe could not run.') from None
+        if result.returncode:
+            missing.append(label)
+    return sorted(set(missing))
 
 
 def run_checks(args: list[str], env: dict[str, str], commands: list[str],

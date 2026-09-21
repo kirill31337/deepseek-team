@@ -61,6 +61,16 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
                 if coord_task:
                     coord_item = coordination.ensure_assignment_ready(
                         copy.source, coord_task, coord_assignment, copy)
+                    sandbox_missing = development.missing_requirements(layout, env, coord_item)
+                    if sandbox_missing:
+                        coordination.record_constraint(
+                            copy.source, coord_task, coord_item['id'],
+                            'dependency_unavailable',
+                            'sandbox missing: ' + ', '.join(sandbox_missing))
+                        raise coordination.CoordinationError(
+                            'Preparation sandbox is missing declared dependencies/check runtime: ' +
+                            ', '.join(sandbox_missing) +
+                            '. Prepare dependencies inside the owned workspace; host-only tools are not exposed.', 78)
                     prepared_changes, _ignored = copy.changes()
                     coord_before = workspace.content_snapshot(copy)
                 # Only after the actual namespace/readiness probes have succeeded.
