@@ -67,6 +67,10 @@ else:
     elif task['mode']=='resume':
         assert (root/'partial.py').read_text()=='partial'
         (root/'partial.py').write_text('completed')
+        (root/'test_partial.py').write_text(
+            "import unittest\nfrom pathlib import Path\n"
+            "class TestPartial(unittest.TestCase):\n"
+            " def test_completed(self): self.assertEqual(Path('partial.py').read_text(),'completed')\n")
     elif task['mode']=='fail':
         (root/'partial.py').write_text('partial')
         print(json.dumps({'type':'result','is_error':True,'result':'fixture task failed'}))
@@ -170,19 +174,9 @@ class LiveDemoTests(LiveBase):
             managed.run(self.args(self.task('resume',sibling)),self.policy(50),worker,copy)
         self.assertEqual((copy.path/'partial.py').read_text(),'partial')
         args=self.args(self.task('resume',sibling),resume_after_failure=True)
-        raw_results=[]
-        execute=worker.execute
-        def capture(*call_args):
-            result=execute(*call_args)
-            raw_results.append(result)
-            return result
-        try:
-            with patch.object(worker,'execute',side_effect=capture):
-                recovery_code=managed.run(args,self.policy(50),worker,copy)
-        except worker.WorkerError as error:
-            self.fail('Recovery protocol failure: '+repr(error.args)+' raw='+repr(raw_results))
-        self.assertEqual(recovery_code,0,repr(raw_results))
+        self.assertEqual(managed.run(args,self.policy(50),worker,copy),0)
         self.assertEqual((copy.path/'partial.py').read_text(),'completed')
+        self.assertTrue((copy.path/'test_partial.py').exists())
         # A successful dirty copy can be reused without recovery or reset.
         self.assertEqual(managed.run(self.args(self.task('fix',sibling)),self.policy(50),worker,copy),0)
         self.assertEqual((copy.path/'partial.py').read_text(),'completed')
