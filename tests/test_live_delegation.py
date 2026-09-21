@@ -188,7 +188,7 @@ class LiveDemoTests(LiveBase):
 
 
     def test_managed_runner_automatically_records_assignment_checks_and_worker_delta(self):
-        copy = workspace.create(self.source, self.state)
+        copy, sibling = [workspace.create(self.source, self.state) for _ in range(2)]
         policy = self.policy(50)
         task = coordination.open_task(
             self.source, session_id='session-runner', turn_id='turn-runner',
@@ -203,7 +203,7 @@ class LiveDemoTests(LiveBase):
             }],
         })
         aid = planned['assignments'][0]['id']
-        args = self.args(self.task('fix', copy), coord_task=task['id'], coord_assignment=aid)
+        args = self.args(self.task('fix', sibling), coord_task=task['id'], coord_assignment=aid)
         self.assertEqual(managed.run(args, policy, worker, copy), 0)
         record = coordination.load_task(self.source, task['id'])
         assignment = record['assignments'][0]
