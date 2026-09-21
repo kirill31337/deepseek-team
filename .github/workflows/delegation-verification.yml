@@ -22,7 +22,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y bubblewrap apparmor
-          npm install -g @openai/codex@0.154.0 @anthropic-ai/claude-code@2.1.273
+          npm install -g @openai/codex@0.155.1 @anthropic-ai/claude-code@2.1.278
           python -m pip install .
           deepseek-team sandbox install-apparmor
           deepseek-team sandbox status
@@ -36,6 +36,7 @@ jobs:
         run: |
           set -o pipefail
           python -m unittest discover -s tests -p test_live_delegation.py -v 2>&1 | tee live-verification.log
+          python -m unittest discover -s tests -p test_codex_coordination_integration.py -v 2>&1 | tee -a live-verification.log
       - uses: actions/upload-artifact@v4
         if: always()
         with:
