@@ -11,8 +11,8 @@ derive an "actual percentage" from calls, tasks, files, lines, tokens, time, or 
 subjective list of bullets. Access remains independent of the target profile:
 explicit read-only always remains read-only.
 
-Keep the required Linux OS sandbox enabled for managed workers. Do not add
---os-sandbox off to ordinary coordination flows and do not weaken Ubuntu AppArmor
+Keep the required Linux OS sandbox enabled for managed workers. Never add `--os-sandbox off`
+to ordinary coordination flows and do not weaken Ubuntu AppArmor
 user-namespace restrictions to make delegation pass.
 
 ### Process
