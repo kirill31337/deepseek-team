@@ -1,5 +1,44 @@
 # Worker boundary hardening
 
+## 0.5.0 — coordinator process enforcement (2026-09-22)
+
+0.5.0 adds a coordinator-process guardrail on top of the existing worker sandbox. These are separate boundaries and must not be conflated.
+
+For **Codex**, DeepSeek Team installs one stable user-level lifecycle hook definition. It is active only when the current repository already contains the package-owned managed Codex block created by explicit `deepseek-team init --coordinator codex`. Codex owns native hook trust; DeepSeek Team neither bypasses nor infers that decision.
+
+The supported technical enforcement points are:
+
+- `SessionStart` / `UserPromptSubmit`: inject or restore the persistent task ledger, including after compaction;
+- `PreToolUse`: deny supported coordinator mutation calls before execution when no compliant distribution exists, when scope is unplanned, or when a pending worker assignment owns the path;
+- `Stop`: block silent completion while assignments are pending or completed worker results have not been dispositioned.
+
+These hooks are **not** claimed to intercept every possible Codex implementation path. Specialized or future tool surfaces that do not traverse the supported hook path remain an environment limitation and must be re-verified against upstream Codex. The release CI therefore runs a real Codex new-session scenario and checks an observed PreToolUse denial before the attempted file mutation reaches disk.
+
+For **Claude Code**, 0.5.0 does not claim equivalent coordinator-side technical gating. Managed instructions and the persistent ledger/worker accounting are supplied, while coordinator compliance with work distribution remains instruction-driven. Worker filesystem/network permissions remain technically enforced by the existing sandbox.
+
+### Persistent coordination state
+
+The ledger is stored under the user's private DeepSeek Team state directory, outside the repository. It records only the minimum process state needed for continuity: session/task/deliverable/assignment ids, executor/scope/acceptance/dependencies/checks, workspace id, coordinator-prepared inputs, worker-only delta, result summary, checks, result disposition and structured constraints.
+
+It is not a scheduler. It does not scan arbitrary projects, auto-attach repositories, commit, push, publish or deploy. Existing workspace records remain the source of truth for owned development copies.
+
+At 75/full-access, free-form reasons such as "quality ownership" or "release work" do not technically satisfy the distribution gate. Technical retention reasons such as missing dependencies must be recorded from the runner/preflight. Signing/secrets remain coordinator-only through a structured sensitive marker. Semantic inseparability is not presented as a deterministic proof: genuinely small work uses the explicit small-task classification and is structurally restricted to one concrete scope.
+
+### Workspace readiness and attribution
+
+A coordinated assignment checks:
+
+1. workspace base HEAD matches the task base;
+2. declared paths/commands/check executables exist;
+3. the same requirements are observable **inside the actual sparse Bubblewrap namespace**;
+4. only then may the provider credential be read.
+
+A host-only JDK/SDK/tool therefore does not become available merely because access is full-access. Missing dependencies must be prepared explicitly inside the owned copy. Stubs are not treated as equivalent project verification.
+
+If selected dirty source is needed, `workspace import --include FILE` copies only explicitly named ordinary non-secret files. The imported baseline is recorded as coordinator-prepared input. The runner snapshots content immediately before worker execution and records only the delta after that snapshot as worker changes, avoiding false worker authorship for prepared source.
+
+Declared post-worker checks run inside the same sparse/no-network sandbox and are stored with exit codes. Worker result summaries and review findings survive compaction/continuation through the ledger; the coordinator must record an explicit disposition before the task can finish.
+
 ## 0.4.0 — configurable delegation and managed development copies (2026-09-21)
 
 The 25/50/75 delegation levels are policy for **how the coordinator distributes work**, not a security primitive and not a measured utilization percentage. Security-relevant access is resolved separately as `auto | read-only | full-access` with precedence `CLI > project > global > defaults`. The resolved policy is snapshotted for each new job.
