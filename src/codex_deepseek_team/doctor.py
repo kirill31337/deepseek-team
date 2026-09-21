@@ -141,6 +141,35 @@ def check_runtime(runtime):
     print('Claude Code worker routing: isolated DeepSeek Anthropic-compatible child; parent Claude auth/config untouched.')
 
 
+def resolve_policy(*, delegation_level=None, access=None, root=None):
+    """Use the same layered policy resolver as config, workers and managed instructions."""
+    from codex_deepseek_team import settings
+    try:
+        return settings.resolve(Path.cwd() if root is None else Path(root),
+                                delegation_level=delegation_level, access=access)
+    except settings.SettingsError as error:
+        raise worker.WorkerError(78, str(error)) from None
+
+
+def check_policy_runtime(runtime, policy):
+    """Check the runtime surface that the effective access will actually use."""
+    if policy.effective_access != 'full-access':
+        return check_runtime(runtime)
+    from codex_deepseek_team import development
+    binary = shutil.which(runtime)
+    if not binary:
+        raise worker.WorkerError(78, f'{runtime} executable is unavailable for managed full-access.')
+    try:
+        version = subprocess.check_output([binary, '--version'], text=True).strip()
+        development.check_runtime(binary, runtime)
+    except development.DevelopmentError as error:
+        raise worker.WorkerError(error.code, str(error)) from None
+    except (OSError, subprocess.SubprocessError):
+        raise worker.WorkerError(78, f'{runtime} managed full-access capability check failed.') from None
+    print(version)
+    print(f'Managed {runtime} runtime capabilities: PASS (effective access={policy.effective_access}).')
+
+
 def live_tests(runtimes=('codex',), os_sandbox='required'):
     if os.environ.get('DEEPSEEK_TEAM_DISABLED') == '1' or os.environ.get('CODEX_DEEPSEEK_DISABLED') == '1':
         print('Live check disabled by DeepSeek delegation switch.')
@@ -185,8 +214,18 @@ def main(argv=None):
                         help='Runtime(s) to verify; default codex preserves legacy behavior.')
     parser.add_argument('--os-sandbox', choices=['required', 'off'], default='required',
                         help='required: verify Bubblewrap/AppArmor containment (default); off: explicitly skip only this OS-layer check.')
+    parser.add_argument('--delegation-level', type=int, choices=[25, 50, 75],
+                        help='Per-diagnostic override; resolved with project/global/default settings.')
+    parser.add_argument('--access', choices=['auto', 'read-only', 'full-access'],
+                        help='Per-diagnostic access override; independent of delegation level.')
     args = parser.parse_args(argv)
     try:
+        from codex_deepseek_team import settings
+        policy = resolve_policy(delegation_level=args.delegation_level, access=args.access)
+        print(settings.describe(policy))
+        if policy.effective_access == 'full-access' and args.os_sandbox == 'off':
+            raise worker.WorkerError(
+                64, 'Effective full-access requires the OS sandbox; diagnostics cannot validate it with --os-sandbox off.')
         if args.os_sandbox == 'required':
             sandbox, backend = worker.resolve_os_sandbox('required')
             print(f'OS sandbox: PASS ({backend.source}, {backend.bwrap})')
@@ -197,8 +236,10 @@ def main(argv=None):
             print('OS sandbox check: SKIPPED by explicit --os-sandbox off.')
         runtimes = selected_runtimes(args.runtime)
         for runtime in runtimes:
-            check_runtime(runtime)
+            check_policy_runtime(runtime, policy)
         print('Local runtime checks: PASS.')
+        if args.live and policy.effective_access == 'full-access':
+            print('Live provider smoke remains read-only by design; full-access permissions are checked locally.')
         if not args.live:
             print('No network requests or credential validation performed. Use --live for API and worker checks.')
             return 0
