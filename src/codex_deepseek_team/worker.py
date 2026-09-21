@@ -433,7 +433,7 @@ def run(args):
         print(settings.describe(policy), file=sys.stderr)
         if args.write:
             print('Actual access: legacy exact-file writer (source: CLI --write --allow-write).', file=sys.stderr)
-        elif policy.effective_access == 'full-access' or copy is not None:
+        elif policy.effective_access == 'full-access' or copy is not None or getattr(args, 'coord_task', None):
             return managed.run(args, policy, sys.modules.get(__name__) or _worker_api(), copy)
     elif any(getattr(args, name, None) for name in ('delegation_level', 'access', 'workspace')):
         raise WorkerError(78, 'Delegation configuration support is unavailable; reinstall DeepSeek Team.')
@@ -529,6 +529,8 @@ def parse_args():
     parser.add_argument('--delegation-level', type=int, choices=[25, 50, 75])
     parser.add_argument('--access', choices=['auto', 'read-only', 'full-access'])
     parser.add_argument('--workspace', help='Reuse an owned workspace ID; never adopts foreign directories.')
+    parser.add_argument('--coord-task', help='Persistent coordination task id for automatic runner accounting.')
+    parser.add_argument('--coord-assignment', help='Planned coordination assignment id; must be used with --coord-task.')
     parser.add_argument('--resume-after-failure', action='store_true', help='Explicit continuation after inspecting partial work.')
     parser.add_argument('--write', action='store_true', help='Opt in to writing in a clean linked worktree on a codex/ or deepseek/ branch.')
     parser.add_argument('--allow-write', action='append', default=[], metavar='FILE',
@@ -540,6 +542,10 @@ def parse_args():
                         help='Shared lock directory; keep the same directory for all workers.')
     args = parser.parse_args()
     args.attempts_explicit = args.attempts is not None
+    if bool(args.coord_task) != bool(args.coord_assignment):
+        parser.error('--coord-task and --coord-assignment must be supplied together')
+    if args.write and args.coord_task:
+        parser.error('coordinated assignments use managed access, not legacy --write --allow-write')
     if args.write and (args.access is not None or args.workspace):
         parser.error('--write --allow-write cannot be combined with --access or --workspace')
     if args.resume_after_failure and not args.workspace:

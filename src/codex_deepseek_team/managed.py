@@ -7,7 +7,7 @@ from pathlib import Path
 import tempfile
 import time
 
-from . import development, relay, settings, workspace
+from . import coordination, development, relay, settings, workspace
 
 
 def run(args, policy: settings.Policy, api, copy=None) -> int:
@@ -28,6 +28,11 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
         sb, backend = api.resolve_os_sandbox('required')
         if copy is None:
             copy = workspace.create(Path.cwd(), args.state_dir)
+        coord_task = getattr(args, 'coord_task', None)
+        coord_assignment = getattr(args, 'coord_assignment', None)
+        coord_started = False
+        coord_before = None
+        coord_item = None
         print(f'Workspace: {copy.id}\nWorking copy: {copy.path}\n'
               'Source: committed HEAD only; source uncommitted changes were not copied or modified.', file=api.sys.stderr)
         with copy.lock(recover=getattr(args, 'resume_after_failure', False)):
@@ -52,11 +57,22 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
                 layout = development.layout(backend, copy.path, home, control,
                                             [binary], writable=writable)
                 development.probe(layout, env)
-                # Only after the actual namespace layout has executed successfully.
+                # Coordination readiness is checked before provider credentials are read.
+                if coord_task:
+                    coord_item = coordination.ensure_assignment_ready(
+                        copy.source, coord_task, coord_assignment, copy)
+                    prepared_changes, _ignored = copy.changes()
+                    coord_before = workspace.content_snapshot(copy)
+                # Only after the actual namespace/readiness probes have succeeded.
                 key = api.load_api_key()
                 if not key.strip():
                     raise api.WorkerError(78, 'Provider credential is absent; configure it locally. Workspace retained.')
                 development.write_launch(control, binary, runtime, env, writable=writable)
+                if coord_task:
+                    coordination.assignment_started(
+                        copy.source, coord_task, coord_assignment, copy.id, runtime,
+                        prepared_changes)
+                    coord_started = True
                 copy.begin('execution')
                 copy.metadata.update(delegation_level=policy.delegation_level,
                                      requested_access=policy.access, effective_access=policy.effective_access,
@@ -70,9 +86,24 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
                         message, errors, completed = api.runtime_result(runtime, out)
                         if code == 0 and (not completed or not message.strip()):
                             code = 70
+                        check_results = []
+                        if code == 0 and coord_item is not None:
+                            check_results = development.run_checks(
+                                layout, env, coord_item.get('checks', []))
+                            if any(row['exit_code'] != 0 for row in check_results):
+                                code = 65
+                                errors = (errors + '\nDeclared workspace verification failed.').strip()
                         kind = 'provider' if provider.failures else 'execution'
+                        worker_changes = (workspace.changed_since(copy, coord_before)
+                                          if coord_before is not None else [])
                         result = copy.finish('succeeded' if code == 0 else 'failed',
                                              error_kind=kind if code else None, exit_code=code)
+                        if coord_task:
+                            coordination.assignment_finished(
+                                copy.source, coord_task, coord_assignment,
+                                'succeeded' if code == 0 else 'failed',
+                                message if message else errors,
+                                worker_changes, check_results)
                     if code:
                         print(f'{kind.title()} failure (exit {code}); partial files and diff retained. '
                               f'Inspect workspace {copy.id} before --resume-after-failure.', file=api.sys.stderr)
@@ -102,10 +133,21 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
                         copy.finish('failed', error_kind=kind, exit_code=code)
                     except (workspace.WorkspaceError, OSError):
                         copy.failed(kind, code)
+                    if coord_task and coord_started:
+                        try:
+                            changes = (workspace.changed_since(copy, coord_before)
+                                       if coord_before is not None else [])
+                            coordination.assignment_finished(
+                                copy.source, coord_task, coord_assignment, 'failed',
+                                str(getattr(error, 'message', type(error).__name__)),
+                                changes, [])
+                        except Exception:
+                            pass
                     print(f'{kind.title()} failure; retained workspace {copy.id}. '
                           'Explicit recovery is required; no automatic implementation retry.', file=api.sys.stderr)
                     raise
-    except (workspace.WorkspaceError, development.DevelopmentError) as error:
+    except (workspace.WorkspaceError, development.DevelopmentError,
+            coordination.CoordinationError) as error:
         raise api.WorkerError(error.code, str(error)) from None
     finally:
         os.close(slot)

@@ -182,6 +182,24 @@ def write_launch(control: Path, binary: str, runtime: str, env: dict[str, str], 
     (control / 'launch.json').chmod(0o400)
 
 
+def run_checks(args: list[str], env: dict[str, str], commands: list[str],
+               timeout: float = 120) -> list[dict]:
+    """Run declared verification inside the same sparse/no-network sandbox."""
+    results = []
+    for command in commands:
+        try:
+            result = subprocess.run(
+                [*args, '--', '/bin/sh', '-lc', command],
+                env=env, text=True, capture_output=True, timeout=timeout, check=False)
+            results.append({'command': command, 'exit_code': result.returncode})
+        except subprocess.TimeoutExpired:
+            results.append({'command': command, 'exit_code': 124})
+            break
+        if results[-1]['exit_code'] != 0:
+            break
+    return results
+
+
 def bridge_command(args: list[str]) -> list[str]:
     return [*args, '--', sys.executable, '-I', '/run/deepseek-team/bridge.py', '--bridge',
             '/run/deepseek-team/launch.json', '/run/deepseek-team/provider.sock']
