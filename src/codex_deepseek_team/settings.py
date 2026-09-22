@@ -210,6 +210,17 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
         'themselves reserve ordinary implementation, tests, fixtures, documentation or non-secret '
         'metadata from workers. Do not calculate an actual useful-work percentage from calls, '
         'deliverable counts, lines or files.\n'
+        'DeepSeek Team workers always use deepseek-flash. Before each DeepSeek assignment, '
+        'the frontier coordinator chooses `--effort low`, `--effort medium` or `--effort high` '
+        'from the assigned task without asking the user: low for bounded/mechanical work, medium '
+        'for the normal case, and high for difficult debugging, cross-file reasoning or adversarial '
+        'review. The runner applies that choice consistently for Codex and Claude harnesses.\n'
+        'Coordinator-native subagents remain available. Use them only when parallelism, isolated '
+        'context or a native capability materially helps. Represent that choice in the plan with '
+        '`executor: "native-agent"` plus a concrete `delegation_reason`. Native agents complement '
+        'DeepSeek workers and do not satisfy DeepSeek worker assignments required by the 50/75 '
+        'profiles. Protected coordinator responsibilities remain with the coordinator. DeepSeek '
+        'workers themselves remain leaf workers and must never delegate.\n'
     )
     full_profiles = {
         25: 'Delegate bounded research, diagnosis and independent review. The coordinator performs the main implementation.',
@@ -245,7 +256,7 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
             'before coordinator source edits, submit a concrete JSON distribution with '
             '`deepseek-team coordination plan --task TASK_ID`; include deliverable id/kind/scope, '
             'executor, acceptance criteria, dependencies and checks. Run each worker assignment with '
-            '`deepseek-team worker --runtime codex --coord-task TASK_ID --coord-assignment ASSIGNMENT_ID`. '
+            '`deepseek-team worker --runtime codex --effort LOW|MEDIUM|HIGH --coord-task TASK_ID --coord-assignment ASSIGNMENT_ID`. '
             'The runner records start/result/workspace/checks automatically. After reviewing a result, '
             'record its use with `deepseek-team coordination use ...`. New substantial scope requires '
             'a revised plan. Codex PreToolUse technically blocks source mutation while the distribution '
@@ -256,7 +267,7 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
     else:
         process = (
             'Claude coordinator integration is instruction-driven in this release: use the same '
-            'distribution principles and managed worker runner, but DeepSeek Team does not claim a '
+            'distribution principles, explicit per-assignment DeepSeek effort selection and managed worker runner, but DeepSeek Team does not claim a '
             'Claude PreToolUse technical gate. Worker filesystem/network permissions remain technically '
             'sandboxed; coordinator compliance with distribution instructions depends on Claude Code.\n'
         )
