@@ -18,6 +18,7 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
     if getattr(args, 'attempts_explicit', False) and args.attempts != 1:
         raise api.WorkerError(64, 'Managed copies use one attempt; inspect and explicitly continue instead of retrying.')
     task = args.task if args.task is not None else api.sys.stdin.read()
+    effort = api.effort_level(getattr(args, 'effort', api.DEFAULT_EFFORT))
     if not task.strip():
         raise api.WorkerError(64, 'Pass a task on stdin or as one argument.')
     slot = api.acquire_slot(args.state_dir)
@@ -39,7 +40,7 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
             with tempfile.TemporaryDirectory(prefix='session-', dir=args.state_dir) as session, \
                     tempfile.TemporaryDirectory(prefix='dst-') as transport:
                 home, control = Path(session), Path(transport)
-                env = api.child_environment(home, relay.LOCAL_CREDENTIAL, runtime, args.effort)
+                env = api.child_environment(home, relay.LOCAL_CREDENTIAL, runtime, effort)
                 if runtime == 'codex':
                     api.transient_config(home)
                 else:
@@ -78,17 +79,17 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
                 if not key.strip():
                     raise api.WorkerError(78, 'Provider credential is absent; configure it locally. Workspace retained.')
                 development.write_launch(control, binary, runtime, env, writable=writable,
-                                         effort=args.effort)
+                                         effort=effort)
                 if coord_task:
                     coordination.assignment_started(
                         copy.source, coord_task, coord_assignment, copy.id, runtime,
-                        prepared_changes, effort=args.effort)
+                        prepared_changes, effort=effort)
                     coord_started = True
                 copy.begin('execution')
                 copy.metadata.update(delegation_level=policy.delegation_level,
                                      requested_access=policy.access, effective_access=policy.effective_access,
                                      configuration_sources=dict(policy.sources), runtime=runtime,
-                                     model=api.MODEL, effort=args.effort)
+                                     model=api.MODEL, effort=effort)
                 copy.save()
                 provider = None
                 try:
