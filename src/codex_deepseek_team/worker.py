@@ -464,6 +464,7 @@ def run(args):
 
 
 def run_worker(args, scope):
+    effort = effort_level(getattr(args, 'effort', DEFAULT_EFFORT))
     runtime, binary = resolve_runtime(args.runtime, args.codex, args.claude)
     sandbox, backend = resolve_os_sandbox(args.os_sandbox)
     if runtime == 'codex':
@@ -481,13 +482,13 @@ def run_worker(args, scope):
             home = Path(directory)
             if runtime == 'codex':
                 transient_config(home)
-            env = child_environment(home, key, runtime, args.effort)
+            env = child_environment(home, key, runtime, effort)
             if sandbox is not None and runtime == 'codex':
                 try:
                     env = sandbox.prepare_codex_environment(home, env, backend)
                 except sandbox.SandboxError as error:
                     raise WorkerError(error.code, error.message) from None
-            base_command = command(binary, args.allow_write, runtime, args.effort)
+            base_command = command(binary, args.allow_write, runtime, effort)
             if sandbox is not None and runtime == 'claude':
                 try:
                     base_command = sandbox.wrap_command(
