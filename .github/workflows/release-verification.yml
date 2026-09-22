@@ -1,7 +1,7 @@
 name: Release verification
 on:
   push:
-    branches: [main, deepseek/coordination-enforcement]
+    branches: [main]
 
 jobs:
   install-upgrade:
@@ -24,9 +24,9 @@ jobs:
           python -m pip install build
           python -m build
           python -m venv "$RUNNER_TEMP/clean"
-          "$RUNNER_TEMP/clean/bin/pip" install dist/codex_deepseek_team-0.5.0-py3-none-any.whl
-          test "$("$RUNNER_TEMP/clean/bin/deepseek-team" --version)" = "deepseek-team 0.5.0"
-      - name: Verify 0.4 to 0.5 standard installer upgrade
+          "$RUNNER_TEMP/clean/bin/pip" install dist/codex_deepseek_team-0.6.0-py3-none-any.whl
+          test "$("$RUNNER_TEMP/clean/bin/deepseek-team" --version)" = "deepseek-team 0.6.0"
+      - name: Verify 0.5 to 0.6 standard installer upgrade
         shell: bash
         run: |
           set -euo pipefail
@@ -37,7 +37,7 @@ jobs:
           PREFIX="$RUNNER_TEMP/prefix"
           BIN="$RUNNER_TEMP/bin"
           PROJECT="$RUNNER_TEMP/project"
-          git worktree add --detach "$OLD" v0.4.0
+          git worktree add --detach "$OLD" v0.5.0
           mkdir -p "$PROJECT"
           git -C "$PROJECT" init -q
           printf 'VALUE = 1\n' > "$PROJECT/a.py"
@@ -51,9 +51,10 @@ jobs:
           BEFORE_SETTINGS="$(cat "$PROJECT/.deepseek-team.toml")"
           BEFORE_KEY="$(sha256sum "$HOME/.config/codex-deepseek/api-key" | awk '{print $1}')"
           python install.py --prefix "$PREFIX" --bin-dir "$BIN"
-          test "$("$BIN/deepseek-team" --version)" = "deepseek-team 0.5.0"
+          test "$("$BIN/deepseek-team" --version)" = "deepseek-team 0.6.0"
           "$BIN/deepseek-team" hooks status
           "$BIN/deepseek-team" auth status
+          "$BIN/deepseek-team" config show --effective --path "$PROJECT" --json | grep -q '"effort": "auto"'
           test "$(sha256sum "$PROJECT/AGENTS.md" | awk '{print $1}')" = "$BEFORE_AGENTS"
           test "$(cat "$PROJECT/.deepseek-team.toml")" = "$BEFORE_SETTINGS"
           test "$(sha256sum "$HOME/.config/codex-deepseek/api-key" | awk '{print $1}')" = "$BEFORE_KEY"
@@ -66,5 +67,5 @@ jobs:
       - name: Upload release candidate artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: deepseek-team-0.5.0-dist
+          name: deepseek-team-0.6.0-dist
           path: dist/*
