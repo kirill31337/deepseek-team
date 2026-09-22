@@ -36,11 +36,12 @@ class DevelopmentError(Exception):
 
 
 def runtime_command(binary: str, runtime: str, *, writable: bool,
-                    path: str = '/usr/local/bin:/usr/bin:/bin') -> list[str]:
+                    path: str = '/usr/local/bin:/usr/bin:/bin',
+                    effort: str = 'medium') -> list[str]:
     from . import worker
     instructions = FULL_INSTRUCTIONS if writable else worker.INSTRUCTIONS
     if runtime == 'codex':
-        args = worker.command(binary)
+        args = worker.command(binary, effort=effort)
         args[args.index('--sandbox') + 1] = 'danger-full-access'
         # This bypasses only the *inner* filesystem sandbox: the verified sparse
         # bwrap and isolated network namespace always surround the whole harness.
@@ -175,10 +176,11 @@ def probe(args: list[str], env: dict[str, str]) -> None:
                                'no unsandboxed fallback. Check Bubblewrap/AppArmor and runtime installation.')
 
 
-def write_launch(control: Path, binary: str, runtime: str, env: dict[str, str], *, writable: bool) -> None:
+def write_launch(control: Path, binary: str, runtime: str, env: dict[str, str], *,
+                 writable: bool, effort: str = 'medium') -> None:
     shutil.copyfile(Path(relay.__file__), control / 'bridge.py')
     (control / 'bridge.py').chmod(0o400)
-    command = runtime_command(binary, runtime, writable=writable, path=env['PATH'])
+    command = runtime_command(binary, runtime, writable=writable, path=env['PATH'], effort=effort)
     (control / 'launch.json').write_text(json.dumps({'command': command, 'env': env}))
     (control / 'launch.json').chmod(0o400)
 
