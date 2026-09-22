@@ -1,3 +1,5 @@
+![DeepSeek Team banner](assets/deepseek-team-banner.jpg)
+
 # DeepSeek Team
 
 [English](README.md) | **Русский**
