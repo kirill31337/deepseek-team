@@ -325,7 +325,7 @@ wire_api = "responses"
         # A real child takes one second, while the deadline clock sees 1000.
         # The old 180-second default kills it instead of returning its answer.
         clock = time.monotonic
-        argv = ['worker', '--os-sandbox', 'off', '--codex', str(self.root / 'codex-sleep'),
+        argv = ['worker', '--access', 'read-only', '--os-sandbox', 'off', '--codex', str(self.root / 'codex-sleep'),
                 '--state-dir', str(self.state), 'delayed answer']
         with mock.patch.dict(os.environ, self.env, clear=True), \
              mock.patch.object(sys, 'argv', argv), \

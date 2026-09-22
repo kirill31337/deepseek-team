@@ -48,6 +48,9 @@ def main(argv=None):
     if argv and argv[0] == 'coordination':
         from . import coordination_cli
         return coordination_cli.main(argv)
+    if argv and argv[0] == 'routing':
+        from . import routing_cli
+        return routing_cli.main(argv)
     if argv and argv[0] in ('config', 'workspace'):
         from . import delegation_cli
         return delegation_cli.main(argv)
@@ -63,6 +66,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(prog='deepseek-team', description=__doc__)
     parser.add_argument('--version', action='version', version=f'deepseek-team {__version__}')
     commands = parser.add_subparsers(dest='command', required=True)
+    commands.add_parser('routing', help='Adaptive delegation, evidence, feedback, evaluation and experiment budgets.')
     for name in ('on', 'off', 'status'):
         toggle = commands.add_parser(name, help='Save or show local project activation for both coordinators.')
         toggle.add_argument('path', nargs='?', type=Path, default=Path.cwd())

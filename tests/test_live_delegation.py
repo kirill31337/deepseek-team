@@ -23,6 +23,7 @@ import unittest
 from unittest.mock import patch
 
 from codex_deepseek_team import coordination, managed, relay, sandbox, settings, worker, workspace
+from codex_deepseek_team.routing import RoutingService
 
 DRIVER = r'''#!/usr/bin/env python3
 import errno,json,os,pathlib,socket,subprocess,sys
@@ -132,6 +133,58 @@ class LiveBase(unittest.TestCase):
 
 
 class LiveDemoTests(LiveBase):
+    def _assert_post_start_preparation_failure_is_reconciled(self, failure_point):
+        settings.set_values(
+            self.source / '.deepseek-team.toml',
+            delegation_level='auto', access='full-access')
+        policy = self.policy('auto', 'full-access')
+        service = RoutingService(self.source)
+        service.configure({'recovery_rate': .25})
+        copy, sibling = [workspace.create(self.source, self.state) for _ in range(2)]
+        task = coordination.open_task(
+            self.source, session_id='session-' + failure_point,
+            turn_id='turn-' + failure_point, prompt='implement fix',
+            policy=policy, runtime='claude')
+        features = {
+            'kind': 'implementation', 'domain': 'python', 'operation': 'fix',
+            'localization': 'known', 'coupling': 'local', 'verification': 'tests',
+            'clarity': 'clear', 'risk': 'low', 'scope_size': 'small',
+            'runtime': 'claude', 'model': 'deepseek-flash', 'effort': 'medium',
+            'context_version': 'default',
+        }
+        planned = coordination.plan_task(self.source, task['id'], {
+            'classification': 'substantial',
+            'deliverables': [{
+                'id': 'impl', 'kind': 'implementation', 'scope': ['calc.py'],
+                'executor': 'auto', 'acceptance': ['sum fixed'],
+                'dependencies': [], 'checks': ['python3 -V'], 'features': features,
+            }],
+        })
+        self.assertEqual(planned['deliverables'][0]['executor'], 'worker')
+        self.assertEqual(service.recovery_status()['pending_count'], 1)
+        aid = planned['assignments'][0]['id']
+        args = self.args(self.task('fix', sibling), coord_task=task['id'], coord_assignment=aid)
+        error = (workspace.WorkspaceError('simulated post-start preparation failure')
+                 if failure_point == 'begin' else OSError('simulated workspace save failure'))
+        with patch.object(copy, failure_point, side_effect=error):
+            with self.assertRaises((worker.WorkerError, OSError)):
+                managed.run(args, policy, worker, copy)
+
+        assignment = coordination.load_task(self.source, task['id'])['assignments'][0]
+        self.assertEqual(assignment['status'], 'failed')
+        self.assertEqual(assignment['error_kind'], 'environment')
+        observations = service.observations()
+        self.assertEqual(len(observations), 1)
+        self.assertEqual(observations[0]['outcome'], 'infrastructure')
+        self.assertNotIn(observations[0]['outcome'], ('rework', 'rejected'))
+        self.assertEqual(service.recovery_status()['running_count'], 0)
+
+    def test_copy_begin_failure_after_assignment_start_is_reconciled(self):
+        self._assert_post_start_preparation_failure_is_reconciled('begin')
+
+    def test_copy_save_failure_after_assignment_start_is_reconciled(self):
+        self._assert_post_start_preparation_failure_is_reconciled('save')
+
     def test_four_profiles_with_real_permissions_and_local_tests(self):
         copies = [workspace.create(self.source, self.state) for _ in range(6)]
         source_index = (self.source / '.git/index').read_bytes()

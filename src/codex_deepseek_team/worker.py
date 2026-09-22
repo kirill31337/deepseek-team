@@ -488,6 +488,22 @@ def run_worker(args):
         os.close(slot)
 
 
+def _delegation_level_options():
+    """Share settings.parse_level/LEVELS, tolerating direct legacy execution."""
+    sibling = Path(__file__).resolve().with_name('settings.py')
+    if sibling.exists():
+        package_parent = str(sibling.parent.parent)
+        if package_parent not in sys.path:
+            sys.path.insert(0, package_parent)
+        try:
+            from codex_deepseek_team import settings
+        except ImportError:
+            pass
+        else:
+            return settings.parse_level, settings.LEVELS
+    return int, (25, 50, 75)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('task', nargs='?', help='Task; stdin is preferred for private content.')
@@ -501,7 +517,9 @@ def parse_args():
                         help='0: wait without a total deadline (default); 1..900: explicit total limit in seconds, including retries.')
     parser.add_argument('--attempts', type=int, choices=[1, 2, 3],
                         help='Read-only: 2 by default. Managed full-access uses one attempt and explicit resume.')
-    parser.add_argument('--delegation-level', type=int, choices=[25, 50, 75])
+    level_type, level_choices = _delegation_level_options()
+    parser.add_argument('--delegation-level', type=level_type, choices=level_choices,
+                        help='auto adapts per task; 25/50/75 force a fixed profile.')
     parser.add_argument('--access', choices=['auto', 'read-only', 'full-access'])
     parser.add_argument('--workspace', help='Reuse an owned workspace ID; never adopts foreign directories.')
     parser.add_argument('--coord-task', help='Persistent coordination task id for automatic runner accounting.')

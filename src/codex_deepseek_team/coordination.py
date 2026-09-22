@@ -22,6 +22,9 @@ import time
 from typing import Any
 
 from . import settings
+from .config import sync_directory
+from .routing import RoutingService
+from .routing_models import RoutingError, fingerprint, number, validate_features
 
 WORKER_WRITE_KINDS = {"implementation", "test", "fixture", "documentation", "metadata"}
 WORKER_READ_KINDS = {"review", "research", "diagnostic", "test_plan"}
@@ -116,6 +119,7 @@ def _atomic(path: Path, value: Any) -> None:
             os.fsync(stream.fileno())
         os.replace(temporary, path)
         temporary = None
+        sync_directory(path.parent)
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
@@ -148,7 +152,7 @@ def _head(root: Path) -> str:
 
 
 def open_task(root: Path, *, session_id: str, turn_id: str, prompt: str,
-              policy: settings.Policy) -> dict:
+              policy: settings.Policy, runtime: str = 'codex') -> dict:
     root = _project_root(root)
     seed = f"{session_id}\0{turn_id}".encode()
     task_id = "task-" + hashlib.sha256(seed).hexdigest()[:20]
@@ -163,7 +167,8 @@ def open_task(root: Path, *, session_id: str, turn_id: str, prompt: str,
             "prompt_sha256": hashlib.sha256(prompt.encode("utf-8", errors="replace")).hexdigest(),
             "base_head": _head(root), "created_at": now, "updated_at": now,
             "status": "planning", "classification": None, "small_evidence": None,
-            "policy": policy.as_dict(), "deliverables": [], "assignments": [],
+            "policy": policy.as_dict(), "saved_policy": settings.resolve(root).as_dict(),
+            "runtime": runtime, "deliverables": [], "assignments": [],
             "coordinator_events": [], "constraints": [],
         }
         _atomic(path, task)
@@ -197,12 +202,12 @@ def active_task(root: Path, session_id: str) -> dict | None:
 
 
 def begin_turn(root: Path, *, session_id: str, turn_id: str, prompt: str,
-               policy: settings.Policy) -> dict:
+               policy: settings.Policy, runtime: str = 'codex') -> dict:
     """Reuse unfinished work across Stop continuations and compaction."""
     existing = active_task(root, session_id)
     if existing is None:
         task = open_task(root, session_id=session_id, turn_id=turn_id,
-                         prompt=prompt, policy=policy)
+                         prompt=prompt, policy=policy, runtime=runtime)
         task.setdefault('turns', [turn_id])
         task.setdefault('prompt_hashes', [task['prompt_sha256']])
         _atomic(_task_path(root, task['id']), task)
@@ -237,8 +242,10 @@ def _normalize_deliverable(raw: dict) -> dict:
         raise CoordinationError("Deliverables require id/kind/scope/executor/acceptance/dependencies/checks.", 64)
     if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", str(raw["id"])):
         raise CoordinationError("Invalid deliverable id.", 64)
-    if raw["executor"] not in ("worker", "coordinator", "native-agent"):
-        raise CoordinationError("Deliverable executor must be worker, coordinator or native-agent.", 64)
+    if raw["executor"] not in ("auto", "worker", "coordinator", "native-agent"):
+        raise CoordinationError("Deliverable executor must be auto, worker, coordinator or native-agent.", 64)
+    if raw['executor'] == 'worker' and raw['kind'] in PROTECTED_COORDINATOR_KINDS:
+        raise CoordinationError('Protected coordinator responsibilities cannot be assigned to a worker.', 64)
     if raw["executor"] == "native-agent":
         reason = raw.get("delegation_reason")
         if not isinstance(reason, str) or len(reason.strip()) < 12:
@@ -248,11 +255,86 @@ def _normalize_deliverable(raw: dict) -> dict:
             raise CoordinationError(
                 "Protected coordinator responsibilities cannot be assigned to a native agent.", 64)
     value = dict(raw)
+    # Derived state is read only from our ledger, never accepted from a plan.
+    value.pop('routing', None)
+    value.pop('routing_feedback', None)
     value["scope"] = list(raw["scope"]) if isinstance(raw["scope"], list) else [str(raw["scope"])]
     value["acceptance"] = list(raw["acceptance"])
     value["dependencies"] = list(raw["dependencies"])
     value["checks"] = list(raw["checks"])
     return value
+
+
+def _definition(item):
+    return {key: item[key] for key in ('id', 'kind', 'scope', 'acceptance',
+                                      'dependencies', 'checks', 'features')}
+
+
+def _binding(task_id, item):
+    requested = (item.get('routing') or {}).get('requested_executor', item['executor'])
+    return {'task_id': task_id, 'deliverable_id': item['id'],
+            'plan_hash': fingerprint(dict(_definition(item), requested_executor=requested))}
+
+
+def _prepare_routing(root, task, items, service):
+    previous = {item['id']: item for item in task.get('deliverables', [])}
+    started = {row['deliverable_id'] for row in task.get('assignments', [])
+               if row['status'] != 'planned'}
+    started.update(item['id'] for item in previous.values() if item.get('routing_feedback'))
+    ids = set()
+    for item in items:
+        if item['id'] in ids:
+            raise CoordinationError('Duplicate deliverable identity.', 64)
+        ids.add(item['id'])
+        raw = item.get('features', {})
+        defaults = {'kind': item['kind'], 'runtime': task.get('runtime', 'codex'),
+                    'effort': task['policy'].get('effort') if task['policy'].get('effort') in ('low', 'medium', 'high') else 'medium'}
+        if not isinstance(raw, dict):
+            raise CoordinationError('features must be a structured feature card.', 64)
+        item['features'] = validate_features({**defaults, **raw})
+        if item['features']['kind'] != item['kind']:
+            raise CoordinationError('Feature kind must match deliverable kind.', 64)
+        prior = previous.get(item['id'])
+        if item['id'] in started and prior and 'features' in prior:
+            if _definition(item) != _definition(prior) or item['executor'] not in (prior['executor'], 'auto'):
+                raise CoordinationError('Started deliverable scope and features are immutable; use a new deliverable id.', 64)
+            item['executor'] = prior['executor']
+            item['routing'] = prior.get('routing')
+            for key in ('routing_feedback', 'result_evidence'):
+                if key in prior:
+                    item[key] = prior[key]
+            continue
+        requested = item['executor']
+        if requested == 'auto' and service.config()['mode'] != 'auto':
+            raise CoordinationError('executor:auto requires routing mode auto.', 64)
+        decision = service.predict(item['features'], access=task['policy']['effective_access'],
+                                   binding=_binding(task['id'], item),
+                                   recovery=requested == 'auto' and task['policy']['delegation_level'] == 'auto' and bool(item['checks']))
+        if requested == 'auto':
+            item['executor'] = 'worker' if decision['action'] == 'worker' else 'coordinator'
+        item['routing'] = {'decision_id': decision['id'], 'requested_executor': requested,
+                           'action': decision['action'], 'reason_codes': decision['reason_codes']}
+
+
+def _valid_auto_decision(root, task, item):
+    routing = item.get('routing') or {}
+    if routing.get('requested_executor') != 'auto':
+        return False
+    service = RoutingService(root)
+    decision_id = routing.get('decision_id')
+    if not service.validate_plan_decision(decision_id, item.get('features'), _binding(task['id'], item), executor=item['executor']):
+        return False
+    decision = service.decision(decision_id)
+    return item['executor'] == ('worker' if decision['action'] == 'worker' else 'coordinator')
+
+
+@contextmanager
+def _routing_batch(root):
+    try:
+        with RoutingService(root).batch() as service:
+            yield service
+    except RoutingError as error:
+        raise CoordinationError(error.message, error.code) from None
 
 
 def plan_task(root: Path, task_id: str, plan: dict) -> dict:
@@ -271,14 +353,21 @@ def plan_task(root: Path, task_id: str, plan: dict) -> dict:
                 "Small-task exemption requires one concrete non-wildcard scope; "
                 "otherwise register a substantial distribution.", 64)
     root = _project_root(root)
-    with _lock(root):
+    with _lock(root), _routing_batch(root) as service:
         task = load_task(root, task_id)
+        old_deliverables = task.get('deliverables', [])
+        try:
+            _prepare_routing(root, task, deliverables, service)
+        except RoutingError as error:
+            raise CoordinationError(error.message, error.code) from None
         previous = {a["deliverable_id"]: a for a in task.get("assignments", [])}
         incoming_ids = {item["id"] for item in deliverables}
         historical_missing = [
             row["deliverable_id"] for row in task.get("assignments", [])
             if row.get("status") not in ("planned",) and row.get("deliverable_id") not in incoming_ids
         ]
+        historical_missing.extend(item['id'] for item in task.get('deliverables', [])
+                                  if item.get('routing_feedback') and item['id'] not in incoming_ids)
         if historical_missing:
             raise CoordinationError(
                 "Plan revision cannot remove started/completed worker deliverables: " +
@@ -308,6 +397,26 @@ def plan_task(root: Path, task_id: str, plan: dict) -> dict:
                     small_evidence=plan.get("small_evidence"),
                     deliverables=deliverables, assignments=assignments,
                     status="planned", updated_at=time.time())
+        # All routing changes stay uncommitted until the ledger is durable.
+        retained_tickets = set()
+        for item in deliverables:
+            if item.get('routing'):
+                info = service.decision(item['routing']['decision_id']).get('recovery') or {}
+                if info.get('selected'):
+                    retained_tickets.add(info['ticket_id'])
+        for item in old_deliverables:
+            if item.get('routing'):
+                try:
+                    info = service.decision(item['routing']['decision_id']).get('recovery') or {}
+                except RoutingError as error:
+                    if error.code != 66:
+                        raise
+                    # A crash after ledger rename but before the routing commit
+                    # can leave a safe-invalid planned decision. Replanning
+                    # replaces it; a rolled-back ticket cannot need release.
+                    continue
+                if info.get('selected') and info['ticket_id'] not in retained_tickets:
+                    service.release_recovery(info['ticket_id'])
         _atomic(_task_path(root, task_id), task)
         return task
 
@@ -342,8 +451,11 @@ def validate_task(root: Path, task_id: str) -> list[str]:
     if task["classification"] == "small":
         return []
     policy = task["policy"]
-    level = int(policy["delegation_level"])
-    access = policy["effective_access"]
+    level = policy['delegation_level']
+    # A task's distribution profile is a snapshot across compaction. Current
+    # access revocations still apply immediately and cannot force a writer.
+    current = settings.resolve(root)
+    access = _effective_task_access(task, current)
     issues = []
     worker_count = 0
     worker_write_count = 0
@@ -351,6 +463,15 @@ def validate_task(root: Path, task_id: str) -> list[str]:
     eligible_write_count = 0
     for item in task.get("deliverables", []):
         kind, executor = item["kind"], item["executor"]
+        if executor == 'worker' and kind in WORKER_WRITE_KINDS and access != 'full-access':
+            issues.append(f"{item['id']}: current access does not permit worker writes; revise the plan")
+        if (item.get('routing') or {}).get('requested_executor') == 'auto':
+            try:
+                valid_auto = _valid_auto_decision(root, task, item)
+            except (RoutingError, KeyError):
+                valid_auto = False
+            if not valid_auto:
+                issues.append(f"{item['id']}: automatic executor requires its original saved routing decision")
         if executor == "worker":
             worker_count += 1
             if kind in WORKER_WRITE_KINDS:
@@ -366,9 +487,9 @@ def validate_task(root: Path, task_id: str) -> list[str]:
         if executor == "coordinator" and eligible:
             if access == "read-only" and kind in WORKER_WRITE_KINDS:
                 continue
-            if level >= 75 and not _retention_ok(task, item):
+            if level == 75 and not _retention_ok(task, item):
                 issues.append(f"{item['id']}: worker-eligible {kind} retained by coordinator without a supported constraint")
-    if level >= 75 and access == "full-access" and eligible_count and worker_count == 0:
+    if level == 75 and access == "full-access" and eligible_count and worker_count == 0:
         issues.append("75/full-access requires worker assignment for separable worker-eligible deliverables")
     if level == 50 and access == "full-access" and eligible_write_count and worker_write_count == 0:
         issues.append("50/full-access requires at least one worker implementation/test/docs slice when worker-eligible implementation exists")
@@ -382,17 +503,81 @@ def _assignment(task: dict, assignment_id: str) -> dict:
     raise CoordinationError("Unknown coordination assignment.", 64)
 
 
+def _effective_task_access(task, current):
+    policy = task['policy']
+    sources = policy.get('sources', {})
+    explicit_cli = (sources.get('access') == 'cli' or
+                    (policy.get('access') == 'auto' and sources.get('delegation_level') == 'cli'))
+    unchanged_cli_override = explicit_cli and current.as_dict() == task.get('saved_policy')
+    if current.effective_access == 'read-only' and not unchanged_cli_override:
+        return 'read-only'
+    return policy['effective_access']
+
+
+def _check_assignment_access(root, task, item):
+    current = settings.resolve(root)
+    if not current.enabled:
+        raise CoordinationError('Delegation is disabled; no new worker assignment may start.', 69)
+    access = _effective_task_access(task, current)
+    if item['kind'] in WORKER_WRITE_KINDS and access != 'full-access':
+        raise CoordinationError('Current access does not permit this worker writing assignment; revise the plan.', 78)
+
+
 def assignment_started(root: Path, task_id: str, assignment_id: str,
                        workspace_id: str, runtime: str,
                        prepared_changes: list[str], effort: str | None = None) -> dict:
-    with _lock(root):
+    with _lock(root), _routing_batch(root) as service:
         task = load_task(root, task_id)
         row = _assignment(task, assignment_id)
+        item = assignment_deliverable(task, assignment_id)
+        _check_assignment_access(root, task, item)
+        if row['status'] == 'running':
+            # The managed runner holds the workspace's exclusive OS lock. An
+            # exact explicit continuation can reconcile a crash between the
+            # ledger rename and SQLite commit without starting another case.
+            expected = dict(workspace_id=workspace_id, runtime=runtime, effort=effort,
+                            prepared_changes=sorted(set(prepared_changes)))
+            if any(row.get(key) != value for key, value in expected.items()):
+                raise CoordinationError('Running assignment continuation must match its original workspace and execution conditions.', 64)
+            if row.get('routing_decision_id'):
+                try:
+                    service.decision(row['routing_decision_id'])
+                except RoutingError as error:
+                    if error.code != 66 or (item.get('routing') or {}).get('requested_executor') == 'auto':
+                        raise
+                    # A manual start may have captured its decision in the
+                    # interrupted transaction. Recreate before any execution.
+                    decision = service.predict(row['routing_features'], access=task['policy']['effective_access'])
+                    row['routing_decision_id'] = decision['id']
+                    _atomic(_task_path(root, task_id), task)
+                service.start_recovery(row['routing_decision_id'])
+            return task
         if row["status"] not in ("planned", "failed"):
             raise CoordinationError("Assignment is already active or completed.", 64)
+        if row['status'] == 'failed':
+            if row.get('disposition') is None:
+                raise CoordinationError('Review and disposition the failed attempt before explicit continuation.', 64)
+            history = row.setdefault('attempt_history', [])
+            history.append({key: row.get(key) for key in ('status', 'workspace_id', 'runtime', 'effort',
+                'started_at', 'finished_at', 'checks', 'disposition', 'error_kind', 'exit_code',
+                'routing_features', 'routing_decision_id')})
+        if item.get('features'):
+            features = dict(item['features'], runtime=runtime, effort=effort or 'medium', model='deepseek-flash')
+            auto = (item.get('routing') or {}).get('requested_executor') == 'auto'
+            if auto and features != item['features']:
+                raise CoordinationError('Worker runtime/effort must match its automatic routing decision; replan before starting.', 64)
+            try:
+                decision = (service.decision(item['routing']['decision_id']) if auto else
+                            service.predict(features, access=task['policy']['effective_access']))
+                if auto:
+                    service.start_recovery(decision['id'])
+            except RoutingError as error:
+                raise CoordinationError(error.message, error.code) from None
+            row['routing_features'] = features
+            row['routing_decision_id'] = decision['id']
         row.update(status="running", workspace_id=workspace_id, runtime=runtime,
                    effort=effort, prepared_changes=sorted(set(prepared_changes)),
-                   started_at=time.time())
+                   started_at=time.time(), disposition=None, error_kind=None, exit_code=None)
         task.update(status="active", updated_at=time.time())
         _atomic(_task_path(root, task_id), task)
         return task
@@ -400,22 +585,36 @@ def assignment_started(root: Path, task_id: str, assignment_id: str,
 
 def assignment_finished(root: Path, task_id: str, assignment_id: str,
                         status: str, result_summary: str,
-                        worker_changes: list[str], checks: list[dict]) -> dict:
+                        worker_changes: list[str], checks: list[dict], *,
+                        error_kind: str | None = None, exit_code: int | None = None) -> dict:
     if status not in ("succeeded", "failed"):
         raise CoordinationError("Assignment result status must be succeeded or failed.", 64)
     with _lock(root):
         task = load_task(root, task_id)
         row = _assignment(task, assignment_id)
+        if row.get('status') != 'running':
+            raise CoordinationError('Only a running assignment can record a terminal result.', 64)
+        if status == 'failed' and error_kind is None:
+            error_kind = 'verification' if any(check.get('exit_code') for check in checks) else 'execution'
+        if error_kind not in (None, 'verification', 'provider', 'execution', 'environment', 'cancelled'):
+            raise CoordinationError('Unknown worker failure classification.', 64)
         row.update(status=status, result_summary=str(result_summary)[:4000],
                    worker_changes=sorted(set(worker_changes)), checks=list(checks),
-                   finished_at=time.time())
+                   finished_at=time.time(), error_kind=error_kind, exit_code=exit_code)
+        if status == 'failed' and row.get('routing_features'):
+            outcome = {'verification': 'rejected', 'provider': 'infrastructure',
+                       'environment': 'infrastructure', 'cancelled': 'cancelled'}.get(error_kind, 'unknown')
+            _queue_feedback(task, row, action='worker', outcome=outcome, cost_usd=None,
+                            features=row['routing_features'], decision_id=row.get('routing_decision_id'),
+                            started_at=row.get('started_at', task['created_at']))
         task["updated_at"] = time.time()
         _atomic(_task_path(root, task_id), task)
-        return task
+    sync_routing_feedback(root, task_id)
+    return load_task(root, task_id)
 
 
 def use_result(root: Path, task_id: str, assignment_id: str,
-               disposition: str, evidence: str) -> dict:
+               disposition: str, evidence: str, *, cost_usd: float | None = None) -> dict:
     if disposition not in ("incorporated", "reproduced", "rejected", "needs-rework"):
         raise CoordinationError("Invalid result disposition.", 64)
     if not evidence.strip():
@@ -427,9 +626,101 @@ def use_result(root: Path, task_id: str, assignment_id: str,
             raise CoordinationError("Cannot disposition an unfinished assignment.", 64)
         row["disposition"] = {"kind": disposition, "evidence": evidence[:2000],
                               "at": time.time()}
+        if row.get('routing_features'):
+            outcome = {'incorporated': 'accepted', 'reproduced': 'accepted',
+                       'rejected': 'rejected', 'needs-rework': 'rework'}[disposition]
+            if row.get('error_kind') in ('provider', 'environment'):
+                outcome = 'infrastructure'
+            elif row.get('error_kind') == 'cancelled':
+                outcome = 'cancelled'
+            _queue_feedback(task, row, action='worker', outcome=outcome, cost_usd=cost_usd,
+                            features=row['routing_features'], decision_id=row.get('routing_decision_id'),
+                            started_at=row.get('started_at', task['created_at']))
         task["updated_at"] = time.time()
         _atomic(_task_path(root, task_id), task)
-        return task
+    sync_routing_feedback(root, task_id)
+    return load_task(root, task_id)
+
+
+def abandon_assignment(root: Path, task_id: str, assignment_id: str,
+                       evidence: str, *, confirmed_stopped: bool = False) -> dict:
+    """Explicitly close inspected, stopped work after coordinator process loss."""
+    if confirmed_stopped is not True or not isinstance(evidence, str) or not evidence.strip():
+        raise CoordinationError('Inspect the workspace and verify all worker processes have stopped; provide evidence and --confirmed-stopped.', 64)
+    from . import workspace
+    task = load_task(root, task_id)
+    row = _assignment(task, assignment_id)
+    if row.get('status') != 'running' or not row.get('workspace_id'):
+        raise CoordinationError('Only an interrupted running assignment can be abandoned.', 64)
+    try:
+        copy = workspace.load(_state_root(), row['workspace_id'])
+        if copy.source.resolve() != _project_root(root):
+            raise CoordinationError('Assignment workspace belongs to another project.', 78)
+        # Same lock order as the managed runner: workspace, then coordinator.
+        # An active owner always blocks abandonment; no automatic termination.
+        with copy.lock(recover=True):
+            changes, _ = copy.changes()
+            assignment_finished(root, task_id, assignment_id, 'failed', evidence,
+                                changes, [], error_kind='cancelled', exit_code=130)
+            result = use_result(root, task_id, assignment_id, 'rejected', evidence)
+            copy.failed('cancelled', 130)
+            return result
+    except workspace.WorkspaceError as error:
+        raise CoordinationError(error.message, error.code) from None
+
+
+def _queue_feedback(task, owner, *, action, outcome, cost_usd, features, decision_id, started_at):
+    try:
+        cost = None if cost_usd is None else number(cost_usd, 'cost_usd')
+    except RoutingError as error:
+        raise CoordinationError(error.message, error.code) from None
+    events = owner.setdefault('routing_feedback', [])
+    if events and events[-1]['observation']['outcome'] == outcome and events[-1]['observation']['cost_usd'] == cost:
+        return
+    now = time.time()
+    case_id = fingerprint([task['id'], owner['id']])
+    observation = {'id': f'feedback-{case_id[:32]}-{len(events)}', 'case_id': case_id,
+                   'origin': 'local', 'features': features, 'action': action, 'outcome': outcome,
+                   'observed_at': now, 'cost_usd': cost, 'duration_seconds': max(0., now - started_at),
+                   'decision_id': decision_id}
+    events.append({'observation': observation, 'recorded': False})
+
+
+def sync_routing_feedback(root: Path, task_id: str) -> None:
+    """Replay the durable outbox after interruptions; SQLite identities deduplicate it."""
+    with _lock(root):
+        task = load_task(root, task_id)
+        changed = False
+        for owner in [*task.get('assignments', []), *task.get('deliverables', [])]:
+            for event in owner.get('routing_feedback', []):
+                if not event['recorded']:
+                    try:
+                        RoutingService(root).observe(event['observation'])
+                    except RoutingError as error:
+                        raise CoordinationError(error.message, error.code) from None
+                    event['recorded'] = True
+                    changed = True
+        if changed:
+            _atomic(_task_path(root, task_id), task)
+
+
+def observe_coordinator_result(root: Path, task_id: str, deliverable_id: str,
+                               outcome: str, evidence: str, *, cost_usd: float | None = None) -> dict:
+    if outcome not in ('accepted', 'rework', 'rejected', 'infrastructure', 'cancelled', 'unknown') or not evidence.strip():
+        raise CoordinationError('Coordinator result requires a valid outcome and verification evidence.', 64)
+    with _lock(root):
+        task = load_task(root, task_id)
+        item = next((item for item in task['deliverables'] if item['id'] == deliverable_id), None)
+        if item is None or item['executor'] != 'coordinator' or not item.get('features'):
+            raise CoordinationError('Coordinator feedback requires a planned coordinator deliverable with original features.', 64)
+        decision_id = (item.get('routing') or {}).get('decision_id')
+        _queue_feedback(task, item, action='coordinator', outcome=outcome, cost_usd=cost_usd,
+                        features=item['features'], decision_id=decision_id, started_at=task['created_at'])
+        item['result_evidence'] = evidence[:2000]
+        task['updated_at'] = time.time()
+        _atomic(_task_path(root, task_id), task)
+    sync_routing_feedback(root, task_id)
+    return load_task(root, task_id)
 
 
 def record_constraint(root: Path, task_id: str, deliverable_id: str,
@@ -492,6 +783,7 @@ def ensure_assignment_ready(root: Path, task_id: str, assignment_id: str, copy) 
     """Fail preparation before provider access when declared prerequisites are absent."""
     task = load_task(root, task_id)
     item = assignment_deliverable(task, assignment_id)
+    _check_assignment_access(root, task, item)
     if copy.metadata.get('base_head') != task.get('base_head'):
         record_constraint(root, task_id, item['id'], 'environment_incompatible',
                           'workspace base HEAD does not match coordination task base HEAD')
@@ -527,9 +819,10 @@ def ensure_assignment_ready(root: Path, task_id: str, assignment_id: str, copy) 
 
 
 def summary(task: dict) -> str:
+    level = task['policy']['delegation_level']
     lines = [
         f"DeepSeek Team coordination task {task['id']}: "
-        f"{task['policy']['delegation_level']}%/{task['policy']['effective_access']}; "
+        f"{str(level) + '%' if level != 'auto' else 'Auto'}/{task['policy']['effective_access']}; "
         f"effort={task['policy'].get('effort', 'auto')}; "
         f"classification={task.get('classification') or 'pending'}.",
     ]

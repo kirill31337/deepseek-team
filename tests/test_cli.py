@@ -26,7 +26,7 @@ class CliTests(unittest.TestCase):
 
     def cli(self, *args, input=''):
         return subprocess.run([sys.executable, '-m', 'codex_deepseek_team', *args],
-                              input=input, text=True, capture_output=True, env=self.env, timeout=15)
+                              input=input, text=True, capture_output=True, env=self.env, timeout=15, cwd=self.root)
 
     def test_setup_reset_and_offline_doctor_preserve_custom_primary(self):
         home = self.root / 'codex'

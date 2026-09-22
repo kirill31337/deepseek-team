@@ -9,7 +9,9 @@ from . import project, settings, workspace
 
 
 def policy_options(parser):
-    parser.add_argument('--delegation-level', type=int, choices=settings.LEVELS)
+    parser.add_argument('--delegation-level', type=settings.parse_level,
+                        choices=settings.LEVELS,
+                        help='auto adapts per task; 25/50/75 force a fixed profile.')
     parser.add_argument('--access', choices=settings.ACCESS)
     parser.add_argument('--effort', choices=settings.EFFORT,
                         help='auto lets the frontier coordinator choose per DeepSeek assignment; low/medium/high force a level.')

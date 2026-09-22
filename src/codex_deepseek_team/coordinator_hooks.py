@@ -89,7 +89,8 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
         policy = settings.resolve(root)
         task = coordination.begin_turn(
             root, session_id=session, turn_id=str(payload.get("turn_id") or uuid.uuid4().hex),
-            prompt=str(payload.get("prompt") or ""), policy=policy)
+            prompt=str(payload.get("prompt") or ""), policy=policy, runtime=runtime)
+        coordination.sync_routing_feedback(root, task['id'])
         effort_context = (
             "Effort policy is auto: choose low, medium or high for each DeepSeek assignment "
             "from task complexity and pass it explicitly. "
@@ -107,14 +108,19 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
             "native-agent with a concrete delegation_reason; they complement and do not replace "
             "required DeepSeek worker assignments. " + effort_context +
             f"Run assigned workers with --runtime {runtime}. "
-            "Do not report a useful-work percentage from counts."
+            "Do not report a useful-work percentage from counts. "
+            "Capture a structured features card before execution. In delegation Auto, use executor:auto "
+            "to resolve each eligible task from local learning and bounded public evidence. Saved manual "
+            "25/50/75 profiles retain priority and continue learning from outcomes. Routing never grants access. "
+            "Record worker acceptance/rework via coordination use and verified coordinator outcomes via "
+            "coordination result. Supply measured total --cost-usd only when known; never invent subscription costs."
         )
         return _context(text, event)
     task = coordination.latest_task(root, session)
     if event == "SessionStart":
         policy = settings.resolve(root)
         base = (
-            f"DeepSeek Team effective profile: {policy.delegation_level}%/"
+            f"DeepSeek Team effective profile: {str(policy.delegation_level) + '%' if policy.delegation_level != 'auto' else 'Auto'}/"
             f"{policy.effective_access}; effort={policy.effort}. "
             f"{'Claude Code' if runtime == 'claude' else 'Codex'} lifecycle enforcement "
             "is active for this explicitly attached project. "
@@ -131,6 +137,7 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
         return _context(base, event)
     if task is None:
         return {}
+    coordination.sync_routing_feedback(root, task['id'])
     if runtime == 'claude' and payload.get('permission_mode') == 'plan':
         # Native plan files are written before a source-work distribution exists.
         # Do not exempt source edits merely because Claude is in plan mode.
@@ -155,10 +162,10 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
             return _deny("DeepSeek Team distribution gate: " + "; ".join(issues))
         policy = task.get("policy", {})
         if not paths and task.get("classification") == "substantial" and (
-                int(policy.get("delegation_level", 25)) >= 75
+                policy.get("delegation_level", 'auto') in ('auto', 75)
                 and policy.get("effective_access") == "full-access"):
             return _deny(
-                "Unscoped mutating Bash cannot be mapped to the registered 75/full-access "
+                "Unscoped mutating Bash cannot be mapped to the registered Auto/75 full-access "
                 "distribution. Revise the plan or use a file edit whose scope can be checked.")
         for path in paths:
             # Claude Edit/Write normally provide absolute paths. Resolve from

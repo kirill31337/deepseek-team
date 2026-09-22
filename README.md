@@ -4,15 +4,29 @@
 
 **English** | [Русский](README.ru.md)
 
-One Linux package for **Codex and/or Claude Code coordinators** delegating bounded coding work to DeepSeek workers. The current source supports configurable **25/50/75% delegation profiles**, independent `read-only/full-access` policy, and reusable isolated development copies.
+One Linux package for **Codex and/or Claude Code coordinators** delegating bounded coding work to DeepSeek workers. The current source supports **Auto delegation with project learning** and manual **25/50/75% profiles**, independent `read-only/full-access` policy, and reusable isolated development copies.
 
 **The coordinator owns:** scope, architecture, security decisions, final diff review, integration, commits and production actions. **DeepSeek contributes:** focused research/review and, when full-access is selected, independent implementation, local tests/builds and documentation inside a dedicated copy. DeepSeek workers stay on `deepseek-flash`; effort defaults to `auto`, so the frontier coordinator chooses `low`/`medium`/`high` per assignment unless a persistent forced effort is configured. Codex/Claude may also use their own native subagents when they can state a concrete reason for doing so; native subagents complement rather than replace required DeepSeek assignments. The coordinator should verify useful evidence instead of automatically repeating the whole delegated investigation or rewriting correct code.
 
-The percentages are **target work-distribution profiles**, not measured token/time/line quotas and not promises of exact useful contribution. Small or inseparable tasks may delegate less. Without any new settings, behavior remains compatible: the default is **25% + access=auto → read-only**.
+The percentages are **target work-distribution profiles**, not measured token/time/line quotas and not promises of exact useful contribution. Small or inseparable tasks may delegate less. Fresh installs default to **Auto + access=auto → read-only**. Auto chooses an executor per task from bounded public evidence and local outcomes. Saved manual 25/50/75 preferences retain priority and continue collecting outcomes.
 
-Version **0.6.0** adds frontier-selected DeepSeek effort with persistent `auto|low|medium|high` policy, preserves justified native Codex/Claude subagents alongside DeepSeek workers, and keeps DeepSeek workers fixed on `deepseek-flash` as isolated leaf workers. Version 0.5.0 introduced persistent coordination state and Codex lifecycle enforcement. The release supports **Linux, Python 3.11+, Git, Bubblewrap, and Codex CLI and/or Claude Code CLI**. Ubuntu has first-class AppArmor setup for its restricted unprivileged-user-namespace policy. A DeepSeek API key is required for live work. There are no Python runtime dependencies; Bubblewrap/AppArmor are system components.
+Version **0.7.0** adds hybrid routing, persistent learning, chronological evaluation and transactional experiment budgets; see [the routing guide](docs/ROUTING.md). It retains frontier-selected DeepSeek effort with persistent `auto|low|medium|high` policy, preserves justified native Codex/Claude subagents alongside DeepSeek workers, and keeps DeepSeek workers fixed on `deepseek-flash` as isolated leaf workers. Version 0.5.0 introduced persistent coordination state and Codex lifecycle enforcement. The release supports **Linux, Python 3.11+, Git, Bubblewrap, and Codex CLI and/or Claude Code CLI**. Ubuntu has first-class AppArmor setup for its restricted unprivileged-user-namespace policy. A DeepSeek API key is required for live work. There are no Python runtime dependencies; Bubblewrap/AppArmor are system components.
 
 The current source also supports Claude Code coordination hooks: both coordinators use the persistent task ledger and the saved project `on/off` switch.
+
+## How routing works: classifier, estimator, router
+
+The system answers three questions in order: **what is this task, how likely is DeepSeek to complete it well, and is delegating it worthwhile?**
+
+1. **The classifier describes the task.** Before execution, the Codex or Claude coordinator records what needs changing, where the code is, how many components are involved, the risk, and how the result will be checked. It also records the worker's model, runtime and reasoning effort. Unknown task details stay unknown. This feature card is filled by the coordinator; the package does not train a separate classifier.
+2. **The estimator learns from comparable results.** It estimates the chance that a DeepSeek result will be accepted without rework and shows how uncertain that estimate is. A Python bug fix is compared with the same kind of operation under matching execution conditions. Old results gradually lose weight. Explicitly imported public benchmarks can help, but their contribution is capped so that enough local experience can outweigh them.
+3. **The router chooses an executor.** It first checks permissions and which responsibilities belong to the coordinator. Ordinary automatic delegation then requires enough evidence of quality and a lower measured total cost, including review and rework. With too little evidence, it normally keeps the coordinator. The decision and its reasons are saved; the coordinator launches any assigned worker and reviews its work.
+
+**Example:** for “add a `--quiet` flag to `status` and a unit test,” the coordinator can record a small, localized Python change with a clear check. After execution it records whether the result was accepted, needed rework, or was rejected, plus the total cost when known. This updates the statistics for later comparable tasks. Learning needs no model fine-tuning or separate paid training runs; saved manual `25`/`50`/`75` profiles collect the same feedback.
+
+**Delegation can recover after failures.** In Auto, a limited share of safe, small tasks with concrete checks can still go to DeepSeek: the first eligible recovery case, then a gap of at least ten distinct eligible cases between selections by default. Only one such task may be pending or running; a quality failure pauses that task family for one hour. Provider failures do not lower the quality estimate. These safeguards keep new evidence arriving without granting extra access. Fresh Auto settings remain read-only until write access is explicitly allowed.
+
+See [the routing guide](docs/ROUTING.md) for the diagram, scoring details and commands.
 
 ## Ubuntu install — recommended
 
@@ -241,6 +255,7 @@ Settings are layered independently:
 
 | Profile | `access=auto` | Intended practice |
 | --- | --- | --- |
+| **Auto (default)** | `read-only` | Use recorded task features, uncertainty and measured total costs to choose each executor; retain the coordinator when evidence is insufficient. |
 | **25%** | `read-only` | Bounded research, diagnosis and review; coordinator performs the main implementation. |
 | **50%** | `full-access` | Delegate independent implementation slices and their tests before doing the same work locally; coordinator owns architecture/interfaces and integration. |
 | **75%** | `full-access` | Delegate most separable implementation, tests, docs and independent review; use up to three workers only when assignments are genuinely independent. |

@@ -248,6 +248,7 @@ def live_tests(runtimes=('codex',), os_sandbox='required'):
 
 
 def main(argv=None):
+    from codex_deepseek_team import settings as delegation_settings
     parser = argparse.ArgumentParser(description=__doc__)
     group = parser.add_mutually_exclusive_group()
     group.add_argument('--offline', action='store_true', help='Local checks only (default); no network or key reads.')
@@ -256,18 +257,18 @@ def main(argv=None):
                         help='Runtime(s) to verify; default codex preserves legacy behavior.')
     parser.add_argument('--os-sandbox', choices=['required', 'off'], default='required',
                         help='required: verify Bubblewrap/AppArmor containment (default); off: explicitly skip only this OS-layer check.')
-    parser.add_argument('--delegation-level', type=int, choices=[25, 50, 75],
-                        help='Per-diagnostic override; resolved with project/global/default settings.')
+    parser.add_argument('--delegation-level', type=delegation_settings.parse_level,
+                        choices=delegation_settings.LEVELS,
+                        help='Per-diagnostic override; auto adapts per task, 25/50/75 force a fixed profile.')
     parser.add_argument('--access', choices=['auto', 'read-only', 'full-access'],
                         help='Per-diagnostic access override; independent of delegation level.')
     parser.add_argument('--effort', choices=['auto', 'low', 'medium', 'high'],
                         help='Per-diagnostic effort-policy override; default resolves saved policy.')
     args = parser.parse_args(argv)
     try:
-        from codex_deepseek_team import settings
         policy = resolve_policy(delegation_level=args.delegation_level,
                                 access=args.access, effort=args.effort)
-        print(settings.describe(policy))
+        print(delegation_settings.describe(policy))
         if args.live and not policy.enabled:
             print('Live check disabled by DeepSeek delegation switch.')
             return 69

@@ -86,16 +86,18 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
                         copy.source, coord_task, coord_assignment, copy.id, runtime,
                         prepared_changes, effort=effort)
                     coord_started = True
-                copy.begin('execution')
-                copy.metadata.update(delegation_level=policy.delegation_level,
-                                     requested_access=policy.access, effective_access=policy.effective_access,
-                                     configuration_sources=dict(policy.sources), runtime=runtime,
-                                     model=api.MODEL, effort=effort)
-                copy.save()
                 provider = None
+                execution_started = False
                 try:
+                    copy.begin('execution')
+                    copy.metadata.update(delegation_level=policy.delegation_level,
+                                         requested_access=policy.access, effective_access=policy.effective_access,
+                                         configuration_sources=dict(policy.sources), runtime=runtime,
+                                         model=api.MODEL, effort=effort)
+                    copy.save()
                     with relay.ProviderRelay(control / 'provider.sock', key) as provider:
                         timeout = max(0.001, args.timeout - (time.monotonic() - started)) if args.timeout else None
+                        execution_started = True
                         code, out, err = api.execute(development.bridge_command(layout), env, task, timeout)
                         message, errors, completed = api.runtime_result(runtime, out)
                         if code == 0 and (not completed or not message.strip()):
@@ -107,7 +109,8 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
                             if any(row['exit_code'] != 0 for row in check_results):
                                 code = 65
                                 errors = (errors + '\nDeclared workspace verification failed.').strip()
-                        kind = 'provider' if provider.failures else 'execution'
+                        kind = ('provider' if provider.failures else
+                                'verification' if any(row['exit_code'] != 0 for row in check_results) else 'execution')
                         worker_changes = (workspace.changed_since(copy, coord_before)
                                           if coord_before is not None else [])
                         result = copy.finish('succeeded' if code == 0 else 'failed',
@@ -117,7 +120,7 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
                                 copy.source, coord_task, coord_assignment,
                                 'succeeded' if code == 0 else 'failed',
                                 message if message else errors,
-                                worker_changes, check_results)
+                                worker_changes, check_results, error_kind=kind if code else None, exit_code=code)
                     if code:
                         print(f'{kind.title()} failure (exit {code}); partial files and diff retained. '
                               f'Inspect workspace {copy.id} before --resume-after-failure.', file=api.sys.stderr)
@@ -137,24 +140,34 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
                     return code
                 except BaseException as error:
                     code = 130 if isinstance(error, KeyboardInterrupt) else getattr(error, 'code', 71)
-                    if isinstance(error, workspace.WorkspaceError) and code == 73:
+                    if isinstance(error, KeyboardInterrupt):
+                        kind = 'cancelled'
+                    elif isinstance(error, workspace.WorkspaceError) and code == 73:
                         kind = 'verification'
                     elif provider is not None and getattr(provider, 'failures', ()):
                         kind = 'provider'
+                    elif not execution_started:
+                        kind = 'environment'
                     else:
                         kind = 'execution'
                     try:
                         copy.finish('failed', error_kind=kind, exit_code=code)
                     except (workspace.WorkspaceError, OSError):
-                        copy.failed(kind, code)
+                        try:
+                            copy.failed(kind, code)
+                        except (workspace.WorkspaceError, OSError):
+                            pass  # Still reconcile the independent coordination ledger.
                     if coord_task and coord_started:
                         try:
                             changes = (workspace.changed_since(copy, coord_before)
                                        if coord_before is not None else [])
+                        except (workspace.WorkspaceError, OSError):
+                            changes = []
+                        try:
                             coordination.assignment_finished(
                                 copy.source, coord_task, coord_assignment, 'failed',
                                 str(getattr(error, 'message', type(error).__name__)),
-                                changes, [])
+                                changes, [], error_kind=kind, exit_code=code)
                         except Exception:
                             pass
                     print(f'{kind.title()} failure; retained workspace {copy.id}. '

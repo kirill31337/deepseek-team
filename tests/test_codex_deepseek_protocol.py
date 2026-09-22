@@ -93,7 +93,7 @@ class ProtocolTests(unittest.TestCase):
                 config = home / 'config.toml'
                 config.write_text(config.read_text().replace(worker.PROVIDER['base_url'], f'http://127.0.0.1:{server.server_port}/'))
                 env = worker.child_environment(home, synthetic_key)
-                args = worker.command(shutil.which('codex'))
+                args = worker.command(shutil.which('codex'), effort='low')
                 args[-1:-1] = ['--skip-git-repo-check', '-C', str(repo)]
                 code, out, err = worker.execute(args, env, 'Exercise the scoped file operation.', 30)
                 message, errors, completed = worker.result_events(out)
