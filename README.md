@@ -6,7 +6,7 @@ One Linux package for **Codex and/or Claude Code coordinators** delegating bound
 
 The percentages are **target work-distribution profiles**, not measured token/time/line quotas and not promises of exact useful contribution. Small or inseparable tasks may delegate less. Without any new settings, behavior remains compatible: the default is **25% + access=auto → read-only**.
 
-Version **0.5.0** adds persistent coordination state and Codex lifecycle enforcement so the selected delegation profile changes observable coordinator behavior in new sessions instead of remaining only guidance text. The release supports **Linux, Python 3.11+, Git, Bubblewrap, and Codex CLI and/or Claude Code CLI**. Ubuntu has first-class AppArmor setup for its restricted unprivileged-user-namespace policy. A DeepSeek API key is required for live work. There are no Python runtime dependencies; Bubblewrap/AppArmor are system components.
+Version **0.6.0** adds frontier-selected DeepSeek effort with persistent `auto|low|medium|high` policy, preserves justified native Codex/Claude subagents alongside DeepSeek workers, and keeps DeepSeek workers fixed on `deepseek-flash` as isolated leaf workers. Version 0.5.0 introduced persistent coordination state and Codex lifecycle enforcement. The release supports **Linux, Python 3.11+, Git, Bubblewrap, and Codex CLI and/or Claude Code CLI**. Ubuntu has first-class AppArmor setup for its restricted unprivileged-user-namespace policy. A DeepSeek API key is required for live work. There are no Python runtime dependencies; Bubblewrap/AppArmor are system components.
 
 ## Ubuntu install — recommended
 
