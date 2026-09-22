@@ -99,7 +99,7 @@ class PackagingTests(unittest.TestCase):
         scripts = data['project']['scripts']
         self.assertEqual(scripts['codex-deepseek-team'], 'codex_deepseek_team.cli:main')
         self.assertEqual(scripts['deepseek-team'], 'codex_deepseek_team.cli:main')
-        self.assertEqual(data['project']['version'], '0.5.0')
+        self.assertEqual(data['project']['version'], '0.6.0')
         self.assertIn('data/apparmor/*', data['tool']['setuptools']['package-data']['codex_deepseek_team'])
         urls = data['project']['urls']
         self.assertEqual(urls['Repository'], 'https://github.com/kirill31337/deepseek-team')
