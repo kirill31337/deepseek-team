@@ -213,19 +213,31 @@ def describe(policy: Policy) -> str:
 def instructions(policy: Policy, runtime: str = 'codex') -> str:
     if runtime not in ('codex', 'claude'):
         raise SettingsError('Instruction runtime must be codex or claude.')
-    effort_guidance = (
-        'DeepSeek Team workers always use deepseek-flash. Effort policy is auto, so before each '
-        'DeepSeek assignment the frontier coordinator must choose `--effort low`, `--effort medium` '
-        'or `--effort high` from the assigned task without asking the user: low for bounded/mechanical '
-        'work, medium for the normal case, and high for difficult debugging, cross-file reasoning '
-        'or adversarial review. If a DeepSeek worker is launched directly without a frontier-selected '
-        'effort, the runner uses medium as an execution fallback only.\n'
-        if policy.effort == 'auto' else
-        f'DeepSeek Team workers always use deepseek-flash. Effort is persistently forced to '
-        f'`{policy.effort}` by policy (source={policy.sources.get("effort", "default")}); every new '
-        f'DeepSeek assignment must use `--effort {policy.effort}` and the frontier coordinator must '
-        'not auto-select another level unless an explicit one-job CLI override is supplied.\n'
-    )
+
+    if policy.effort == 'auto':
+        effort_guidance = (
+            'DeepSeek Team workers always use deepseek-flash. Effort policy is auto, so before each '
+            'DeepSeek assignment the frontier coordinator must choose --effort low, --effort medium '
+            'or --effort high from the assigned task without asking the user: low for bounded/mechanical '
+            'work, medium for the normal case, and high for difficult debugging, cross-file reasoning '
+            'or adversarial review. If a DeepSeek worker is launched directly without a frontier-selected '
+            'effort, the runner uses medium as an execution fallback only.\n'
+        )
+        effort_example = 'medium'
+        effort_note = (
+            'Because effort policy is auto, replace medium with low or high when the assigned task '
+            'warrants it. '
+        )
+    else:
+        effort_guidance = (
+            f'DeepSeek Team workers always use deepseek-flash. Effort is persistently forced to '
+            f'{policy.effort} by policy (source={policy.sources.get("effort", "default")}); every new '
+            f'DeepSeek assignment must use --effort {policy.effort}. The frontier coordinator must '
+            'not auto-select another level unless the user supplies an explicit one-job CLI override.\n'
+        )
+        effort_example = policy.effort
+        effort_note = 'The saved effort policy is forced for new jobs. '
+
     common = (
         'Percentages are target profiles of useful work, not call/token/line quotas. '
         'Do not manufacture tasks to reach a percentage. For a genuinely small single-output '
@@ -235,14 +247,15 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
         'themselves reserve ordinary implementation, tests, fixtures, documentation or non-secret '
         'metadata from workers. Do not calculate an actual useful-work percentage from calls, '
         'deliverable counts, lines or files.\n'
-        + effort_guidance
+    ) + effort_guidance + (
         'Coordinator-native subagents remain available. Use them only when parallelism, isolated '
         'context or a native capability materially helps. Represent that choice in the plan with '
-        '`executor: "native-agent"` plus a concrete `delegation_reason`. Native agents complement '
+        'executor: "native-agent" plus a concrete delegation_reason. Native agents complement '
         'DeepSeek workers and do not satisfy DeepSeek worker assignments required by the 50/75 '
         'profiles. Protected coordinator responsibilities remain with the coordinator. DeepSeek '
         'workers themselves remain leaf workers and must never delegate.\n'
     )
+
     full_profiles = {
         25: 'Delegate bounded research, diagnosis and independent review. The coordinator performs the main implementation.',
         50: 'Delegate at least one separable implementation/test/docs slice when such work exists; coordinator defines architecture/interfaces and integrates.',
@@ -253,6 +266,7 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
         50: 'Delegate substantial investigation, design validation, test planning and independent review before the coordinator implements the corresponding changes.',
         75: 'Delegate most separable analysis, diagnostics, design validation, test planning and independent review. Use up to three read-only workers only for genuinely independent assignments.',
     }
+
     if policy.effective_access == 'full-access':
         access = (
             'Full-access is development inside an owned isolated copy, not host access. '
@@ -268,19 +282,23 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
             'and review only; project writes and mutating tests/builds remain coordinator work. '
             'Do not expand access merely to satisfy the target profile.\n'
         )
-    guidance = (full_profiles if policy.effective_access == 'full-access'
-                else read_only_profiles)[policy.delegation_level]
+
+    guidance = (
+        full_profiles if policy.effective_access == 'full-access' else read_only_profiles
+    )[policy.delegation_level]
+
     if runtime == 'codex':
         process = (
             'Codex process integration: after project init and native hook trust, SessionStart/'
             'UserPromptSubmit provide the current coordination task id. For every substantial task, '
             'before coordinator source edits, submit a concrete JSON distribution with '
-            '`deepseek-team coordination plan --task TASK_ID`; include deliverable id/kind/scope, '
+            'deepseek-team coordination plan --task TASK_ID; include deliverable id/kind/scope, '
             'executor, acceptance criteria, dependencies and checks. Run each worker assignment with '
-            f'`deepseek-team worker --runtime codex --effort {policy.effort if policy.effort != "auto" else "medium"} --coord-task TASK_ID --coord-assignment ASSIGNMENT_ID`' +
-            ('; when effort policy is auto, replace `medium` with `low` or `high` when the assigned task warrants it. ' if policy.effort == 'auto' else '; the saved effort policy is forced for new jobs. ')
+            f'deepseek-team worker --runtime codex --effort {effort_example} '
+            '--coord-task TASK_ID --coord-assignment ASSIGNMENT_ID. '
+            + effort_note +
             'The runner records start/result/workspace/checks automatically. After reviewing a result, '
-            'record its use with `deepseek-team coordination use ...`. New substantial scope requires '
+            'record its use with deepseek-team coordination use. New substantial scope requires '
             'a revised plan. Codex PreToolUse technically blocks source mutation while the distribution '
             'is missing/noncompliant, blocks unplanned scope, and blocks duplicate work owned by a '
             'pending worker assignment; Stop prevents silent completion with pending/undispositioned '
@@ -289,12 +307,17 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
     else:
         process = (
             'Claude coordinator integration is instruction-driven in this release: use the same '
-            'distribution principles, explicit per-assignment DeepSeek effort selection and managed worker runner, but DeepSeek Team does not claim a '
-            'Claude PreToolUse technical gate. Worker filesystem/network permissions remain technically '
-            'sandboxed; coordinator compliance with distribution instructions depends on Claude Code.\n'
+            'distribution principles, resolved effort policy and managed worker runner, but DeepSeek '
+            'Team does not claim a Claude PreToolUse technical gate. Worker filesystem/network '
+            'permissions remain technically sandboxed; coordinator compliance with distribution '
+            'instructions depends on Claude Code.\n'
         )
-    return (f'### Effective delegation profile: {policy.delegation_level}% / {policy.effective_access}\n'
-            + common + guidance + '\n' + access + process
-            + 'While a worker runs, work only on independent scope. Review the actual diff and recorded '
-            'checks without repeating the whole investigation or rewriting correct code. DeepSeek workers never '
-            'stage, commit, push, publish, deploy, access production services or delegate.\n')
+
+    return (
+        f'### Effective delegation profile: {policy.delegation_level}% / {policy.effective_access}; '
+        f'effort={policy.effort}\n'
+        + common + guidance + '\n' + access + process
+        + 'While a worker runs, work only on independent scope. Review the actual diff and recorded '
+          'checks without repeating the whole investigation or rewriting correct code. DeepSeek workers never '
+          'stage, commit, push, publish, deploy, access production services or delegate.\n'
+    )
