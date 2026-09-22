@@ -141,12 +141,13 @@ def check_runtime(runtime):
     print('Claude Code worker routing: isolated DeepSeek Anthropic-compatible child; parent Claude auth/config untouched.')
 
 
-def resolve_policy(*, delegation_level=None, access=None, root=None):
+def resolve_policy(*, delegation_level=None, access=None, effort=None, root=None):
     """Use the same layered policy resolver as config, workers and managed instructions."""
     from codex_deepseek_team import settings
     try:
         return settings.resolve(Path.cwd() if root is None else Path(root),
-                                delegation_level=delegation_level, access=access)
+                                delegation_level=delegation_level, access=access,
+                                effort=effort)
     except settings.SettingsError as error:
         raise worker.WorkerError(78, str(error)) from None
 
@@ -239,10 +240,13 @@ def main(argv=None):
                         help='Per-diagnostic override; resolved with project/global/default settings.')
     parser.add_argument('--access', choices=['auto', 'read-only', 'full-access'],
                         help='Per-diagnostic access override; independent of delegation level.')
+    parser.add_argument('--effort', choices=['auto', 'low', 'medium', 'high'],
+                        help='Per-diagnostic effort-policy override; default resolves saved policy.')
     args = parser.parse_args(argv)
     try:
         from codex_deepseek_team import settings
-        policy = resolve_policy(delegation_level=args.delegation_level, access=args.access)
+        policy = resolve_policy(delegation_level=args.delegation_level,
+                                access=args.access, effort=args.effort)
         print(settings.describe(policy))
         if policy.effective_access == 'full-access' and args.os_sandbox == 'off':
             raise worker.WorkerError(
