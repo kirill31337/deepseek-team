@@ -101,7 +101,7 @@ class CommandLayoutTests(unittest.TestCase):
         }
         args = sandbox.wrap_command(
             ['/home/alice/.local/bin/claude', '--bare'], cwd=cwd,
-            session_home=session, writable=False, env=env,
+            session_home=session, env=env,
             backend=self.backend(), real_home=Path('/home/alice'),
             existing=lambda path: str(path) in existing_paths,
             is_dir=lambda _path: True)
@@ -126,24 +126,12 @@ class CommandLayoutTests(unittest.TestCase):
         self.assertEqual(
             args[-5:], ['--chdir', str(cwd), '--', '/home/alice/.local/bin/claude', '--bare'])
 
-    def test_writer_mounts_only_worktree_as_readwrite_after_readonly_root(self):
-        cwd = Path('/srv/project')
-        session = Path('/tmp/deepseek-session')
-        args = sandbox.wrap_command(
-            ['/usr/bin/claude'], cwd=cwd, session_home=session,
-            writable=True, env={'HOME': str(session), 'PATH': '/usr/bin:/bin'},
-            backend=self.backend(), real_home=Path('/home/alice'))
-        triples = [args[i:i + 3] for i in range(len(args) - 2)]
-        self.assertIn(['--ro-bind', '/', '/'], triples)
-        self.assertIn(['--bind', str(cwd), str(cwd)], triples)
-        self.assertNotIn(['--ro-bind', str(cwd), str(cwd)], triples)
-
     def test_known_credentials_are_masked_after_runtime_paths(self):
         cwd = Path('/home/alice/project')
         session = Path('/home/alice/.local/state/codex-deepseek/session-2')
         args = sandbox.wrap_command(
             ['/home/alice/.local/bin/codex'], cwd=cwd, session_home=session,
-            writable=False, env={'HOME': str(session), 'PATH': '/home/alice/.local/bin:/usr/bin'},
+            env={'HOME': str(session), 'PATH': '/home/alice/.local/bin:/usr/bin'},
             backend=self.backend(), real_home=Path('/home/alice'),
             existing=lambda path: str(path) in {
                 '/home/alice', '/home/alice/.local', '/home/alice/.local/share/keyrings',
@@ -165,8 +153,7 @@ class CommandLayoutTests(unittest.TestCase):
     def test_refuses_to_mount_entire_real_home_as_checkout(self):
         with self.assertRaises(sandbox.SandboxError) as caught:
             sandbox.wrap_command(['/usr/bin/claude'], cwd=Path('/home/alice'),
-                                 session_home=Path('/tmp/session'), writable=False,
-                                 env={'HOME': '/tmp/session', 'PATH': '/usr/bin'},
+                                 session_home=Path('/tmp/session'), env={'HOME': '/tmp/session', 'PATH': '/usr/bin'},
                                  backend=self.backend(), real_home=Path('/home/alice'))
         self.assertEqual(caught.exception.code, 78)
 
