@@ -55,6 +55,6 @@ class CliTests(unittest.TestCase):
     def test_worker_subcommand_forwards_arguments_and_missing_key_failure(self):
         r = self.cli('worker', input='synthetic task')
         self.assertEqual(r.returncode, 78, r.stderr)
-        r = self.cli('worker', '--write', '--attempts', '2', '--allow-write', 'file.py', input='task')
+        r = self.cli('worker', '--write', input='task')
         self.assertEqual(r.returncode, 2, r.stderr)
-        self.assertIn('never retries', r.stderr)
+        self.assertIn('unrecognized arguments: --write', r.stderr)
