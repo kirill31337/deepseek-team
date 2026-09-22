@@ -16,7 +16,8 @@ from typing import Mapping
 PROJECT_FILE = '.deepseek-team.toml'
 LEVELS = (25, 50, 75)
 ACCESS = ('auto', 'read-only', 'full-access')
-DEFAULTS = {'delegation_level': 25, 'access': 'auto'}
+EFFORT = ('auto', 'low', 'medium', 'high')
+DEFAULTS = {'delegation_level': 25, 'access': 'auto', 'effort': 'auto'}
 
 
 class SettingsError(Exception):
@@ -28,6 +29,7 @@ class Policy:
     delegation_level: int
     access: str
     sources: Mapping[str, str]
+    effort: str = 'auto'
 
     @property
     def effective_access(self) -> str:
@@ -40,6 +42,8 @@ class Policy:
             'delegation_level': self.delegation_level,
             'access': self.access,
             'effective_access': self.effective_access,
+            'effort': self.effort,
+            'effort_mode': 'frontier-auto' if self.effort == 'auto' else 'forced',
             'sources': dict(self.sources),
             'effective_access_source': (
                 f'profile:{self.delegation_level} (access=auto)' if self.access == 'auto'
@@ -80,13 +84,15 @@ def project_root(path: Path | None = None, *, required: bool = False) -> Path | 
 
 def _validate(values: dict) -> None:
     if set(values) - set(DEFAULTS):
-        raise SettingsError('Only delegation_level and access are allowed in delegation settings.')
+        raise SettingsError('Only delegation_level, access and effort are allowed in delegation settings.')
     if 'delegation_level' in values:
         level = values['delegation_level']
         if type(level) is not int or level not in LEVELS:
             raise SettingsError('delegation_level must be the integer 25, 50 or 75.')
     if 'access' in values and values['access'] not in ACCESS:
         raise SettingsError('access must be auto, read-only or full-access.')
+    if 'effort' in values and values['effort'] not in EFFORT:
+        raise SettingsError('effort must be auto, low, medium or high.')
 
 
 def _read(path: Path) -> bytes | None:
@@ -117,7 +123,8 @@ def read_values(path: Path) -> dict:
 
 
 def resolve(root: Path | None = None, *, delegation_level: int | None = None,
-            access: str | None = None, global_path: Path | None = None) -> Policy:
+            access: str | None = None, effort: str | None = None,
+            global_path: Path | None = None) -> Policy:
     """Resolve both fields independently and freeze a new-job policy snapshot."""
     values = dict(DEFAULTS)
     sources = {name: 'default' for name in DEFAULTS}
@@ -129,22 +136,25 @@ def resolve(root: Path | None = None, *, delegation_level: int | None = None,
     for label, path in layers:
         for key, value in read_values(path).items():
             values[key], sources[key] = value, f'{label}:{path}'
-    overrides = {k: v for k, v in {'delegation_level': delegation_level, 'access': access}.items()
-                 if v is not None}
+    overrides = {k: v for k, v in {
+        'delegation_level': delegation_level, 'access': access, 'effort': effort,
+    }.items() if v is not None}
     _validate(overrides)
     for key, value in overrides.items():
         values[key], sources[key] = value, 'cli'
-    return Policy(values['delegation_level'], values['access'], MappingProxyType(sources))
+    return Policy(values['delegation_level'], values['access'], MappingProxyType(sources),
+                  values['effort'])
 
 
 def set_values(path: Path, *, delegation_level: int | None = None,
-               access: str | None = None) -> bool:
+               access: str | None = None, effort: str | None = None) -> bool:
     """Atomic partial update: changing a level never implicitly resets access."""
-    changes = {k: v for k, v in {'delegation_level': delegation_level, 'access': access}.items()
-               if v is not None}
+    changes = {k: v for k, v in {
+        'delegation_level': delegation_level, 'access': access, 'effort': effort,
+    }.items() if v is not None}
     _validate(changes)
     if not changes:
-        raise SettingsError('Specify --delegation-level and/or --access.')
+        raise SettingsError('Specify --delegation-level, --access and/or --effort.')
     path = Path(path)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     parent = path.parent.lstat()
@@ -194,6 +204,8 @@ def describe(policy: Policy) -> str:
         f'delegation_level: {policy.delegation_level}% (target; source={policy.sources["delegation_level"]})',
         f'access: {policy.access} (source={policy.sources["access"]})',
         f'effective_access: {policy.effective_access} (source={data["effective_access_source"]})',
+        f'effort: {policy.effort} (source={policy.sources.get("effort", "default")}; '
+        + ('frontier chooses low/medium/high per assignment' if policy.effort == 'auto' else 'forced for new DeepSeek jobs') + ')',
         'max_workers: 3; total_timeout: unlimited by default',
     ))
 
@@ -201,6 +213,19 @@ def describe(policy: Policy) -> str:
 def instructions(policy: Policy, runtime: str = 'codex') -> str:
     if runtime not in ('codex', 'claude'):
         raise SettingsError('Instruction runtime must be codex or claude.')
+    effort_guidance = (
+        'DeepSeek Team workers always use deepseek-flash. Effort policy is auto, so before each '
+        'DeepSeek assignment the frontier coordinator must choose `--effort low`, `--effort medium` '
+        'or `--effort high` from the assigned task without asking the user: low for bounded/mechanical '
+        'work, medium for the normal case, and high for difficult debugging, cross-file reasoning '
+        'or adversarial review. If a DeepSeek worker is launched directly without a frontier-selected '
+        'effort, the runner uses medium as an execution fallback only.\n'
+        if policy.effort == 'auto' else
+        f'DeepSeek Team workers always use deepseek-flash. Effort is persistently forced to '
+        f'`{policy.effort}` by policy (source={policy.sources.get("effort", "default")}); every new '
+        f'DeepSeek assignment must use `--effort {policy.effort}` and the frontier coordinator must '
+        'not auto-select another level unless an explicit one-job CLI override is supplied.\n'
+    )
     common = (
         'Percentages are target profiles of useful work, not call/token/line quotas. '
         'Do not manufacture tasks to reach a percentage. For a genuinely small single-output '
@@ -210,11 +235,7 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
         'themselves reserve ordinary implementation, tests, fixtures, documentation or non-secret '
         'metadata from workers. Do not calculate an actual useful-work percentage from calls, '
         'deliverable counts, lines or files.\n'
-        'DeepSeek Team workers always use deepseek-flash. Before each DeepSeek assignment, '
-        'the frontier coordinator chooses `--effort low`, `--effort medium` or `--effort high` '
-        'from the assigned task without asking the user: low for bounded/mechanical work, medium '
-        'for the normal case, and high for difficult debugging, cross-file reasoning or adversarial '
-        'review. The runner applies that choice consistently for Codex and Claude harnesses.\n'
+        + effort_guidance
         'Coordinator-native subagents remain available. Use them only when parallelism, isolated '
         'context or a native capability materially helps. Represent that choice in the plan with '
         '`executor: "native-agent"` plus a concrete `delegation_reason`. Native agents complement '
@@ -256,7 +277,8 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
             'before coordinator source edits, submit a concrete JSON distribution with '
             '`deepseek-team coordination plan --task TASK_ID`; include deliverable id/kind/scope, '
             'executor, acceptance criteria, dependencies and checks. Run each worker assignment with '
-            '`deepseek-team worker --runtime codex --effort medium --coord-task TASK_ID --coord-assignment ASSIGNMENT_ID`, replacing `medium` with `low` or `high` when appropriate. '
+            f'`deepseek-team worker --runtime codex --effort {policy.effort if policy.effort != "auto" else "medium"} --coord-task TASK_ID --coord-assignment ASSIGNMENT_ID`' +
+            ('; when effort policy is auto, replace `medium` with `low` or `high` when the assigned task warrants it. ' if policy.effort == 'auto' else '; the saved effort policy is forced for new jobs. ')
             'The runner records start/result/workspace/checks automatically. After reviewing a result, '
             'record its use with `deepseek-team coordination use ...`. New substantial scope requires '
             'a revised plan. Codex PreToolUse technically blocks source mutation while the distribution '
