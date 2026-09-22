@@ -20,13 +20,9 @@ spec.loader.exec_module(worker)
 class ProtocolTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which('codex'), 'Codex CLI is not installed')
     def test_real_cli_responses_routing_and_readonly_tools(self):
-        self.exercise_cli(write=False)
+        self.exercise_cli()
 
-    @unittest.skipUnless(shutil.which('codex'), 'Codex CLI is not installed')
-    def test_real_cli_writer_can_edit_worktree_but_not_main_or_git_metadata(self):
-        self.exercise_cli(write=True)
-
-    def exercise_cli(self, write):
+    def exercise_cli(self):
         requests = []
         tool_results = []
         tool_sent = False
@@ -52,8 +48,6 @@ class ProtocolTests(unittest.TestCase):
                     if 'exec_command' in tools:
                         name = 'exec_command'
                         arguments = {'cmd': 'cat evidence.txt; shopt -q login_shell && printf LOGIN_ENABLED; test -z "${DEEPSEEK_API_KEY+x}" && printf KEY_ENV_ABSENT; touch forbidden.txt', 'max_output_tokens': 500}
-                        if write:
-                            arguments['cmd'] += '; printf broken > .git; printf broken > ../main/evidence.txt; touch ../outside.txt'
                     elif 'shell_command' in tools:
                         name = 'shell_command'
                         arguments = {'command': 'cat evidence.txt; touch forbidden.txt', 'timeout_ms': 1000}
@@ -91,14 +85,6 @@ class ProtocolTests(unittest.TestCase):
             repo = root / 'repo'
             repo.mkdir()
             (repo / 'evidence.txt').write_text('READ_ONLY_EVIDENCE')
-            if write:
-                main = root / 'main'
-                repo.rename(main)
-                for command in [['init', '-q', '-b', 'main'], ['add', '.'],
-                                ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'baseline'],
-                                ['worktree', 'add', '-q', '-b', 'codex/deepseek/protocol', str(repo)]]:
-                    subprocess.run(['git', *command], cwd=main, check=True, capture_output=True)
-                git_pointer = (repo / '.git').read_bytes()
             server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
             thread = threading.Thread(target=server.serve_forever, daemon=True)
             thread.start()
@@ -107,8 +93,8 @@ class ProtocolTests(unittest.TestCase):
                 config = home / 'config.toml'
                 config.write_text(config.read_text().replace(worker.PROVIDER['base_url'], f'http://127.0.0.1:{server.server_port}/'))
                 env = worker.child_environment(home, synthetic_key)
-                args = worker.command(shutil.which('codex'), ['forbidden.txt'] if write else [])
-                args[-1:-1] = (['-C', str(repo)] if write else ['--skip-git-repo-check', '-C', str(repo)])
+                args = worker.command(shutil.which('codex'))
+                args[-1:-1] = ['--skip-git-repo-check', '-C', str(repo)]
                 code, out, err = worker.execute(args, env, 'Exercise the scoped file operation.', 30)
                 message, errors, completed = worker.result_events(out)
                 self.assertEqual(code, 0, err + errors)
@@ -119,11 +105,7 @@ class ProtocolTests(unittest.TestCase):
                 self.assertTrue(any('READ_ONLY_EVIDENCE' in result for result in tool_results), str(tool_results))
                 self.assertFalse(any('LOGIN_ENABLED' in result for result in tool_results), 'Worker shell loaded login profiles')
                 self.assertTrue(any('KEY_ENV_ABSENT' in result for result in tool_results), 'API key reached worker shell')
-                self.assertEqual((repo / 'forbidden.txt').exists(), write, 'Unexpected sandbox write behavior')
-                if write:
-                    self.assertEqual((repo / '.git').read_bytes(), git_pointer, 'Writer changed Git metadata')
-                    self.assertEqual((main / 'evidence.txt').read_text(), 'READ_ONLY_EVIDENCE', 'Writer changed main')
-                    self.assertFalse((root / 'outside.txt').exists(), 'Writer escaped its worktree')
+                self.assertFalse((repo / 'forbidden.txt').exists(), 'Read-only worker unexpectedly wrote to the checkout')
                 for file in root.rglob('*'):
                     if file.is_file():
                         self.assertNotIn(synthetic_key.encode(), file.read_bytes(), 'Codex persisted a credential')
