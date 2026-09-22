@@ -2,11 +2,11 @@
 
 One Linux package for **Codex and/or Claude Code coordinators** delegating bounded coding work to DeepSeek workers. The current source supports configurable **25/50/75% delegation profiles**, independent `read-only/full-access` policy, reusable isolated development copies, and the legacy exact-file writer.
 
-**The coordinator owns:** scope, architecture, security decisions, final diff review, integration, commits and production actions. **DeepSeek contributes:** focused research/review and, when full-access is selected, independent implementation, local tests/builds and documentation inside a dedicated copy. The coordinator should verify useful evidence instead of automatically repeating the whole delegated investigation or rewriting correct code.
+**The coordinator owns:** scope, architecture, security decisions, final diff review, integration, commits and production actions. **DeepSeek contributes:** focused research/review and, when full-access is selected, independent implementation, local tests/builds and documentation inside a dedicated copy. DeepSeek workers stay on `deepseek-flash`; effort defaults to `auto`, so the frontier coordinator chooses `low`/`medium`/`high` per assignment unless a persistent forced effort is configured. Codex/Claude may also use their own native subagents when they can state a concrete reason for doing so; native subagents complement rather than replace required DeepSeek assignments. The coordinator should verify useful evidence instead of automatically repeating the whole delegated investigation or rewriting correct code.
 
 The percentages are **target work-distribution profiles**, not measured token/time/line quotas and not promises of exact useful contribution. Small or inseparable tasks may delegate less. Without any new settings, behavior remains compatible: the default is **25% + access=auto → read-only**.
 
-Version **0.5.0** adds persistent coordination state and Codex lifecycle enforcement so the selected delegation profile changes observable coordinator behavior in new sessions instead of remaining only guidance text. The release supports **Linux, Python 3.11+, Git, Bubblewrap, and Codex CLI and/or Claude Code CLI**. Ubuntu has first-class AppArmor setup for its restricted unprivileged-user-namespace policy. A DeepSeek API key is required for live work. There are no Python runtime dependencies; Bubblewrap/AppArmor are system components.
+Version **0.6.0** adds frontier-selected DeepSeek effort with persistent `auto|low|medium|high` policy, preserves justified native Codex/Claude subagents alongside DeepSeek workers, and keeps DeepSeek workers fixed on `deepseek-flash` as isolated leaf workers. Version 0.5.0 introduced persistent coordination state and Codex lifecycle enforcement. The release supports **Linux, Python 3.11+, Git, Bubblewrap, and Codex CLI and/or Claude Code CLI**. Ubuntu has first-class AppArmor setup for its restricted unprivileged-user-namespace policy. A DeepSeek API key is required for live work. There are no Python runtime dependencies; Bubblewrap/AppArmor are system components.
 
 ## Ubuntu install — recommended
 
@@ -82,7 +82,7 @@ You can ask Codex to install or update DeepSeek Team for the repository it is cu
 Install or update DeepSeek Team in this Linux project from https://github.com/kirill31337/deepseek-team. Use the repository's standard install.py; on Ubuntu use --with-sandbox unless a working DeepSeek Team sandbox is already configured. Preserve my existing Codex model/auth, DeepSeek Team settings, and credential. Configure Codex support without asking me to paste secrets into this prompt; if no DeepSeek key exists, leave secret entry to "deepseek-team auth set". Ensure the stable Codex lifecycle hooks are installed and healthy with "deepseek-team hooks install" and "deepseek-team hooks status". If this repository does not already contain the DeepSeek Team managed block in AGENTS.md, attach it with "deepseek-team init --coordinator codex ."; if it is already attached, do not re-run init just because the package was updated. Verify "deepseek-team --version", "deepseek-team sandbox status", "deepseek-team hooks status", and "deepseek-team doctor --runtime codex --offline". Do not use --os-sandbox off and do not weaken AppArmor/Bubblewrap. If the hooks require native Codex trust/review, use the Codex "/hooks" interface and approve/trust the DeepSeek Team package-owned hooks yourself when the current Codex environment permits it. Do not bypass Codex hook trust or modify trust state outside the native Codex mechanism. Afterwards verify with "deepseek-team hooks status". Only ask me to approve the hooks manually if native approval cannot be completed from the current Codex session.
 ```
 
-The prompt intentionally does **not** contain an API key and does not change your delegation level or access policy. Configure the private DeepSeek credential separately with `deepseek-team auth set`, and set `delegation_level` / `access` explicitly if you want values other than the existing configuration or defaults.
+The prompt intentionally does **not** contain an API key and does not change your delegation level, access policy, or saved effort policy. Configure the private DeepSeek credential separately with `deepseek-team auth set`, and set `delegation_level` / `access` / `effort` explicitly if you want values other than the existing configuration or defaults.
 
 ### Rootless/manual install
 
@@ -204,6 +204,12 @@ Settings are layered independently:
 
 Access is independent of the target percentage. An explicit `read-only` remains read-only at 50/75, and an explicit `full-access` can be selected at 25. Changing the percentage does not overwrite an explicit access choice; return access to `auto` when you want profile defaults again.
 
+### DeepSeek model, effort and coordinator-native subagents
+
+DeepSeek Team currently routes every managed worker to **`deepseek-flash`**. There is intentionally no Flash/Pro model router. The saved effort policy defaults to **`auto`**. In `auto`, the frontier Codex/Claude coordinator selects `--effort low|medium|high` for each DeepSeek assignment: `low` for bounded/mechanical work or broad scans, `medium` for the normal case, and `high` for difficult debugging, cross-file reasoning or demanding independent review. A direct worker that reaches the runner without a concrete frontier selection uses `medium` only as an execution fallback.
+
+The primary Codex/Claude coordinator keeps its native subagent capability. For substantial work, a native-subagent deliverable is represented in the coordination plan as `"executor": "native-agent"` with a concrete `"delegation_reason"`. Native subagents are useful for genuinely parallel work, isolated context, or native-runtime capabilities, but they do **not** count as a DeepSeek worker assignment required by the 50/75 profiles. Protected coordinator responsibilities remain coordinator-owned. The DeepSeek workers themselves still have agent/delegation tools disabled and remain leaf workers.
+
 Examples:
 
 ```bash
@@ -217,11 +223,20 @@ deepseek-team config set --global --delegation-level 25 --access read-only
 deepseek-team config show --effective
 deepseek-team config show --effective --json
 
+# Persist effort for this project (frontier no longer chooses per job)
+deepseek-team config set --project --effort high
+
+# Or persist it user-wide
+deepseek-team config set --global --effort high
+
+# Restore automatic frontier selection
+deepseek-team config set --project --effort auto
+
 # One-job override
-deepseek-team worker --runtime codex --delegation-level 75 --access full-access
+deepseek-team worker --runtime codex --delegation-level 75 --access full-access --effort high
 ```
 
-Project settings live in `.deepseek-team.toml`; global settings live under the user's XDG config directory. Settings are snapshotted when a new job starts and do not change permissions of an already running process.
+Project settings live in `.deepseek-team.toml`; global settings live under the user's XDG config directory. `effort` follows the same precedence as the other policy fields: one-job CLI override > project > global > default (`auto`). Settings are snapshotted when a new job starts and do not change an already running process.
 
 `config show --effective --instructions --runtime codex|claude` renders the current coordinator guidance. Managed AGENTS.md/CLAUDE.md blocks tell the coordinator to resolve this current policy before each assignment instead of relying on a stale percentage embedded in the file.
 
@@ -265,7 +280,7 @@ JSON
 The assignment returned by that plan is tied to the runner:
 
 ```bash
-deepseek-team worker --runtime codex \
+deepseek-team worker --runtime codex --effort medium \
   --coord-task TASK_ID --coord-assignment ASSIGNMENT_ID <<'TASK'
 Implement the assigned deliverable and satisfy its registered acceptance criteria.
 TASK
@@ -286,7 +301,7 @@ deepseek-team workspace import WORKSPACE_ID --include path/to/needed.py
 
 Those files are recorded as coordinator-prepared input, not worker authorship. Declared dependencies are also checked **inside the actual worker sandbox before the provider credential is read**. Host-only JDK/SDK/tools are not assumed to exist in full-access. Missing dependencies must be prepared explicitly with `workspace prepare`; replacing them with stubs is not treated as equivalent verification.
 
-For Claude Code, the same ledger/runner accounting and managed instructions are available, but coordinator distribution enforcement is **instruction-driven** in 0.5.0. DeepSeek Team does not claim a Claude PreToolUse technical gate.
+For Claude Code, the same ledger/runner accounting and managed instructions are available, but coordinator distribution enforcement is **instruction-driven** in 0.5.0. DeepSeek Team does not claim a Claude PreToolUse technical gate. Both coordinators may use justified native subagents; those native agents use the host runtime's own model/permissions/sandbox and are outside the DeepSeek worker sandbox.
 
 The 25/50/75 value remains a **target policy, not a measured productivity percentage**. DeepSeek Team records observable facts; it does not convert call counts, files, lines, tokens, task bullets or subjective outcomes into a fake "actual contribution %" metric.
 

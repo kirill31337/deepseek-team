@@ -11,6 +11,8 @@ from . import project, settings, workspace
 def policy_options(parser):
     parser.add_argument('--delegation-level', type=int, choices=settings.LEVELS)
     parser.add_argument('--access', choices=settings.ACCESS)
+    parser.add_argument('--effort', choices=settings.EFFORT,
+                        help='auto lets the frontier coordinator choose per DeepSeek assignment; low/medium/high force a level.')
 
 
 def _record(copy):
@@ -21,7 +23,7 @@ def main(argv):
     parser = argparse.ArgumentParser(prog='deepseek-team ' + argv[0])
     subs = parser.add_subparsers(dest='command', required=True)
     if argv[0] == 'config':
-        setter = subs.add_parser('set', help='Set fields independently without resetting explicit access.')
+        setter = subs.add_parser('set', help='Persist delegation/access/effort fields independently.')
         scope = setter.add_mutually_exclusive_group(required=True)
         scope.add_argument('--project', action='store_true')
         scope.add_argument('--global', dest='global_scope', action='store_true')
@@ -61,7 +63,8 @@ def main(argv):
             root = settings.project_root(args.path, required=getattr(args, 'project', False))
             if args.command == 'set':
                 target = root / settings.PROJECT_FILE if args.project else settings.global_file()
-                changed = settings.set_values(target, delegation_level=args.delegation_level, access=args.access)
+                changed = settings.set_values(target, delegation_level=args.delegation_level,
+                                              access=args.access, effort=args.effort)
                 if args.project:
                     # Refresh only blocks this package already owns. Never add
                     # unsolicited instruction files and never alter user suffixes.
@@ -76,7 +79,8 @@ def main(argv):
                 # Do not apply setter values a second time as artificial CLI overrides.
                 policy = settings.resolve(root)
             else:
-                policy = settings.resolve(root, delegation_level=args.delegation_level, access=args.access)
+                policy = settings.resolve(root, delegation_level=args.delegation_level,
+                                          access=args.access, effort=args.effort)
             if getattr(args, 'json', False):
                 print(json.dumps(policy.as_dict(), indent=2))
             else:

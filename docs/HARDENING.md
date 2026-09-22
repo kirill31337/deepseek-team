@@ -16,9 +16,13 @@ These hooks are **not** claimed to intercept every possible Codex implementation
 
 For **Claude Code**, 0.5.0 does not claim equivalent coordinator-side technical gating. Managed instructions and the persistent ledger/worker accounting are supplied, while coordinator compliance with work distribution remains instruction-driven. Worker filesystem/network permissions remain technically enforced by the existing sandbox.
 
+Coordinator-native subagents are deliberately a **coordinator capability**, not a DeepSeek-worker capability. A planned native-agent deliverable requires a concrete `delegation_reason`, cannot own protected coordinator responsibilities, and does not satisfy DeepSeek worker requirements in the 50/75 profiles. Native subagents execute under Codex/Claude's own native agent model, permissions and sandboxing; DeepSeek Team does not wrap them in the DeepSeek worker Bubblewrap boundary. Conversely, DeepSeek workers keep agent tools disabled and remain leaf workers.
+
+DeepSeek workers stay fixed to `deepseek-flash`. Effort policy defaults to `auto`, where the frontier coordinator selects `low`/`medium`/`high` per assignment. A user may persist a forced `low`, `medium` or `high` value at project or global scope; setting it back to `auto` restores frontier selection. The resolved concrete effort is propagated consistently through the Codex or Claude harness and recorded for coordinated managed assignments. When an `auto` worker reaches the runner without a concrete frontier selection, `medium` is only an execution fallback.
+
 ### Persistent coordination state
 
-The ledger is stored under the user's private DeepSeek Team state directory, outside the repository. It records only the minimum process state needed for continuity: session/task/deliverable/assignment ids, executor/scope/acceptance/dependencies/checks, workspace id, coordinator-prepared inputs, worker-only delta, result summary, checks, result disposition and structured constraints.
+The ledger is stored under the user's private DeepSeek Team state directory, outside the repository. It records only the minimum process state needed for continuity: session/task/deliverable/assignment ids, executor/scope/acceptance/dependencies/checks, native delegation reasons, selected DeepSeek effort, workspace id, coordinator-prepared inputs, worker-only delta, result summary, checks, result disposition and structured constraints.
 
 It is not a scheduler. It does not scan arbitrary projects, auto-attach repositories, commit, push, publish or deploy. Existing workspace records remain the source of truth for owned development copies.
 

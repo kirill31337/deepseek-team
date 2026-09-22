@@ -70,6 +70,12 @@ def handle(payload: dict) -> dict:
         task = coordination.begin_turn(
             root, session_id=session, turn_id=str(payload.get("turn_id") or "turn"),
             prompt=str(payload.get("prompt") or ""), policy=policy)
+        effort_context = (
+            "Effort policy is auto: choose low, medium or high for each DeepSeek assignment "
+            "from task complexity and pass it explicitly. "
+            if policy.effort == "auto" else
+            f"Effort policy is forced to {policy.effort}: use that level for new DeepSeek assignments. "
+        )
         text = (
             coordination.summary(task) + "\n"
             "Before coordinator source edits for a substantial task, register a concrete "
@@ -77,6 +83,9 @@ def handle(payload: dict) -> dict:
             ". For a genuinely small single-output task, record it as small with evidence. "
             "At 75/full-access, worker-eligible implementation/tests/fixtures/docs/metadata "
             "default to DeepSeek unless a supported concrete constraint is recorded. "
+            "Coordinator-native subagents are also allowed when the plan uses executor "
+            "native-agent with a concrete delegation_reason; they complement and do not replace "
+            "required DeepSeek worker assignments. " + effort_context +
             "Do not report a useful-work percentage from counts."
         )
         return _context(text, event)
@@ -85,7 +94,8 @@ def handle(payload: dict) -> dict:
         policy = settings.resolve(root)
         base = (
             f"DeepSeek Team effective profile: {policy.delegation_level}%/"
-            f"{policy.effective_access}. Codex lifecycle enforcement is active for this "
+            f"{policy.effective_access}; effort={policy.effort}. "
+            "Codex lifecycle enforcement is active for this "
             "explicitly attached project. "
         )
         if task:

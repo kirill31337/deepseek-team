@@ -1,0 +1,53 @@
+name: Publish release
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify and build
+        run: |
+          python -m pip install build
+          PYTHONPATH=src python -m unittest discover -s tests -v
+          python -m build
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          VERSION="$(python - <<'PY'
+import tomllib
+with open('pyproject.toml', 'rb') as source:
+    print(tomllib.load(source)['project']['version'])
+PY
+)"
+          test -n "$VERSION"
+          test -f "docs/releases/$VERSION.md"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="v$VERSION"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; nothing to publish."
+            exit 0
+          fi
+          gh release create "$TAG" dist/* \
+            --target "$GITHUB_SHA" \
+            --title "DeepSeek Team $VERSION" \
+            --notes-file "docs/releases/$VERSION.md"

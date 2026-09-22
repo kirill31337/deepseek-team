@@ -15,11 +15,34 @@ Keep the required Linux OS sandbox enabled for managed workers. Never add `--os-
 to ordinary coordination flows and do not weaken Ubuntu AppArmor
 user-namespace restrictions to make delegation pass.
 
+### Model, effort and native subagents
+
+DeepSeek Team workers always use **`deepseek-flash`**. Do not route to another DeepSeek
+model. Resolve the current effort policy with the effective config before assigning work.
+The default is `effort=auto`: in that mode the frontier coordinator chooses the effort
+from the actual delegated scope and passes `--effort low|medium|high` (`low` for bounded
+or mechanical work, `medium` for the normal case, `high` for difficult debugging,
+cross-file reasoning, security-sensitive review or adversarial verification). If the
+resolved policy is explicitly `low`, `medium` or `high`, treat it as the saved forced
+level for new DeepSeek jobs and do not auto-select another value. `config set` can persist
+that choice per project or globally, and setting it back to `auto` restores frontier
+selection. A direct worker launched while policy is auto falls back to `medium` only when
+no frontier-selected concrete effort reaches the runner.
+
+The coordinator may also use its own **native subagents** when this materially improves
+parallelism, isolated context, independent verification, or access to a native capability.
+For a substantial planned deliverable, record this as `executor: "native-agent"` and add a
+concrete `delegation_reason`. A native subagent is additive: it does **not** satisfy a
+DeepSeek worker assignment required by the 50/75 profiles. Architecture/security decisions,
+final integration/verification, secrets/signing, commit/push and production actions remain
+coordinator-owned. DeepSeek workers themselves remain leaf workers and must not delegate.
+
 ### Process
 
 For a substantial task, identify concrete deliverables before duplicating their
 implementation. Each deliverable needs: id, kind, concrete scope, executor,
-acceptance criteria, dependencies, and checks. Architecture, security decisions,
+acceptance criteria, dependencies, and checks. `native-agent` executors additionally
+need `delegation_reason` explaining why native delegation is useful for that scope. Architecture, security decisions,
 final verification, integration, secrets/signing, commit/push and production stay
 with the coordinator. That responsibility alone does not reserve ordinary
 implementation, tests, fixtures, documentation, or non-secret metadata.
@@ -58,7 +81,7 @@ JSON
 Use the assignment id returned by the plan:
 
 ```bash
-deepseek-team worker --runtime {runtime} \
+deepseek-team worker --runtime {runtime} --effort medium \
   --coord-task TASK_ID --coord-assignment ASSIGNMENT_ID <<'TASK'
 Implement the assigned deliverable and satisfy its registered acceptance criteria.
 TASK
@@ -104,5 +127,9 @@ Claude Code: managed instructions and worker accounting are available, but coord
 distribution enforcement is instruction-driven in this release; no Claude
 PreToolUse technical block is claimed.
 
-No worker stages, commits, pushes, deploys, publishes, accesses production, or reads
-coordinator secrets.
+Coordinator-native subagents run under the coordinator runtime's own native agent model,
+permissions and sandboxing; they are not placed inside the DeepSeek Team worker sandbox.
+This does not change the isolation of DeepSeek workers.
+
+No DeepSeek worker stages, commits, pushes, deploys, publishes, accesses production,
+reads coordinator secrets, or delegates to another agent.
