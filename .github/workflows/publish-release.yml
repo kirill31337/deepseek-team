@@ -27,11 +27,11 @@ jobs:
         shell: bash
         run: |
           VERSION="$(python - <<'PY'
-import tomllib
-with open('pyproject.toml', 'rb') as source:
-    print(tomllib.load(source)['project']['version'])
-PY
-)"
+          import tomllib
+          with open('pyproject.toml', 'rb') as source:
+              print(tomllib.load(source)['project']['version'])
+          PY
+          )"
           test -n "$VERSION"
           test -f "docs/releases/$VERSION.md"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
