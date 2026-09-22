@@ -89,8 +89,11 @@ class DoctorSandboxTests(unittest.TestCase):
         self.assertIn('native trust must be checked', text)
         self.assertNotIn('trusted: yes', text.lower())
 
-    def test_doctor_labels_claude_coordinator_as_instruction_driven(self):
-        self.assertIn('instruction-driven', doctor.coordination_status('claude')[2])
+    def test_doctor_reports_claude_hook_status_without_claiming_effective_trust(self):
+        with mock.patch('codex_deepseek_team.claude_config.status', return_value=False):
+            installed, _, limitation = doctor.coordination_status('claude')
+        self.assertEqual(installed, 'missing-or-disabled')
+        self.assertIn('Claude /hooks', limitation)
 
     def test_live_worker_call_forwards_required_os_sandbox(self):
         with mock.patch.object(doctor.subprocess, 'run', return_value=SimpleNamespace(returncode=0)) as run:

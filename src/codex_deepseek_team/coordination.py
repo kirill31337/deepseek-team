@@ -1,7 +1,7 @@
 """Minimal persistent coordinator/worker ledger.
 
 This is intentionally not a scheduler. It records distribution decisions, assignments,
-worker results and dispositions so Codex hooks can enforce process transitions and
+worker results and dispositions so coordinator hooks can enforce process transitions and
 restore context after compaction.
 """
 from __future__ import annotations

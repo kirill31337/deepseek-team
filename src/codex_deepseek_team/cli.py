@@ -41,10 +41,10 @@ def main(argv=None):
     if sys.platform != 'linux':
         print('This release supports Linux with Python 3.11+ and Codex and/or Claude Code.', file=sys.stderr)
         return 78
-    from . import activation, config, doctor, sandbox, settings, worker
+    from . import activation, claude_config, config, doctor, sandbox, settings, worker
     if argv and argv[0] == 'coordinator-hook':
-        from . import codex_hooks
-        return codex_hooks.main()
+        from . import coordinator_hooks
+        return coordinator_hooks.main(argv[1:])
     if argv and argv[0] == 'coordination':
         from . import coordination_cli
         return coordination_cli.main(argv)
@@ -85,11 +85,12 @@ def main(argv=None):
     setter.add_argument('--stdin', action='store_true', help='Read from a pipe; never pass a key as a command argument.')
     auth_commands.add_parser('status', help='Report whether a usable key is present, without displaying it.')
     auth_commands.add_parser('remove', help='Delete the saved key; environment overrides are unaffected.')
-    hooks_cmd = commands.add_parser('hooks', help='Manage stable user-level Codex coordination hooks.')
+    hooks_cmd = commands.add_parser('hooks', help='Manage user-level Codex/Claude coordination hooks.')
     hooks_commands = hooks_cmd.add_subparsers(dest='hooks_command', required=True)
-    hooks_commands.add_parser('install', help='Install/update package-owned user-level Codex hooks.')
-    hooks_commands.add_parser('status', help='Report whether the exact package hook set is installed.')
-    hooks_commands.add_parser('remove', help='Remove only package-owned Codex hook handlers.')
+    for name in ('install', 'status', 'remove'):
+        hook_action = hooks_commands.add_parser(name)
+        hook_action.add_argument('--runtime', choices=['codex', 'claude', 'both', 'auto'], default='codex',
+                                 help='Coordinator hooks to manage; default codex preserves existing commands.')
     sandbox_cmd = commands.add_parser('sandbox', help='Inspect or manage Linux Bubblewrap/AppArmor isolation.')
     sandbox_commands = sandbox_cmd.add_subparsers(dest='sandbox_command', required=True)
     sandbox_commands.add_parser('status', help='Probe Bubblewrap and the effective AppArmor/userns backend.')
@@ -125,7 +126,10 @@ def main(argv=None):
                 print('Codex primary model and OpenAI authentication were preserved.')
                 print('Codex requires one native hook review/trust via /hooks; the stable definition persists across package updates.')
             if 'claude' in runtimes:
-                print('Claude Code runtime uses an isolated DeepSeek child environment; Claude configuration/auth were not changed.')
+                changed = claude_config.install()
+                print('Claude coordination hooks installed.' if changed else 'Claude coordination hooks already installed.')
+                print('Claude model, permissions, authentication and unrelated hooks were preserved.')
+                print('Start a new Claude session and check /hooks. Native settings may disable hooks.')
             if not args.no_key and not worker.load_api_key().strip():
                 if sys.stdin.isatty():
                     config.save_key(getpass.getpass('DeepSeek API key (hidden): '))
@@ -140,7 +144,8 @@ def main(argv=None):
                 print('Managed Codex provider removed.' if changed else 'No package-owned Codex provider block to remove.')
                 print('Managed Codex coordination hooks removed.' if hooks_changed else 'No package-owned Codex hooks to remove.')
             if 'claude' in runtimes:
-                print('No package-owned Claude configuration exists; nothing was changed.')
+                print('Managed Claude coordination hooks removed.' if claude_config.remove()
+                      else 'No package-owned Claude hooks to remove.')
         elif args.command in ['init', 'detach']:
             from . import project
             try:
@@ -164,19 +169,36 @@ def main(argv=None):
                 print('Key available; value omitted.' if present else 'No key configured.')
                 return 0 if present else 78
         elif args.command == 'hooks':
-            home = worker.codex_home()
-            if args.hooks_command == 'install':
-                changed = config.install_codex_hooks(home)
-                print('Codex coordination hooks installed.' if changed else 'Codex coordination hooks already installed.')
-                print('Review/trust this stable user-level definition once in Codex with /hooks.')
-            elif args.hooks_command == 'remove':
-                print('Codex coordination hooks removed.' if config.remove_codex_hooks(home)
-                      else 'No package-owned Codex coordination hooks were present.')
-            else:
-                installed = config.codex_hooks_status(home)
-                print('Codex coordination hooks installed; native trust state is managed by Codex /hooks.'
-                      if installed else 'Codex coordination hooks are not installed.')
-                return 0 if installed else 78
+            healthy = True
+            for runtime in _runtimes(args.runtime):
+                if runtime == 'claude':
+                    if args.hooks_command == 'install':
+                        changed = claude_config.install()
+                        print('Claude coordination hooks installed.' if changed else 'Claude coordination hooks already installed.')
+                        print('Start a new Claude session and check /hooks. Native settings may disable hooks.')
+                    elif args.hooks_command == 'remove':
+                        print('Claude coordination hooks removed.' if claude_config.remove()
+                              else 'No package-owned Claude coordination hooks were present.')
+                    else:
+                        installed = claude_config.status()
+                        print('Claude coordination hooks installed; check effective settings with Claude /hooks.'
+                              if installed else 'Claude coordination hooks are missing, modified or disabled in user settings.')
+                        healthy = healthy and installed
+                    continue
+                home = worker.codex_home()
+                if args.hooks_command == 'install':
+                    changed = config.install_codex_hooks(home)
+                    print('Codex coordination hooks installed.' if changed else 'Codex coordination hooks already installed.')
+                    print('Review/trust this stable user-level definition once in Codex with /hooks.')
+                elif args.hooks_command == 'remove':
+                    print('Codex coordination hooks removed.' if config.remove_codex_hooks(home)
+                          else 'No package-owned Codex coordination hooks were present.')
+                else:
+                    installed = config.codex_hooks_status(home)
+                    print('Codex coordination hooks installed; native trust state is managed by Codex /hooks.'
+                          if installed else 'Codex coordination hooks are not installed.')
+                    healthy = healthy and installed
+            return 0 if healthy else 78
         elif args.command == 'sandbox':
             if args.sandbox_command == 'status':
                 return _sandbox_status(sandbox)

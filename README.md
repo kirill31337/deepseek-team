@@ -12,6 +12,8 @@ The percentages are **target work-distribution profiles**, not measured token/ti
 
 Version **0.6.0** adds frontier-selected DeepSeek effort with persistent `auto|low|medium|high` policy, preserves justified native Codex/Claude subagents alongside DeepSeek workers, and keeps DeepSeek workers fixed on `deepseek-flash` as isolated leaf workers. Version 0.5.0 introduced persistent coordination state and Codex lifecycle enforcement. The release supports **Linux, Python 3.11+, Git, Bubblewrap, and Codex CLI and/or Claude Code CLI**. Ubuntu has first-class AppArmor setup for its restricted unprivileged-user-namespace policy. A DeepSeek API key is required for live work. There are no Python runtime dependencies; Bubblewrap/AppArmor are system components.
 
+The current source also supports Claude Code coordination hooks: both coordinators use the persistent task ledger and the saved project `on/off` switch.
+
 ## Ubuntu install — recommended
 
 Install the coordinator CLI(s) you intend to use, then:
@@ -38,8 +40,10 @@ deepseek-team init --coordinator codex
 
 # Claude Code only
 deepseek-team setup --runtime claude
+deepseek-team hooks status --runtime claude
 deepseek-team doctor --runtime claude --offline
 deepseek-team init --coordinator claude
+# Start a new Claude session and check /hooks.
 
 # Or both
 deepseek-team setup --runtime both
@@ -77,6 +81,22 @@ deepseek-team init --coordinator codex /path/to/project
 Codex owns native hook trust. Review/trust the stable DeepSeek Team hook once from Codex with `/hooks`; DeepSeek Team does not bypass or infer that decision. Normal package updates keep the same hook command and **do not require re-running `init` for projects that are already attached**.
 
 `hooks remove` removes only the package-owned DeepSeek Team handlers and preserves unrelated user hooks.
+
+### Claude Code lifecycle hooks
+
+The standard installer also detects Claude Code on `PATH`. It installs DeepSeek Team handlers in `~/.claude/settings.json`, or in `$CLAUDE_CONFIG_DIR/settings.json` when that environment variable is set. `setup --runtime claude` installs the same handlers. Existing model, permissions, credentials and unrelated hooks are preserved. Projects opt in with `deepseek-team init --coordinator claude`.
+
+```bash
+deepseek-team hooks install --runtime claude
+deepseek-team hooks status --runtime claude
+deepseek-team hooks remove --runtime claude
+```
+
+Use `--runtime both` for both coordinators, or `--runtime auto` for those found on `PATH`. Without the flag, `hooks` continues to target Codex.
+
+After installation, start a new Claude session and check `/hooks`. `hooks status` verifies the user-level definitions; it cannot confirm which hooks a running session has loaded. Claude's `disableAllHooks`, managed settings, or `--bare` can disable them. Installation preserves those settings. The [Claude hook reference](https://code.claude.com/docs/en/hooks) describes the native controls.
+
+When updating an already attached Claude project, `deepseek-team init --coordinator claude .` can refresh old instructions that described delegation as instruction-driven. The existing project marker already enables the new handlers, and later package updates or `on/off` changes do not require another `init`.
 
 ## Install with an agent prompt
 
@@ -207,11 +227,11 @@ For example: “Turn off DeepSeek Team in this project” or “Turn DeepSeek Te
 
 The choice persists across sessions and package updates. It is stored locally for your user, separately for each checkout, under `${XDG_CONFIG_HOME:-~/.config}/deepseek-team/activation/`. Nothing is added to Git. Commands also work from subdirectories; you can pass a project path explicitly, for example `deepseek-team off /path/to/project`. `status --json` reports the effective state, saved state and source. Outside a Git working copy, specify a project path.
 
-By default, delegation is enabled. `off` prevents new workers from starting, including reuse of workspaces belonging to that source project, and disables Codex coordination gates on subsequent hook events. Live diagnostics also respect it. Already running workers continue; their results and coordination records are retained. `on` restores delegation with the existing access, percentage and effort settings. Credentials and project instruction files are unchanged. It does not install hooks or attach a new project; initial setup still uses `setup` and `init`.
+By default, delegation is enabled. `off` prevents new workers from starting, including reuse of workspaces belonging to that source project, and disables Codex and Claude coordination gates on subsequent hook events. Live diagnostics also respect it. Already running workers continue; their results and coordination records are retained. `on` restores delegation with the existing access, percentage and effort settings. Credentials and project instruction files are unchanged. It does not install hooks or attach a new project; initial setup still uses `setup` and `init`.
 
 `DEEPSEEK_TEAM_DISABLED=1` and the legacy `CODEX_DEEPSEEK_DISABLED=1` override the saved choice. If either is set, `on` saves the enabled state but reports that delegation remains disabled until the environment override is removed. `config show --effective --instructions` also reports activation and tells the coordinator to continue locally while disabled.
 
-Codex receives the current state through its installed, trusted hooks. Claude Code follows the project instructions and checks the current configuration before assigning work; the worker command enforces the switch for both runtimes even if a chat still contains old instructions. Existing attached projects can optionally refresh their instruction blocks once with `deepseek-team init --coordinator both .` to include the new switch guidance (choose `codex` or `claude` if only one is used). Toggling itself never requires another `init`.
+Both coordinators receive the current state through their installed, enabled hooks. The worker command also enforces the switch even if a chat still contains old instructions. Existing attached projects can optionally refresh their instruction blocks once with `deepseek-team init --coordinator both .` to include the new switch guidance (choose `codex` or `claude` if only one is used). Toggling itself never requires another `init`.
 
 ## Delegation profiles and access
 
@@ -271,15 +291,17 @@ DeepSeek Team 0.5.0 adds a small persistent coordination ledger outside the repo
 
 For Codex, `deepseek-team setup --runtime codex` and the standard installer place one stable user-level lifecycle hook definition in `$CODEX_HOME/hooks.json`. The hook is inert unless the current repository has already been explicitly attached with `deepseek-team init --coordinator codex`. Codex owns native hook trust; review/trust the stable definition once with Codex `/hooks`. DeepSeek Team does not bypass or infer that decision.
 
-Supported Codex hook behavior is split deliberately:
+Claude uses the same ledger through its user-level hooks and a project attached with `init --coordinator claude`. Both integrations handle these events:
 
 - `SessionStart` and `UserPromptSubmit` restore/inject the current coordination state, including after compaction;
 - `PreToolUse` can technically deny coordinator source mutation before execution when the distribution is missing/noncompliant, when a new scope was not planned, or when the path is still owned by a pending worker assignment;
-- `Stop` prevents silent completion while assignments are pending or completed worker results have no disposition.
+- `Stop` requests a continuation while assignments are pending or completed worker results have no disposition. In Claude, if `stop_hook_active` is already true, it shows the remaining work and leaves the task unfinished in the ledger instead of blocking again.
+
+Claude's gate covers `Edit`, `Write`, `NotebookEdit` and recognized mutating `Bash` commands. File paths are checked against the project scopes, including absolute paths. In plan mode, Markdown files in Claude's native plan directory can be edited before a distribution is registered, and `Stop` leaves the task open. This exception supports the default directory and `plansDirectory` in user, project or local settings files. Shell detection uses known patterns; hooks do not intercept every possible write through arbitrary commands or external tools. Claude native-subagent events do not open, complete or enforce the coordinator's task. These hooks control the coordinator's workflow; worker isolation is enforced separately by the OS sandbox.
 
 At **75/full-access**, ordinary separable implementation, tests, fixtures, documentation and non-secret metadata are worker-eligible by default. Merely running one implementation/review worker does not satisfy the profile if the coordinator then retains the remaining worker-eligible work without a supported constraint. At **50/full-access**, a review-only worker does not substitute for delegating an available implementation/test/docs slice. Access remains independent: an explicit read-only override never becomes writable.
 
-Before a substantial Codex task mutates source, the coordinator registers concrete deliverables:
+Before a substantial task mutates source, either coordinator registers concrete deliverables:
 
 ```bash
 deepseek-team coordination plan --task TASK_ID <<'JSON'
@@ -300,7 +322,7 @@ deepseek-team coordination plan --task TASK_ID <<'JSON'
 JSON
 ```
 
-The assignment returned by that plan is tied to the runner:
+The assignment returned by that plan is tied to the runner. Use `--runtime claude` when Claude Code is coordinating; the example below uses Codex:
 
 ```bash
 deepseek-team worker --runtime codex --effort medium \
@@ -324,7 +346,7 @@ deepseek-team workspace import WORKSPACE_ID --include path/to/needed.py
 
 Those files are recorded as coordinator-prepared input, not worker authorship. Declared dependencies are also checked **inside the actual worker sandbox before the provider credential is read**. Host-only JDK/SDK/tools are not assumed to exist in full-access. Missing dependencies must be prepared explicitly with `workspace prepare`; replacing them with stubs is not treated as equivalent verification.
 
-For Claude Code, the same ledger/runner accounting and managed instructions are available, but coordinator distribution enforcement is **instruction-driven** in 0.5.0. DeepSeek Team does not claim a Claude PreToolUse technical gate. Both coordinators may use justified native subagents; those native agents use the host runtime's own model/permissions/sandbox and are outside the DeepSeek worker sandbox.
+Both coordinators may use justified native subagents; those native agents use the host runtime's own model/permissions/sandbox and are outside the DeepSeek worker sandbox.
 
 The 25/50/75 value remains a **target policy, not a measured productivity percentage**. DeepSeek Team records observable facts; it does not convert call counts, files, lines, tokens, task bullets or subjective outcomes into a fake "actual contribution %" metric.
 
@@ -449,7 +471,7 @@ deepseek-team doctor --runtime both --offline --delegation-level 50 --access aut
 PYTHONPATH=src python3 -m unittest discover -s tests -v
 ```
 
-`doctor --offline` verifies local sandbox/runtime capabilities without a DeepSeek API request or key validation. `doctor --live` makes billable DeepSeek calls, uses a synthetic repository, and verifies that selected read-only workers do not modify it.
+`doctor --offline` verifies local sandbox/runtime capabilities and reports hook installation and project binding for the selected coordinator, without a DeepSeek API request or key validation. It does not confirm that a running session has enabled those hooks. `doctor --live` makes billable DeepSeek calls, uses a synthetic repository, and verifies that selected read-only workers do not modify it.
 
 Offline tests use synthetic credentials/transports. GitHub Actions runs the full unittest suite, builds/installs the wheel and exercises both console aliases on Python 3.11, 3.12 and 3.13. A separate Ubuntu sandbox job exercises Bubblewrap/AppArmor. The dedicated **Delegation verification** workflow additionally installs pinned real Codex/Claude versions and drives their actual tool/protocol surfaces against an offline local provider fixture: read-only write denial, full-access unlisted-file creation/local tests, parallel isolated copies, explicit recovery and provider-vs-execution failure classification are checked without a real DeepSeek key or paid request. A green CI matrix is not evidence of a live DeepSeek inference request.
 
@@ -460,13 +482,13 @@ Installer-managed checkout:
 ```bash
 git pull --ff-only
 python3 install.py --with-sandbox   # recommended on Ubuntu
-deepseek-team hooks status
-deepseek-team doctor --runtime codex --offline
+deepseek-team hooks status --runtime auto
+deepseek-team doctor --runtime auto --offline
 ```
 
 If the repository was already attached before the update, do **not** re-run `init` just for the upgrade. For a new repository, attach it once with `deepseek-team init --coordinator codex /path/to/project` (or `--coordinator both` when both coordinator instruction files are desired). In Codex, review/trust the stable hook once with `/hooks`.
 
-For pipx: `pipx upgrade codex-deepseek-team`, then run `deepseek-team hooks install`, `deepseek-team hooks status`, and `deepseek-team sandbox status`.
+For pipx: `pipx upgrade codex-deepseek-team`, then run `deepseek-team hooks install --runtime auto`, `deepseek-team hooks status --runtime auto`, and `deepseek-team sandbox status`.
 
 Detach project instructions/package-owned coordinator configuration:
 
@@ -482,7 +504,7 @@ If you also want to remove only the unchanged package-owned AppArmor policy:
 deepseek-team sandbox remove-apparmor
 ```
 
-`reset --runtime codex` removes only this package's unmodified DeepSeek provider block and preserves primary auth/model and unrelated providers. Claude runtime has no package-owned persistent provider config, so resetting Claude is a no-op. Environment keys and private Codex config backups are retained.
+`reset --runtime codex` removes this package's unmodified DeepSeek provider block and its Codex hooks. `reset --runtime claude` removes only the package-owned handlers from Claude settings. Both preserve primary auth/model, permissions and unrelated configuration. Environment keys and private Codex config backups are retained.
 
 Uninstall the Python package with your package manager, or remove the installer-owned `~/.local/bin/deepseek-team`, `~/.local/bin/codex-deepseek-team` symlinks and `~/.local/share/codex-deepseek-team` directory after detaching projects.
 

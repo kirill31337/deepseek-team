@@ -108,6 +108,12 @@ def main(argv=None):
                 check=False)
             if hook_result.returncode:
                 print('Warning: Codex coordination hooks could not be installed; run deepseek-team setup --runtime codex --no-key after fixing ~/.codex/hooks.json.', file=sys.stderr)
+        if shutil.which('claude'):
+            hook_result = subprocess.run(
+                [str(environment / 'bin/deepseek-team'), 'hooks', 'install', '--runtime', 'claude'],
+                check=False)
+            if hook_result.returncode:
+                print('Warning: Claude coordination hooks could not be installed; check Claude settings.json and run deepseek-team setup --runtime claude --no-key.', file=sys.stderr)
         if args.with_sandbox:
             _install_ubuntu_sandbox(environment / 'bin/deepseek-team')
         print('Installed commands: ' + ', '.join(str(binary) for binary, _ in links))

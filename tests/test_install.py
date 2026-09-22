@@ -70,7 +70,7 @@ class InstallTests(unittest.TestCase):
             calls.append(list(args))
             return subprocess.CompletedProcess(args, 0, '', '')
         with mock.patch.object(installer.venv.EnvBuilder, 'create', side_effect=self.simulate_venv), \
-             mock.patch.object(installer.shutil, 'which', return_value='/usr/bin/codex'), \
+             mock.patch.object(installer.shutil, 'which', side_effect=lambda name: '/usr/bin/codex' if name == 'codex' else None), \
              mock.patch.object(installer.subprocess, 'run', side_effect=run):
             self.assertEqual(installer.main(self.args), 0)
 
@@ -87,7 +87,7 @@ class InstallTests(unittest.TestCase):
             calls.append(list(args))
             return subprocess.CompletedProcess(args, 0, '', '')
         with mock.patch.object(installer.venv.EnvBuilder, 'create', side_effect=self.simulate_venv), \
-             mock.patch.object(installer.shutil, 'which', return_value='/usr/bin/codex'), \
+             mock.patch.object(installer.shutil, 'which', side_effect=lambda name: '/usr/bin/codex' if name == 'codex' else None), \
              mock.patch.object(installer.subprocess, 'run', side_effect=run):
             self.assertEqual(installer.main(self.args), 0)
             self.assertEqual(installer.main(self.args), 0)
@@ -104,6 +104,21 @@ class InstallTests(unittest.TestCase):
         flattened = '\n'.join(' '.join(call) for call in calls)
         self.assertNotIn(' init ', flattened)
         self.assertNotIn('find ', flattened)
+
+    def test_install_with_claude_adds_explicit_runtime_hooks(self):
+        for available in (('claude',), ('codex', 'claude')):
+            with self.subTest(runtimes=available):
+                calls = []
+                def run(args, **kwargs):
+                    calls.append(list(args))
+                    return subprocess.CompletedProcess(args, 0, '', '')
+                with mock.patch.object(installer.venv.EnvBuilder, 'create', side_effect=self.simulate_venv), \
+                     mock.patch.object(installer.shutil, 'which', side_effect=lambda name: '/usr/bin/' + name if name in available else None), \
+                     mock.patch.object(installer.subprocess, 'run', side_effect=run):
+                    self.assertEqual(installer.main(self.args), 0)
+                team = str(self.prefix / 'venv/bin/deepseek-team')
+                self.assertIn([team, 'hooks', 'install', '--runtime', 'claude'], calls)
+                self.assertEqual([team, 'hooks', 'install'] in calls, 'codex' in available)
 
     def test_plain_install_never_invokes_privileged_sandbox_setup(self):
         calls = []

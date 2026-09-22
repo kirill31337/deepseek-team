@@ -298,31 +298,34 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
         full_profiles if policy.effective_access == 'full-access' else read_only_profiles
     )[policy.delegation_level]
 
-    if runtime == 'codex':
-        process = (
-            'Codex process integration: after project init and native hook trust, SessionStart/'
+    coordinator = 'Claude' if runtime == 'claude' else 'Codex'
+    process = (
+            f'{coordinator} process integration: after project init and enabling hooks in the runtime, SessionStart/'
             'UserPromptSubmit provide the current coordination task id. For every substantial task, '
             'before coordinator source edits, submit a concrete JSON distribution with '
             'deepseek-team coordination plan --task TASK_ID; include deliverable id/kind/scope, '
             'executor, acceptance criteria, dependencies and checks. Run each worker assignment with '
-            f'deepseek-team worker --runtime codex --effort {effort_example} '
+            f'deepseek-team worker --runtime {runtime} --effort {effort_example} '
             '--coord-task TASK_ID --coord-assignment ASSIGNMENT_ID. '
             + effort_note +
             'The runner records start/result/workspace/checks automatically. After reviewing a result, '
             'record its use with deepseek-team coordination use. New substantial scope requires '
-            'a revised plan. Codex PreToolUse technically blocks source mutation while the distribution '
+            f'a revised plan. {coordinator} PreToolUse blocks recognized source edits while the distribution '
             'is missing/noncompliant, blocks unplanned scope, and blocks duplicate work owned by a '
-            'pending worker assignment; Stop prevents silent completion with pending/undispositioned '
-            'worker results. Native hook trust is controlled by Codex and is not inferred by this package.\n'
-        )
+            'pending worker assignment. Hook coverage depends on the tools and native runtime settings; '
+            'it does not replace the worker OS sandbox. '
+    )
+    if runtime == 'codex':
+        process += (
+            'Stop prevents silent completion with pending/undispositioned worker results. '
+            'Native hook trust is controlled by Codex and is not inferred by this package.\n')
     else:
-        process = (
-            'Claude coordinator integration is instruction-driven in this release: use the same '
-            'distribution principles, resolved effort policy and managed worker runner, but DeepSeek '
-            'Team does not claim a Claude PreToolUse technical gate. Worker filesystem/network '
-            'permissions remain technically sandboxed; coordinator compliance with distribution '
-            'instructions depends on Claude Code.\n'
-        )
+        process += (
+            'Claude hooks cover Edit, Write, NotebookEdit and recognized mutating Bash commands. '
+            'Stop requests a continuation for pending/undispositioned results; if stop_hook_active '
+            'is already true, it warns the user and leaves the task unfinished in the ledger '
+            'instead of blocking again. Native subagent hook events do not change the coordinator ledger. '
+            'Check enabled hooks through Claude /hooks; --bare or native settings can disable them.\n')
 
     return (
         f'### Effective delegation profile: {policy.delegation_level}% / {policy.effective_access}; '

@@ -188,22 +188,27 @@ def check_policy_runtime(runtime, policy):
 
 def coordination_status(runtime, root=None):
     """Describe coordinator-process integration without guessing native trust state."""
-    if runtime == 'claude':
-        return ('not-applicable', 'managed-instructions',
-                'Claude coordinator distribution is instruction-driven; no technical PreToolUse gate is claimed.')
-    if runtime != 'codex':
+    if runtime not in ('codex', 'claude'):
         raise worker.WorkerError(64, f'Unsupported coordination runtime: {runtime}.')
-    from codex_deepseek_team import config, project, settings
-    installed = 'installed' if config.codex_hooks_status(worker.codex_home()) else 'missing'
+    from codex_deepseek_team import claude_config, config, project, settings
+    try:
+        if runtime == 'claude':
+            installed = 'installed' if claude_config.status() else 'missing-or-disabled'
+        else:
+            installed = 'installed' if config.codex_hooks_status(worker.codex_home()) else 'missing'
+    except config.ConfigError as error:
+        raise worker.WorkerError(78, str(error)) from None
     project_root = settings.project_root(Path.cwd() if root is None else Path(root))
     if project_root is None:
         attached = 'outside-project'
     else:
         try:
-            attached = 'attached' if project.is_attached(project_root, 'codex') else 'not-attached'
+            attached = 'attached' if project.is_attached(project_root, runtime) else 'not-attached'
         except project.ProjectError:
             attached = 'invalid-project-binding'
-    trust = 'native trust must be checked with Codex /hooks; DeepSeek Team does not bypass or infer it'
+    trust = ('check effective settings with Claude /hooks; project/managed settings or --bare may disable hooks'
+             if runtime == 'claude' else
+             'native trust must be checked with Codex /hooks; DeepSeek Team does not bypass or infer it')
     return installed, attached, trust
 
 
@@ -281,12 +286,9 @@ def main(argv=None):
         for runtime in runtimes:
             check_policy_runtime(runtime, policy)
             hooks, binding, limitation = coordination_status(runtime)
-            if runtime == 'codex':
-                print('Coordination hooks: ' + hooks)
-                print('Project coordination binding: ' + binding)
-                print('Coordination hook trust: ' + limitation)
-            else:
-                print('Claude coordinator enforcement: ' + limitation)
+            print('Coordination hooks: ' + hooks)
+            print('Project coordination binding: ' + binding)
+            print('Coordination hook availability: ' + limitation)
         print('Local runtime checks: PASS.')
         if args.live and policy.effective_access == 'full-access':
             print('Live provider smoke remains read-only by design; full-access permissions are checked locally.')

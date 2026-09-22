@@ -127,9 +127,17 @@ hook trust is owned by Codex and must be reviewed there once; DeepSeek Team does
 bypass or infer it. Hooks are a coordinator-process guardrail, not a replacement for
 the worker Bubblewrap/AppArmor security boundary.
 
-Claude Code: managed instructions and worker accounting are available, but coordinator
-distribution enforcement is instruction-driven in this release; no Claude
-PreToolUse technical block is claimed.
+Claude Code: after `setup --runtime claude` and project attachment, user-level hooks
+inject the current policy and enforce the same ledger distribution through PreToolUse.
+They cover Edit, Write, NotebookEdit and recognized mutating Bash commands, not every
+possible write through arbitrary commands or external tools. Stop requests a continuation
+for unfinished assignments/results; on a repeated Stop it warns and keeps the task
+unfinished in the ledger to avoid a loop. Native-subagent hook events are outside this
+coordinator gate. Check active hooks with Claude `/hooks`; `--bare` and native settings
+can disable them. DeepSeek child workers retain their isolated HOME and `--bare` mode.
+In Claude plan mode, native Markdown plan files can be edited before registering the
+distribution. The plan directory comes from the default or user/project/local
+`plansDirectory` setting. Stop leaves the task open during planning.
 
 Coordinator-native subagents run under the coordinator runtime's own native agent model,
 permissions and sandboxing; they are not placed inside the DeepSeek Team worker sandbox.

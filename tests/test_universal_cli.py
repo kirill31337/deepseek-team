@@ -18,6 +18,7 @@ class UniversalCliTests(unittest.TestCase):
         self.bin = self.root / 'bin'
         self.bin.mkdir()
         self.env = dict(os.environ, HOME=str(self.home), CODEX_HOME=str(self.home / 'codex'),
+                        CLAUDE_CONFIG_DIR=str(self.home / '.claude'),
                         PYTHONPATH=str(Path(__file__).resolve().parents[1] / 'src'))
         self.env.pop('DEEPSEEK_API_KEY', None)
         self.env.pop('DEEPSEEK_TEAM_DISABLED', None)
@@ -30,10 +31,10 @@ class UniversalCliTests(unittest.TestCase):
         self.claude.chmod(0o755)
         self.env['PATH'] = str(self.bin) + os.pathsep + self.env['PATH']
 
-    def cli(self, *args, input=''):
+    def cli(self, *args, input='', cwd=None):
         return subprocess.run([sys.executable, '-m', 'codex_deepseek_team', *args],
                               input=input, text=True, capture_output=True,
-                              env=self.env, timeout=15)
+                              env=self.env, timeout=15, cwd=cwd)
 
     def git_repo(self):
         repo = self.root / 'repo'
@@ -75,6 +76,22 @@ class UniversalCliTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('claude-code-test', result.stdout)
         self.assertFalse((self.home / 'codex/config.toml').exists())
+
+    def test_claude_doctor_reports_installed_hooks_and_project_binding(self):
+        repo = self.git_repo()
+        self.assertEqual(self.cli('setup', '--runtime', 'claude', '--no-key').returncode, 0)
+        self.assertEqual(self.cli('init', '--coordinator', 'claude', str(repo)).returncode, 0)
+        result = self.cli('doctor', '--runtime', 'claude', '--offline', '--os-sandbox', 'off', cwd=repo)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Coordination hooks: installed', result.stdout)
+        self.assertIn('Project coordination binding: attached', result.stdout)
+        self.assertIn('Claude /hooks', result.stdout)
+
+    def test_hooks_auto_and_both_manage_both_detected_runtimes(self):
+        self.assertEqual(self.cli('hooks', 'install', '--runtime', 'auto').returncode, 0)
+        self.assertEqual(self.cli('hooks', 'status', '--runtime', 'both').returncode, 0)
+        self.assertEqual(self.cli('hooks', 'remove', '--runtime', 'both').returncode, 0)
+        self.assertEqual(self.cli('hooks', 'status', '--runtime', 'both').returncode, 78)
 
     def test_claude_doctor_requires_disallowed_tools_support(self):
         self.claude.write_text('#!/bin/sh\ncase "$1" in\n--version) echo claude-code-old;;\n--help) echo "--bare --print --output-format --no-session-persistence --permission-mode --tools --allowedTools";;\nesac\n')

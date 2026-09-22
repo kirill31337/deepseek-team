@@ -105,14 +105,18 @@ class PolicyResolutionTests(RepoCase):
         settings.set_values(self.repo / settings.PROJECT_FILE, effort='auto')
         self.assertEqual(settings.resolve(self.repo).effort, 'auto')
 
-    def test_claude_instructions_label_process_as_instruction_driven(self):
+    def test_claude_instructions_require_runtime_specific_hook_protocol(self):
         policy = settings.resolve(self.repo, delegation_level=75, access='full-access')
         text = settings.instructions(policy, 'claude')
-        self.assertIn('instruction-driven', text)
+        self.assertIn('Claude PreToolUse', text)
+        self.assertIn('coordination plan', text)
+        self.assertIn('--runtime claude', text)
+        self.assertIn('--coord-task', text)
+        self.assertIn('coordination use', text)
         self.assertIn('native-agent', text)
         self.assertIn('Effort policy is auto', text)
-        self.assertIn('resolved effort policy', text)
-        self.assertNotIn('Claude PreToolUse gate', text)
+        self.assertIn('stop_hook_active', text)
+        self.assertNotIn('instruction-driven', text)
 
     def test_read_only_override_keeps_high_delegation_target_without_write_authority(self):
         policy = settings.resolve(self.repo, delegation_level=75, access='read-only')
