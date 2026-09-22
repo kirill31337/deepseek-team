@@ -61,17 +61,15 @@ The 25/50/75 delegation levels are policy for **how the coordinator distributes 
 - a per-run Unix-socket provider capability with a fixed DeepSeek destination and endpoint allowlist;
 - the real DeepSeek credential retained only in the host-side relay.
 
-The runtime may create/edit/delete arbitrary project files and run local tests/builds inside that copy. This is intentionally broader than the legacy exact-file writer, but publication, deployment, production services, secrets and Git integration/commits remain coordinator-owned.
+The runtime may create/edit/delete project files and run local tests/builds inside that copy. Publication, deployment, production services, secrets and Git integration/commits remain coordinator-owned.
 
 Owned workspaces are created from committed HEAD. Source dirty/untracked/ignored files are neither cleaned nor silently copied. Reopening a copy verifies its identity and Git administrative digest; another worker cannot take an active copy because an exclusive owner lock is required. A failed/interrupted copy is retained and cannot be resumed without explicit `--resume-after-failure`; no automatic implementation retry is performed over uncertain state.
-
-The legacy `--write --allow-write` path remains unchanged for users who want an exact file allowlist. It continues to use the older writer rules and does not gain test/build permission.
 
 Managed AGENTS.md/CLAUDE.md text describes the current policy but is not treated as containment. The worker and doctor independently resolve policy and verify the actual runtime/sandbox surface before access is granted.
 
 ## 0.3.0 — Bubblewrap + Ubuntu AppArmor (2026-09-16)
 
-DeepSeek Team now requires a usable Linux Bubblewrap backend before a worker reads the DeepSeek credential. There is no automatic unsandboxed fallback. An explicit `--os-sandbox off` exists only for diagnosis/legacy compatibility, prints a warning, and is never emitted by managed `AGENTS.md` / `CLAUDE.md` instructions.
+DeepSeek Team now requires a usable Linux Bubblewrap backend before a worker reads the DeepSeek credential. There is no automatic unsandboxed fallback. An explicit `--os-sandbox off` exists only for diagnosis, prints a warning, and is never emitted by managed `AGENTS.md` / `CLAUDE.md` instructions.
 
 ### Ubuntu user namespaces
 
@@ -87,7 +85,7 @@ The profile is intentionally unconfined for ordinary resources and grants `usern
 
 ### Codex: preserve the native Linux sandbox
 
-Current Codex on Linux already builds its own Bubblewrap sandbox. DeepSeek Team therefore does not put Codex inside a second user namespace. It probes a working direct/AppArmor-aware `bwrap` backend, creates a private temporary `bwrap` shim and places it first on the worker `PATH`. Codex then constructs its normal `read-only` / `workspace-write` sandbox through that verified executable.
+Current Codex on Linux already builds its own Bubblewrap sandbox. DeepSeek Team therefore does not put read-only Codex workers inside a second user namespace. It probes a working direct/AppArmor-aware `bwrap` backend, creates a private temporary `bwrap` shim and places it first on the worker `PATH`. Codex then constructs its native `read-only` sandbox through that verified executable.
 
 Because the AppArmor profile grants permission to create the **initial** user namespace, the private shim also guarantees Bubblewrap `--disable-userns` exactly once. If Codex already supplies the flag it is preserved without duplication; otherwise the shim injects it. This prevents processes inside the completed Codex sandbox from using the inherited AppArmor `userns` permission to create further user namespaces.
 
@@ -95,7 +93,7 @@ The shim contains only the executable/profile prefix and this fixed hardening ru
 
 ### Claude Code: outer Bubblewrap
 
-The isolated Claude worker harness runs inside an outer Bubblewrap namespace. The policy uses a read-only root, fresh user/PID/IPC/UTS namespaces, dropped capabilities, private temporary directories, a temporary writable worker HOME, and a worktree mounted read-only for review or read-write for writer mode. The real user HOME is hidden and only runtime roots needed to start the CLI are re-exposed read-only; common credential locations are then masked again. The outer sandbox passes `--disable-userns`, so the Claude payload cannot create another user namespace after setup.
+The isolated read-only Claude worker harness runs inside an outer Bubblewrap namespace. The policy uses a read-only root, fresh user/PID/IPC/UTS namespaces, dropped capabilities, private temporary directories, a temporary writable worker HOME, and a read-only worktree. The real user HOME is hidden and only runtime roots needed to start the CLI are re-exposed read-only; common credential locations are then masked again. The outer sandbox passes `--disable-userns`, so the Claude payload cannot create another user namespace after setup.
 
 The outer Claude policy intentionally keeps the host network namespace because the CLI must reach the DeepSeek API. This feature does not claim network isolation. Claude still exposes no Bash/web/agent tools to the worker and explicitly denies MCP tools.
 
@@ -103,17 +101,7 @@ The outer Claude policy intentionally keeps the host network namespace because t
 
 Bubblewrap/AppArmor significantly strengthen the host boundary, but this package is not a replacement for a separate OS user/container/VM for arbitrary hostile source trees. The worktree is intentionally visible to the worker, and runtime files required to start the coordinator can be exposed read-only. A secret committed or stored inside an allowed source tree should be treated as readable project data.
 
-`WriteScope` remains the authoritative result acceptance boundary for writer work: exact allowed paths, clean linked worktree, index/HEAD/branch checks, and rejected partial work preservation are unchanged.
-
 ## 0.1/0.2 — Git and output integrity (2026-09-15)
-
-### Writer verification
-
-Ordinary `git diff` can miss protected-file edits when index entries use `assume-unchanged` or `skip-worktree`, or when `core.filemode=false` hides an executable-bit change. Inherited `GIT_INDEX_FILE` can redirect verification to a different index. DeepSeek Team therefore uses a minimal Git environment, ignores inherited index/global/system overrides, forces executable-bit checks, and refuses nonstandard index flags before execution and before accepting a result.
-
-The linked-worktree `.git` pointer must not be a symlink/hardlink and must remain unchanged. Verification itself runs outside the model sandbox, so repository-configured `core.fsmonitor`, hooks, clean/process filters, external diff and textconv are disabled or refused as appropriate. Submodule index entries are refused rather than recursively inspected.
-
-Writer mode requires an ordinary, clean, full linked worktree on a `codex/` or `deepseek/` branch. It refuses repositories containing submodule entries, nonstandard index flags, or tracked/allowed files using locally configured external clean/process filters. Admission failures return 78; detected result violations return 73. Rejected/partial files are preserved for coordinator inspection.
 
 ### Runtime and output integrity
 
