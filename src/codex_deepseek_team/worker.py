@@ -21,6 +21,8 @@ import tomllib
 MODEL = 'deepseek-flash'
 CLAUDE_MODEL = 'deepseek-flash[1m]'
 CLAUDE_BASE_URL = 'https://api.deepseek.com/anthropic'
+EFFORT_LEVELS = ('low', 'medium', 'high')
+DEFAULT_EFFORT = 'medium'
 PROVIDER = {
     'name': 'DeepSeek', 'base_url': 'https://api.deepseek.com/',
     'env_key': 'DEEPSEEK_API_KEY', 'wire_api': 'responses',
@@ -65,6 +67,12 @@ RETRYABLE = re.compile(
 class WorkerError(Exception):
     def __init__(self, code, message):
         self.code, self.message = code, message
+
+
+def effort_level(value):
+    if value not in EFFORT_LEVELS:
+        raise WorkerError(64, 'DeepSeek effort must be low, medium or high.')
+    return value
 
 
 def codex_home():
@@ -163,8 +171,9 @@ def acquire_slot(state):
             os.close(directory)
 
 
-def child_environment(home, key, runtime='codex'):
+def child_environment(home, key, runtime='codex', effort=DEFAULT_EFFORT):
     """Build a minimal child environment without parent provider credentials."""
+    effort = effort_level(effort)
     common = ['PATH', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'TZ',
               'SSL_CERT_FILE', 'SSL_CERT_DIR']
     env = {name: os.environ[name] for name in common if name in os.environ}
@@ -184,7 +193,7 @@ def child_environment(home, key, runtime='codex'):
             ANTHROPIC_DEFAULT_SONNET_MODEL=CLAUDE_MODEL,
             ANTHROPIC_DEFAULT_HAIKU_MODEL=MODEL,
             CLAUDE_CODE_SUBAGENT_MODEL=MODEL,
-            CLAUDE_CODE_EFFORT_LEVEL='max',
+            CLAUDE_CODE_EFFORT_LEVEL=effort,
             CLAUDE_CODE_AUTO_COMPACT_WINDOW='786432',
             DISABLE_TELEMETRY='1',
             DISABLE_ERROR_REPORTING='1',
@@ -201,13 +210,14 @@ def transient_config(home):
     (home / 'config.toml').chmod(0o600)
 
 
-def _codex_command(binary, write_paths=()):
+def _codex_command(binary, write_paths=(), effort=DEFAULT_EFFORT):
+    effort = effort_level(effort)
     args = [binary, 'exec', '--strict-config', '--ephemeral', '--json',
             '--ignore-rules', '--color', 'never', '--sandbox',
             'workspace-write' if write_paths else 'read-only',
             '--model', MODEL, '-c', 'model_provider="deepseek"']
     overrides = {
-        'approval_policy': 'never', 'model_reasoning_effort': 'low',
+        'approval_policy': 'never', 'model_reasoning_effort': effort,
         'model_reasoning_summary': 'none', 'service_tier': 'default',
         'developer_instructions': INSTRUCTIONS, 'web_search': 'disabled',
         'history.persistence': 'none', 'analytics.enabled': False,
@@ -245,7 +255,8 @@ def _claude_edit_rule(name):
     return f'Edit(./{name})'
 
 
-def _claude_command(binary, write_paths=()):
+def _claude_command(binary, write_paths=(), effort=DEFAULT_EFFORT):
+    effort_level(effort)
     tools = 'Read,Glob,Grep,Edit,Write' if write_paths else 'Read,Glob,Grep'
     instructions = WRITE_INSTRUCTIONS if write_paths else INSTRUCTIONS
     if write_paths:
@@ -261,11 +272,11 @@ def _claude_command(binary, write_paths=()):
     return args
 
 
-def command(binary, write_paths=(), runtime='codex'):
+def command(binary, write_paths=(), runtime='codex', effort=DEFAULT_EFFORT):
     if runtime == 'codex':
-        return _codex_command(binary, write_paths)
+        return _codex_command(binary, write_paths, effort)
     if runtime == 'claude':
-        return _claude_command(binary, write_paths)
+        return _claude_command(binary, write_paths, effort)
     raise WorkerError(64, f'Unsupported worker runtime: {runtime}.')
 
 
@@ -470,13 +481,13 @@ def run_worker(args, scope):
             home = Path(directory)
             if runtime == 'codex':
                 transient_config(home)
-            env = child_environment(home, key, runtime)
+            env = child_environment(home, key, runtime, args.effort)
             if sandbox is not None and runtime == 'codex':
                 try:
                     env = sandbox.prepare_codex_environment(home, env, backend)
                 except sandbox.SandboxError as error:
                     raise WorkerError(error.code, error.message) from None
-            base_command = command(binary, args.allow_write, runtime)
+            base_command = command(binary, args.allow_write, runtime, args.effort)
             if sandbox is not None and runtime == 'claude':
                 try:
                     base_command = sandbox.wrap_command(
@@ -522,6 +533,8 @@ def parse_args():
                         help='CLI harness for the DeepSeek worker; default keeps legacy Codex behavior.')
     parser.add_argument('--os-sandbox', choices=['required', 'off'], default='required',
                         help='required: enforce Bubblewrap/AppArmor containment (default); off: explicit unsafe compatibility bypass.')
+    parser.add_argument('--effort', choices=EFFORT_LEVELS, default=DEFAULT_EFFORT,
+                        help='DeepSeek Flash reasoning effort. Managed coordinators should choose low/medium/high per assignment; default: medium.')
     parser.add_argument('--timeout', type=float, default=0,
                         help='0: wait without a total deadline (default); 1..900: explicit total limit in seconds, including retries.')
     parser.add_argument('--attempts', type=int, choices=[1, 2, 3],
