@@ -41,6 +41,8 @@ class PolicyResolutionTests(RepoCase):
                 self.assertEqual(policy.delegation_level, level)
                 self.assertEqual(policy.access, 'auto')
                 self.assertEqual(policy.effective_access, access)
+                self.assertEqual(policy.effort, 'auto')
+                self.assertEqual(policy.as_dict()['effort_mode'], 'frontier-auto')
                 self.assertTrue(policy.as_dict()['percentage_is_target_not_measurement'])
 
     def test_explicit_access_is_independent_of_level(self):
@@ -54,13 +56,15 @@ class PolicyResolutionTests(RepoCase):
         )
 
     def test_cli_project_global_default_precedence_and_sources(self):
-        settings.set_values(settings.global_file(), delegation_level=50, access='read-only')
-        settings.set_values(self.repo / settings.PROJECT_FILE, delegation_level=75, access='auto')
+        settings.set_values(settings.global_file(), delegation_level=50, access='read-only', effort='high')
+        settings.set_values(self.repo / settings.PROJECT_FILE, delegation_level=75, access='auto', effort='auto')
 
         project_policy = settings.resolve(self.repo)
-        self.assertEqual((project_policy.delegation_level, project_policy.access), (75, 'auto'))
+        self.assertEqual((project_policy.delegation_level, project_policy.access, project_policy.effort),
+                         (75, 'auto', 'auto'))
         self.assertTrue(project_policy.sources['delegation_level'].startswith('project:'))
         self.assertTrue(project_policy.sources['access'].startswith('project:'))
+        self.assertTrue(project_policy.sources['effort'].startswith('project:'))
 
         mixed = settings.resolve(self.repo, access='read-only')
         self.assertEqual(mixed.delegation_level, 75)
@@ -68,10 +72,12 @@ class PolicyResolutionTests(RepoCase):
         self.assertTrue(mixed.sources['delegation_level'].startswith('project:'))
         self.assertEqual(mixed.sources['access'], 'cli')
 
-        cli = settings.resolve(self.repo, delegation_level=25, access='full-access')
-        self.assertEqual((cli.delegation_level, cli.effective_access), (25, 'full-access'))
+        cli = settings.resolve(self.repo, delegation_level=25, access='full-access', effort='low')
+        self.assertEqual((cli.delegation_level, cli.effective_access, cli.effort),
+                         (25, 'full-access', 'low'))
         self.assertEqual(cli.sources['delegation_level'], 'cli')
         self.assertEqual(cli.sources['access'], 'cli')
+        self.assertEqual(cli.sources['effort'], 'cli')
 
     def test_codex_instructions_require_coordination_protocol_not_percentage_counting(self):
         policy = settings.resolve(self.repo, delegation_level=75, access='full-access')
@@ -82,9 +88,22 @@ class PolicyResolutionTests(RepoCase):
         self.assertIn('Codex PreToolUse', text)
         self.assertIn('Do not calculate an actual useful-work percentage', text)
         self.assertIn('deepseek-flash', text)
+        self.assertIn('Effort policy is auto', text)
         self.assertIn('--effort low', text)
         self.assertIn('native-agent', text)
         self.assertIn('delegation_reason', text)
+
+    def test_forced_effort_policy_is_persisted_and_removes_frontier_choice(self):
+        settings.set_values(self.repo / settings.PROJECT_FILE, effort='high')
+        policy = settings.resolve(self.repo)
+        self.assertEqual(policy.effort, 'high')
+        self.assertEqual(policy.as_dict()['effort_mode'], 'forced')
+        text = settings.instructions(policy, 'codex')
+        self.assertIn('persistently forced to high', text)
+        self.assertIn('--effort high', text)
+        self.assertNotIn('Effort policy is auto', text)
+        settings.set_values(self.repo / settings.PROJECT_FILE, effort='auto')
+        self.assertEqual(settings.resolve(self.repo).effort, 'auto')
 
     def test_claude_instructions_label_process_as_instruction_driven(self):
         policy = settings.resolve(self.repo, delegation_level=75, access='full-access')
@@ -114,7 +133,7 @@ class PolicyResolutionTests(RepoCase):
         with redirect_stdout(out):
             self.assertEqual(delegation_cli.main([
                 'config', 'set', '--project', '--path', str(self.repo),
-                '--delegation-level', '50', '--access', 'read-only',
+                '--delegation-level', '50', '--access', 'read-only', '--effort', 'high',
             ]), 0)
         with redirect_stdout(out := io.StringIO()):
             self.assertEqual(delegation_cli.main([
@@ -124,6 +143,7 @@ class PolicyResolutionTests(RepoCase):
         policy = settings.resolve(self.repo)
         self.assertEqual(policy.delegation_level, 75)
         self.assertEqual(policy.access, 'read-only')
+        self.assertEqual(policy.effort, 'high')
 
         with redirect_stdout(out := io.StringIO()):
             self.assertEqual(delegation_cli.main([
@@ -132,6 +152,8 @@ class PolicyResolutionTests(RepoCase):
         shown = json.loads(out.getvalue())
         self.assertEqual(shown['delegation_level'], 75)
         self.assertEqual(shown['effective_access'], 'read-only')
+        self.assertEqual(shown['effort'], 'high')
+        self.assertEqual(shown['effort_mode'], 'forced')
         self.assertIn('project:', shown['sources']['access'])
 
 
@@ -174,7 +196,7 @@ class LegacyCompatibilityTests(unittest.TestCase):
         self.assertIsNone(args.access)
         self.assertIsNone(args.delegation_level)
         self.assertEqual(args.attempts, 1)
-        self.assertEqual(args.effort, 'medium')
+        self.assertIsNone(args.effort)
 
     def test_conflicting_legacy_and_new_access_is_rejected(self):
         with self.assertRaises(SystemExit):
@@ -211,6 +233,7 @@ class DoctorPolicyTests(RepoCase):
         policy = doctor.resolve_policy(root=self.repo, delegation_level=50, access='auto')
         self.assertEqual(policy.delegation_level, 50)
         self.assertEqual(policy.effective_access, 'full-access')
+        self.assertEqual(policy.effort, 'auto')
 
     def test_doctor_reports_policy_and_checks_matching_runtime_surface(self):
         policy = settings.Policy(50, 'auto',
@@ -228,6 +251,7 @@ class DoctorPolicyTests(RepoCase):
         runtime_check.assert_called_once_with('claude', policy)
         self.assertIn('delegation_level: 50%', output.getvalue())
         self.assertIn('effective_access: full-access', output.getvalue())
+        self.assertIn('effort: auto', output.getvalue())
 
     def test_doctor_refuses_full_access_with_os_sandbox_off(self):
         policy = settings.Policy(75, 'full-access',
