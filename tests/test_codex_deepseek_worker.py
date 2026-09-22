@@ -231,7 +231,7 @@ wire_api = "responses"
         config = self.user / '.config/deepseek-team/config.toml'
         config.parent.mkdir(parents=True)
         config.write_text('effort = "high"\n')
-        r = self.run_worker()
+        r = self.run_worker(env={'XDG_CONFIG_HOME': str(self.user / '.config')})
         self.assertEqual(r.returncode, 0, r.stderr)
         c, = self.calls()
         self.assertIn('model_reasoning_effort="high"', c['args'])
