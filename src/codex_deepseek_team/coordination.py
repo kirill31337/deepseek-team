@@ -286,7 +286,12 @@ def plan_task(root: Path, task_id: str, plan: dict) -> dict:
                 ". Add a new deliverable id for revised scope.", 64)
         assignments = []
         for item in deliverables:
+            prior = previous.get(item["id"])
             if item["executor"] != "worker":
+                if prior and prior.get("status") != "planned":
+                    raise CoordinationError(
+                        "Plan revision cannot reassign a started/completed DeepSeek worker deliverable; "
+                        "add a new deliverable id for the native/coordinator scope.", 64)
                 continue
             if item["id"] in previous:
                 assignments.append(previous[item["id"]])
@@ -529,9 +534,16 @@ def summary(task: dict) -> str:
     ]
     for row in task.get("assignments", []):
         text = f"- {row['id']} deliverable={row['deliverable_id']} status={row['status']}"
+        if row.get("effort"):
+            text += f"; effort={row['effort']}"
         if row.get("result_summary"):
             text += f"; result={row['result_summary'][:500]}"
         if row.get("disposition"):
             text += f"; disposition={row['disposition']['kind']}: {row['disposition']['evidence'][:300]}"
         lines.append(text)
+    for item in task.get("deliverables", []):
+        if item.get("executor") == "native-agent":
+            reason = str(item.get("delegation_reason") or "")[:300]
+            lines.append(
+                f"- native-agent deliverable={item.get('id')} kind={item.get('kind')}; reason={reason}")
     return "\n".join(lines)
