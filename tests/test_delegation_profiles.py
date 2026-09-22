@@ -187,27 +187,18 @@ class ManagedRuntimeMountTests(RepoCase):
             self.assertNotEqual(root, self.home)
 
 
-class LegacyCompatibilityTests(unittest.TestCase):
+class RemovedLegacyWriterTests(unittest.TestCase):
     def parse(self, *argv):
         with mock.patch.object(sys, 'argv', ['deepseek-team worker', *argv]):
             return worker.parse_args()
 
-    def test_legacy_exact_file_writer_still_parses_without_new_settings(self):
-        args = self.parse('--write', '--allow-write', 'src/example.py', 'implement')
-        self.assertTrue(args.write)
-        self.assertEqual(args.allow_write, ['src/example.py'])
-        self.assertIsNone(args.access)
-        self.assertIsNone(args.delegation_level)
-        self.assertEqual(args.attempts, 1)
-        self.assertIsNone(args.effort)
-
-    def test_conflicting_legacy_and_new_access_is_rejected(self):
-        with self.assertRaises(SystemExit):
-            self.parse('--write', '--allow-write', 'src/example.py',
-                       '--access', 'full-access', 'implement')
-        with self.assertRaises(SystemExit):
-            self.parse('--write', '--allow-write', 'src/example.py',
-                       '--workspace', '0' * 32, 'implement')
+    def test_legacy_writer_flags_are_rejected(self):
+        for argv in [
+            ('--write', 'implement'),
+            ('--allow-write', 'src/example.py', 'implement'),
+        ]:
+            with self.subTest(argv=argv), self.assertRaises(SystemExit):
+                self.parse(*argv)
 
 
 class ManagedBlockTests(RepoCase):
