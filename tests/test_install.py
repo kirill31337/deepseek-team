@@ -25,9 +25,14 @@ class InstallTests(unittest.TestCase):
         for command in installer.COMMANDS:
             (path / 'bin' / command).write_text('entrypoint')
 
-    def test_install_and_repeat_publish_legacy_and_neutral_entrypoints(self):
+    def test_install_and_repeat_publish_legacy_and_neutral_entrypoints_without_codex(self):
+        calls = []
+        def run(args, **kwargs):
+            calls.append(list(args))
+            return subprocess.CompletedProcess(args, 0, '', '')
         with mock.patch.object(installer.venv.EnvBuilder, 'create', side_effect=self.simulate_venv), \
-                mock.patch.object(installer.subprocess, 'run') as run:
+                mock.patch.object(installer.shutil, 'which', return_value=None), \
+                mock.patch.object(installer.subprocess, 'run', side_effect=run):
             self.assertEqual(installer.main(self.args), 0)
             self.assertEqual(installer.main(self.args), 0)
         for command_name in installer.COMMANDS:
@@ -35,7 +40,12 @@ class InstallTests(unittest.TestCase):
             self.assertTrue(command.is_symlink())
             self.assertEqual(command.resolve(), self.prefix / 'venv/bin' / command_name)
         self.assertEqual({p.name for p in self.bin.iterdir()}, set(installer.COMMANDS))
-        self.assertEqual(run.call_count, 2)
+
+        python = str(self.prefix / 'venv/bin/python')
+        expected_pip = [python, '-m', 'pip', 'install', '--upgrade',
+                        str(Path(installer.__file__).resolve().parent)]
+        self.assertEqual(calls, [expected_pip, expected_pip])
+        self.assertFalse(any('hooks' in call for call in calls))
 
     def test_with_sandbox_is_explicit_and_runs_ubuntu_system_setup_after_install(self):
         calls = []
@@ -44,6 +54,7 @@ class InstallTests(unittest.TestCase):
             return subprocess.CompletedProcess(args, 0, '', '')
         with mock.patch.object(installer.venv.EnvBuilder, 'create', side_effect=self.simulate_venv), \
              mock.patch.object(installer, 'is_ubuntu', return_value=True, create=True), \
+             mock.patch.object(installer.shutil, 'which', return_value=None), \
              mock.patch.object(installer.subprocess, 'run', side_effect=run):
             self.assertEqual(installer.main([*self.args, '--with-sandbox']), 0)
         pip = str(self.prefix / 'venv/bin/python')
@@ -53,7 +64,7 @@ class InstallTests(unittest.TestCase):
         self.assertIn([team, 'sandbox', 'install-apparmor'], calls)
         self.assertIn([team, 'sandbox', 'status'], calls)
 
-    def test_standard_install_with_codex_installs_stable_coordination_hooks(self):
+    def test_standard_install_with_codex_runs_pip_then_installs_coordination_hooks(self):
         calls = []
         def run(args, **kwargs):
             calls.append(list(args))
@@ -62,10 +73,15 @@ class InstallTests(unittest.TestCase):
              mock.patch.object(installer.shutil, 'which', return_value='/usr/bin/codex'), \
              mock.patch.object(installer.subprocess, 'run', side_effect=run):
             self.assertEqual(installer.main(self.args), 0)
-        team = str(self.prefix / 'venv/bin/deepseek-team')
-        self.assertIn([team, 'hooks', 'install'], calls)
 
-    def test_repeat_upgrade_reinstalls_same_hook_definition_without_project_scan(self):
+        python = str(self.prefix / 'venv/bin/python')
+        team = str(self.prefix / 'venv/bin/deepseek-team')
+        expected_pip = [python, '-m', 'pip', 'install', '--upgrade',
+                        str(Path(installer.__file__).resolve().parent)]
+        expected_hooks = [team, 'hooks', 'install']
+        self.assertEqual(calls, [expected_pip, expected_hooks])
+
+    def test_repeat_upgrade_with_codex_repeats_pip_and_same_hook_install_only(self):
         calls = []
         def run(args, **kwargs):
             calls.append(list(args))
@@ -75,9 +91,16 @@ class InstallTests(unittest.TestCase):
              mock.patch.object(installer.subprocess, 'run', side_effect=run):
             self.assertEqual(installer.main(self.args), 0)
             self.assertEqual(installer.main(self.args), 0)
+
+        python = str(self.prefix / 'venv/bin/python')
         team = str(self.prefix / 'venv/bin/deepseek-team')
-        hook_calls = [call for call in calls if call == [team, 'hooks', 'install']]
-        self.assertEqual(len(hook_calls), 2)
+        expected_pip = [python, '-m', 'pip', 'install', '--upgrade',
+                        str(Path(installer.__file__).resolve().parent)]
+        expected_hooks = [team, 'hooks', 'install']
+        self.assertEqual(
+            calls,
+            [expected_pip, expected_hooks, expected_pip, expected_hooks],
+        )
         flattened = '\n'.join(' '.join(call) for call in calls)
         self.assertNotIn(' init ', flattened)
         self.assertNotIn('find ', flattened)
@@ -88,6 +111,7 @@ class InstallTests(unittest.TestCase):
             calls.append(list(args))
             return subprocess.CompletedProcess(args, 0, '', '')
         with mock.patch.object(installer.venv.EnvBuilder, 'create', side_effect=self.simulate_venv), \
+             mock.patch.object(installer.shutil, 'which', return_value=None), \
              mock.patch.object(installer.subprocess, 'run', side_effect=run):
             self.assertEqual(installer.main(self.args), 0)
         flattened = '\n'.join(' '.join(call) for call in calls)
@@ -147,6 +171,7 @@ class InstallTests(unittest.TestCase):
                 if partial is not None:
                     marker.write_text(partial)
                 with mock.patch.object(installer.venv.EnvBuilder, 'create', side_effect=self.simulate_venv), \
+                        mock.patch.object(installer.shutil, 'which', return_value=None), \
                         mock.patch.object(installer.subprocess, 'run'):
                     self.assertEqual(installer.main(self.args), 0)
                 self.assertEqual(marker.read_text(), installer.OWNER)
@@ -155,6 +180,7 @@ class InstallTests(unittest.TestCase):
 
     def test_equivalent_prefix_and_relative_command_links_allow_update(self):
         with mock.patch.object(installer.venv.EnvBuilder, 'create', side_effect=self.simulate_venv), \
+                mock.patch.object(installer.shutil, 'which', return_value=None), \
                 mock.patch.object(installer.subprocess, 'run'):
             self.assertEqual(installer.main(self.args), 0)
             for command_name in installer.COMMANDS:
