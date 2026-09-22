@@ -2,7 +2,7 @@
 
 **English** | [Русский](README.ru.md)
 
-One Linux package for **Codex and/or Claude Code coordinators** delegating bounded coding work to DeepSeek workers. The current source supports configurable **25/50/75% delegation profiles**, independent `read-only/full-access` policy, reusable isolated development copies, and the legacy exact-file writer.
+One Linux package for **Codex and/or Claude Code coordinators** delegating bounded coding work to DeepSeek workers. The current source supports configurable **25/50/75% delegation profiles**, independent `read-only/full-access` policy, and reusable isolated development copies.
 
 **The coordinator owns:** scope, architecture, security decisions, final diff review, integration, commits and production actions. **DeepSeek contributes:** focused research/review and, when full-access is selected, independent implementation, local tests/builds and documentation inside a dedicated copy. DeepSeek workers stay on `deepseek-flash`; effort defaults to `auto`, so the frontier coordinator chooses `low`/`medium`/`high` per assignment unless a persistent forced effort is configured. Codex/Claude may also use their own native subagents when they can state a concrete reason for doing so; native subagents complement rather than replace required DeepSeek assignments. The coordinator should verify useful evidence instead of automatically repeating the whole delegated investigation or rewriting correct code.
 
@@ -134,13 +134,13 @@ There is no automatic unsandboxed fallback.
 
 ## Isolation modes
 
-The existing read-only and legacy exact-file writer paths retain their hybrid runtime-specific boundary. Managed development copies used by the new full-access mode use a stricter sparse outer Bubblewrap boundary for **both** runtimes.
+Read-only workers retain their runtime-specific boundary. Managed development copies used by full-access use a stricter sparse outer Bubblewrap boundary for **both** runtimes.
 
-### Legacy/read-only runtime boundary
+### Read-only runtime boundary
 
 ### Codex worker
 
-Current Codex on Linux already has its own Bubblewrap-backed `read-only` / `workspace-write` sandbox. Nesting Codex inside another Bubblewrap namespace with further user-namespace creation disabled would break that native sandbox.
+Current Codex on Linux already has its own Bubblewrap-backed sandbox. Nesting Codex inside another Bubblewrap namespace with further user-namespace creation disabled would break that native sandbox.
 
 DeepSeek Team therefore:
 
@@ -148,8 +148,7 @@ DeepSeek Team therefore:
 - creates a private temporary `bwrap` shim inside the worker session;
 - puts that shim first on the worker `PATH`;
 - lets **Codex itself** build its normal Linux sandbox using that verified `bwrap` path;
-- retains the existing Codex `read-only` / `workspace-write` policy and writer network restrictions;
-- runs the shared Git `WriteScope` verifier before accepting a writer result.
+- keeps the delegated read-only job under Codex's native `read-only` policy.
 
 The parent Codex auth/history/rules/plugins/apps/memories are not copied; the worker receives a temporary `HOME`/`CODEX_HOME` and only the DeepSeek provider configuration it needs.
 
@@ -164,22 +163,22 @@ Claude Code does not provide the same native Linux Bubblewrap boundary for these
 - real user HOME masked, with only runtime roots needed to start the CLI re-exposed read-only;
 - common credential stores masked again after runtime mounts;
 - temporary worker HOME writable;
-- repository/worktree mounted read-only for review or read-write for writer mode;
+- repository/worktree mounted read-only;
 - `--disable-userns` prevents the worker payload from creating another user namespace.
 
-Claude itself still runs `--bare`, with no session persistence. Built-in tools are restricted to `Read,Glob,Grep` for review and `Read,Glob,Grep,Edit,Write` for writer work; Bash, web tools and agents are absent, MCP tools are explicitly denied, and writer approval rules are path-scoped `Edit(./exact/file)` entries.
+Claude itself still runs `--bare`, with no session persistence. Built-in tools are restricted to `Read,Glob,Grep`; Bash, web tools and agents are absent, and MCP tools are explicitly denied.
 
 ### Managed full-access boundary
 
-Managed development copies are not the legacy writer sandbox. For both Codex and Claude, DeepSeek Team surrounds the runtime with a sparse Bubblewrap namespace that exposes only the owned working copy, required runtime prefixes, a temporary HOME and a per-run control directory. Git administrative files are remounted read-only. The namespace uses `--unshare-net`; the worker cannot reach arbitrary host/network services.
+For both Codex and Claude, DeepSeek Team surrounds managed development copies with a sparse Bubblewrap namespace that exposes only the owned working copy, required runtime prefixes, a temporary HOME and a per-run control directory. Git administrative files are remounted read-only. The namespace uses `--unshare-net`; the worker cannot reach arbitrary host/network services.
 
 DeepSeek API access is provided only through a fixed-destination host relay connected to the namespace through a per-run Unix socket and namespace-local loopback bridge. The real provider credential stays in the host-side relay; the isolated runtime sees only a synthetic local credential. The relay is not a general proxy and accepts only the provider endpoints needed by the supported runtime protocols.
 
 Full-access therefore means **full development access to the assigned copy**, not full host access. It does not grant access to the user's other checkouts, dirty source checkout, secrets, production databases, system services, deployment credentials, publishing or Git integration/commits.
 
-### Legacy network boundary
+### Read-only network boundary
 
-The legacy Claude review/exact-file path still must reach DeepSeek directly, so that older outer Claude sandbox intentionally does **not** unshare the network namespace. Network-facing model tools remain excluded by the Claude tool surface, while legacy Codex keeps its own sandbox/network policy.
+The read-only Claude worker must reach DeepSeek directly, so its outer sandbox intentionally does **not** unshare the network namespace. Network-facing model tools remain excluded by the Claude tool surface, while Codex keeps its own native sandbox/network policy.
 
 ## DeepSeek credential
 
@@ -384,32 +383,6 @@ A successful modified workspace can be reused for another iteration. If executio
 
 Up to three workers may run concurrently. Each full-access assignment owns a separate copy and lock; one worker cannot see another worker's copy or the user's source checkout. The coordinator remains responsible for final review, integration, committing, pushing and deployment.
 
-## Legacy exact-file writer
-
-The pre-existing `--write --allow-write` mode remains available when a precise file allowlist is desired. It keeps the clean linked-worktree requirement, forbids worker-run tests/builds, and verifies the exact allowed paths after execution. It is intentionally narrower than managed full-access and cannot be combined with `--access` or `--workspace`.
-
-
-Start from a committed baseline and use a **clean linked worktree** on a dedicated `codex/` or `deepseek/` branch:
-
-```bash
-git worktree add -b deepseek/parser-fix ../project-deepseek-parser HEAD
-cd ../project-deepseek-parser
-
-deepseek-team worker --runtime claude --write \
-  --allow-write src/parser.py \
-  --allow-write tests/test_parser.py <<'TASK'
-Implement the agreed empty-input behavior and add a focused regression test.
-Modify only the allowed files. Do not run tests/builds or touch Git state.
-Return a brief summary, risks and suggested checks.
-TASK
-```
-
-The same writer flow works with `--runtime codex`.
-
-The writer gets one attempt, one owner per file, exact allowed paths, a per-worktree lock and post-run Git verification. Hidden/credential targets, symlinks, hardlinks, unsafe index state and unsupported Git filter/submodule configurations are rejected. The verifier checks tracked, untracked and ignored changes plus index, HEAD, branch and the linked-worktree Git pointer. Failed/rejected runs may leave partial work for coordinator inspection; DeepSeek Team never silently resets it.
-
-**The coordinator must inspect the actual diff/new files, run meaningful tests, and integrate.** Workers never stage, commit, push or deploy. Writers never retry automatically after partial edits.
-
 ## Sandbox commands
 
 ```bash
@@ -430,9 +403,9 @@ This prints a warning and deliberately bypasses the new OS-layer requirement. It
 
 ## Reliability and security boundaries
 
-- At most three workers share user-level locks; writer work also has a per-worktree lock.
+- At most three workers share user-level locks; managed workspaces additionally use ownership locks.
 - Default total timeout is `0` (unlimited). A slow/silent worker is not treated as failed.
-- Read-only transient failures can retry within the configured bounded attempt count. Writers use exactly one attempt.
+- Read-only transient failures can retry within the configured bounded attempt count. Managed full-access uses one attempt; partial work is retained and continuation requires explicit `--resume-after-failure`.
 - Worker output must be a completed structured result. Malformed JSON, invalid UTF-8, terminal failure events and empty successful answers are rejected.
 - `DEEPSEEK_TEAM_DISABLED=1` disables delegation. `CODEX_DEEPSEEK_DISABLED=1` remains supported for compatibility.
 - DeepSeek/model names in prompts are requested configuration, not proof of the remotely served model; `doctor --live` performs the available routing probe.
@@ -493,7 +466,7 @@ Uninstall the Python package with your package manager, or remove the installer-
 
 ## Scope
 
-This release remains **Linux-only**. Windows support is deliberately deferred rather than weakening writer guarantees.
+This release remains **Linux-only**. Windows support is deliberately deferred rather than weakening worker isolation guarantees.
 
 ## License
 

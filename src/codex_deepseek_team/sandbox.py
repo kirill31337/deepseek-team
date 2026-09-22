@@ -212,7 +212,7 @@ def _runtime_roots(command: list[str], env: dict[str, str], real_home: Path,
 
 
 def wrap_command(command: list[str], *, cwd: Path, session_home: Path,
-                 writable: bool, env: dict[str, str], backend: SandboxBackend,
+                 env: dict[str, str], backend: SandboxBackend,
                  real_home: Path | None = None,
                  existing: Callable[[Path], bool] | None = None,
                  is_dir: Callable[[Path], bool] | None = None) -> list[str]:
@@ -275,8 +275,7 @@ def wrap_command(command: list[str], *, cwd: Path, session_home: Path,
     if existing(Path('/var/tmp')):
         args += ['--tmpfs', '/var/tmp']
 
-    mount = '--bind' if writable else '--ro-bind'
-    args += [mount, str(cwd), str(cwd), '--chdir', str(cwd), '--', *command]
+    args += ['--ro-bind', str(cwd), str(cwd), '--chdir', str(cwd), '--', *command]
     return args
 
 

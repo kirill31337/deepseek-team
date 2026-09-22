@@ -34,7 +34,7 @@ class WorkerOsSandboxTests(unittest.TestCase):
     def make_args(self, root, **overrides):
         values = dict(
             runtime='claude', codex='codex', claude='claude', os_sandbox='required',
-            write=False, allow_write=[], task='bounded task', state_dir=Path(root) / 'state',
+            task='bounded task', state_dir=Path(root) / 'state',
             timeout=0, attempts=1,
         )
         values.update(overrides)
@@ -49,7 +49,7 @@ class WorkerOsSandboxTests(unittest.TestCase):
                                    side_effect=worker.WorkerError(78, 'sandbox unavailable')), \
                  mock.patch.object(worker, 'load_api_key', side_effect=AssertionError('key read too early')) as key:
                 with self.assertRaises(worker.WorkerError) as caught:
-                    worker.run_worker(args, None)
+                    worker.run_worker(args)
             self.assertEqual(caught.exception.code, 78)
             key.assert_not_called()
 
@@ -66,31 +66,14 @@ class WorkerOsSandboxTests(unittest.TestCase):
                  mock.patch.object(worker, 'acquire_slot', return_value=fd), \
                  mock.patch.object(worker, 'execute', return_value=(0, '{"type":"result","is_error":false,"result":"ok"}', '')) as execute:
                 with mock.patch('sys.stdout', new=io.StringIO()):
-                    code = worker.run_worker(args, None)
+                    code = worker.run_worker(args)
             self.assertEqual(code, 0)
             self.assertEqual(len(fake.wrap_calls), 1)
             wrapped_command, kwargs = fake.wrap_calls[0]
             self.assertEqual(wrapped_command[0], '/usr/bin/claude')
-            self.assertFalse(kwargs['writable'])
+            self.assertNotIn('writable', kwargs)
             self.assertEqual(execute.call_args.args[0][:3], ['/usr/bin/bwrap', '--', '/usr/bin/claude'])
             self.assertEqual(fake.codex_calls, [])
-
-    def test_claude_writer_marks_outer_worktree_writable(self):
-        fake = FakeSandboxModule()
-        backend = object()
-        with tempfile.TemporaryDirectory() as directory:
-            args = self.make_args(directory, write=True, allow_write=['src/a.py'])
-            fd = os.open(os.devnull, os.O_RDONLY)
-            self.addCleanup(lambda: _safe_close(fd))
-            with mock.patch.object(worker, 'resolve_runtime', return_value=('claude', '/usr/bin/claude')), \
-                 mock.patch.object(worker, 'resolve_os_sandbox', create=True, return_value=(fake, backend)), \
-                 mock.patch.object(worker, 'load_api_key', return_value='KEY'), \
-                 mock.patch.object(worker, 'acquire_slot', return_value=fd), \
-                 mock.patch.object(worker, 'execute', return_value=(0, '{"type":"result","is_error":false,"result":"ok"}', '')):
-                with mock.patch('sys.stdout', new=io.StringIO()):
-                    code = worker.run_worker(args, None)
-            self.assertEqual(code, 0)
-            self.assertTrue(fake.wrap_calls[0][1]['writable'])
 
     def test_codex_uses_native_sandbox_with_prepared_bwrap_environment(self):
         fake = FakeSandboxModule()
@@ -106,7 +89,7 @@ class WorkerOsSandboxTests(unittest.TestCase):
                  mock.patch.object(worker, 'acquire_slot', return_value=fd), \
                  mock.patch.object(worker, 'execute', return_value=(0, '{"type":"turn.completed"}\n{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}', '')) as execute:
                 with mock.patch('sys.stdout', new=io.StringIO()):
-                    code = worker.run_worker(args, None)
+                    code = worker.run_worker(args)
             self.assertEqual(code, 0)
             self.assertEqual(fake.wrap_calls, [])
             self.assertEqual(len(fake.codex_calls), 1)
