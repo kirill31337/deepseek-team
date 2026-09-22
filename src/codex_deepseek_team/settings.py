@@ -256,7 +256,7 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
             'before coordinator source edits, submit a concrete JSON distribution with '
             '`deepseek-team coordination plan --task TASK_ID`; include deliverable id/kind/scope, '
             'executor, acceptance criteria, dependencies and checks. Run each worker assignment with '
-            '`deepseek-team worker --runtime codex --effort LOW|MEDIUM|HIGH --coord-task TASK_ID --coord-assignment ASSIGNMENT_ID`. '
+            '`deepseek-team worker --runtime codex --effort medium --coord-task TASK_ID --coord-assignment ASSIGNMENT_ID`, replacing `medium` with `low` or `high` when appropriate. '
             'The runner records start/result/workspace/checks automatically. After reviewing a result, '
             'record its use with `deepseek-team coordination use ...`. New substantial scope requires '
             'a revised plan. Codex PreToolUse technically blocks source mutation while the distribution '
@@ -274,5 +274,5 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
     return (f'### Effective delegation profile: {policy.delegation_level}% / {policy.effective_access}\n'
             + common + guidance + '\n' + access + process
             + 'While a worker runs, work only on independent scope. Review the actual diff and recorded '
-            'checks without repeating the whole investigation or rewriting correct code. Workers never '
+            'checks without repeating the whole investigation or rewriting correct code. DeepSeek workers never '
             'stage, commit, push, publish, deploy, access production services or delegate.\n')
