@@ -1,4 +1,4 @@
-![DeepSeek Team banner](assets/deepseek-team-banner.jpg)
+![DeepSeek Team banner](assets/deepseek-team-banner-4b37ec05.jpg)
 
 # DeepSeek Team
 
