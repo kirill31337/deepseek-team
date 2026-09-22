@@ -2,7 +2,7 @@
 
 [English](README.md) | **Русский**
 
-Один Linux-пакет для **координаторов Codex и/или Claude Code**, которые делегируют ограниченные задачи по разработке воркерам DeepSeek. Текущая версия поддерживает настраиваемые **профили делегирования 25/50/75%**, независимую политику `read-only/full-access`, переиспользуемые изолированные рабочие копии и устаревший режим точечной записи в заранее разрешённые файлы.
+Один Linux-пакет для **координаторов Codex и/или Claude Code**, которые делегируют ограниченные задачи по разработке воркерам DeepSeek. Текущая версия поддерживает настраиваемые **профили делегирования 25/50/75%**, независимую политику `read-only/full-access` и переиспользуемые изолированные рабочие копии.
 
 **Координатор отвечает за:** границы задачи, архитектуру, решения по безопасности, финальную проверку diff, интеграцию, коммиты и действия в production. **DeepSeek выполняет:** сфокусированные исследования/ревью, а при выбранном full-access — независимую реализацию, локальные тесты/сборки и документацию внутри отдельной рабочей копии. Воркеры DeepSeek всегда используют `deepseek-flash`; effort по умолчанию равен `auto`, поэтому frontier-координатор выбирает `low`/`medium`/`high` отдельно для каждого задания, если только не настроено принудительное сохраняемое значение effort. Codex/Claude также могут использовать собственных нативных субагентов, если могут указать конкретную причину; нативные субагенты дополняют, а не заменяют обязательные задания DeepSeek. Координатор должен проверять полезные результаты, а не автоматически повторять всё делегированное исследование или переписывать корректный код.
 
@@ -136,13 +136,13 @@ profile deepseek-team-bwrap flags=(unconfined) {
 
 ## Режимы изоляции
 
-Существующие read-only и legacy exact-file writer режимы сохраняют гибридную границу, зависящую от runtime. Управляемые рабочие копии нового full-access режима используют более строгую разреженную внешнюю Bubblewrap-границу для **обоих** runtime.
+Read-only воркеры сохраняют границу, зависящую от runtime. Управляемые рабочие копии full-access используют более строгую разреженную внешнюю Bubblewrap-границу для **обоих** runtime.
 
-### Legacy/read-only граница runtime
+### Граница read-only runtime
 
 ### Воркер Codex
 
-Текущий Codex в Linux уже имеет собственный Bubblewrap-backed sandbox `read-only` / `workspace-write`. Если вложить Codex в ещё один Bubblewrap namespace и запретить создание дополнительных user namespace, его нативный sandbox сломается.
+Текущий Codex в Linux уже имеет собственный Bubblewrap-backed sandbox. Если вложить Codex в ещё один Bubblewrap namespace и запретить создание дополнительных user namespace, его нативный sandbox сломается.
 
 Поэтому DeepSeek Team:
 
@@ -150,8 +150,7 @@ profile deepseek-team-bwrap flags=(unconfined) {
 - создаёт приватный временный shim `bwrap` внутри worker-сессии;
 - ставит этот shim первым в `PATH` воркера;
 - позволяет **самому Codex** создать обычный Linux sandbox через проверенный путь `bwrap`;
-- сохраняет существующую политику Codex `read-only` / `workspace-write` и сетевые ограничения writer;
-- запускает общий Git-верификатор `WriteScope` перед принятием результата writer.
+- оставляет делегированную read-only задачу под нативной политикой Codex `read-only`.
 
 Родительские Codex auth/history/rules/plugins/apps/memories не копируются; воркер получает временные `HOME`/`CODEX_HOME` и только необходимую конфигурацию DeepSeek provider.
 
@@ -166,22 +165,22 @@ Claude Code не предоставляет аналогичную нативн�
 - настоящий HOME пользователя скрыт, а необходимые runtime-пути для запуска CLI повторно доступны только на чтение;
 - распространённые credential stores снова маскируются после runtime-mounts;
 - временный HOME воркера доступен на запись;
-- repository/worktree монтируется read-only для review либо read-write для writer;
+- repository/worktree монтируется read-only;
 - `--disable-userns` запрещает worker payload создавать ещё один user namespace.
 
-Сам Claude по-прежнему запускается с `--bare` без сохранения сессии. Встроенные инструменты ограничены `Read,Glob,Grep` для review и `Read,Glob,Grep,Edit,Write` для writer; Bash, web-инструменты и agents отсутствуют, MCP-инструменты явно запрещены, а правила approval для writer ограничены путями вида `Edit(./exact/file)`.
+Сам Claude по-прежнему запускается с `--bare` без сохранения сессии. Встроенные инструменты ограничены `Read,Glob,Grep`; Bash, web-инструменты и agents отсутствуют, а MCP-инструменты явно запрещены.
 
 ### Граница managed full-access
 
-Управляемые development-копии — не legacy writer sandbox. И для Codex, и для Claude DeepSeek Team окружает runtime разреженным Bubblewrap namespace, который открывает только принадлежащую пакету рабочую копию, необходимые runtime-префиксы, временный HOME и per-run control directory. Административные Git-файлы перемонтируются read-only. Namespace использует `--unshare-net`; воркер не может обращаться к произвольным сервисам хоста или сети.
+И для Codex, и для Claude DeepSeek Team окружает управляемые development-копии разреженным Bubblewrap namespace, который открывает только принадлежащую пакету рабочую копию, необходимые runtime-префиксы, временный HOME и per-run control directory. Административные Git-файлы перемонтируются read-only. Namespace использует `--unshare-net`; воркер не может обращаться к произвольным сервисам хоста или сети.
 
 Доступ к DeepSeek API предоставляется только через host-relay с фиксированным назначением, подключённый к namespace через per-run Unix socket и namespace-local loopback bridge. Настоящий provider credential остаётся в relay на стороне хоста; изолированный runtime видит только синтетический локальный credential. Relay не является универсальным proxy и принимает только provider endpoints, необходимые поддерживаемым runtime-протоколам.
 
 Таким образом, full-access означает **полный доступ разработчика к назначенной копии**, а не полный доступ к хосту. Он не открывает другие checkout пользователя, dirty source checkout, secrets, production-базы, системные сервисы, deployment credentials, публикацию или Git integration/commits.
 
-### Legacy-сетевая граница
+### Сетевая граница read-only
 
-Legacy-путь Claude для review/exact-file всё ещё должен обращаться к DeepSeek напрямую, поэтому старый внешний Claude sandbox намеренно **не** делает unshare network namespace. Сетевые model tools при этом исключены из Claude tool surface, а legacy Codex сохраняет собственную sandbox/network политику.
+Read-only воркер Claude должен обращаться к DeepSeek напрямую, поэтому его внешний sandbox намеренно **не** делает unshare network namespace. Сетевые model tools при этом исключены из Claude tool surface, а Codex сохраняет собственную нативную sandbox/network политику.
 
 ## DeepSeek credential
 
@@ -386,31 +385,6 @@ deepseek-team workspace diff WORKSPACE_ID
 
 Одновременно могут работать до трёх воркеров. Каждый full-access assignment получает отдельную копию и lock; один воркер не видит копию другого и исходный checkout пользователя. Координатор остаётся ответственным за финальное ревью, интеграцию, commit, push и deployment.
 
-## Legacy exact-file writer
-
-Существующий режим `--write --allow-write` остаётся доступен, когда нужен точный allowlist файлов. Он сохраняет требование чистого linked worktree, запрещает worker-run tests/builds и после выполнения проверяет точные разрешённые пути. Это намеренно более узкий режим, чем managed full-access, и его нельзя сочетать с `--access` или `--workspace`.
-
-Начните с закоммиченной базы и используйте **чистый linked worktree** на отдельной ветке `codex/` или `deepseek/`:
-
-~~~bash
-git worktree add -b deepseek/parser-fix ../project-deepseek-parser HEAD
-cd ../project-deepseek-parser
-
-deepseek-team worker --runtime claude --write \
-  --allow-write src/parser.py \
-  --allow-write tests/test_parser.py <<'TASK'
-Implement the agreed empty-input behavior and add a focused regression test.
-Modify only the allowed files. Do not run tests/builds or touch Git state.
-Return a brief summary, risks and suggested checks.
-TASK
-~~~
-
-Тот же writer-flow работает с `--runtime codex`.
-
-Writer получает одну попытку, одного владельца на файл, точные разрешённые пути, per-worktree lock и post-run Git verification. Hidden/credential targets, symlinks, hardlinks, unsafe index state и неподдерживаемые Git filter/submodule конфигурации отклоняются. Верификатор проверяет tracked, untracked и ignored изменения, а также index, HEAD, branch и Git pointer linked worktree. Неудачные/отклонённые запуски могут оставить частичную работу для проверки координатором; DeepSeek Team никогда молча её не сбрасывает.
-
-**Координатор обязан проверить фактический diff/новые файлы, запустить осмысленные тесты и выполнить интеграцию.** Воркеры никогда не stage/commit/push/deploy. Writers никогда автоматически не повторяют попытку после частичных изменений.
-
 ## Команды sandbox
 
 ~~~bash
@@ -431,9 +405,9 @@ deepseek-team worker --os-sandbox off ...
 
 ## Надёжность и границы безопасности
 
-- Не более трёх воркеров используют общие user-level locks; writer также имеет per-worktree lock.
+- Не более трёх воркеров используют общие user-level locks; управляемые workspaces дополнительно используют ownership locks.
 - Total timeout по умолчанию равен `0` (без ограничения). Медленный/молчащий воркер не считается упавшим.
-- Read-only transient failures могут повторяться в пределах настроенного числа попыток. Writers используют ровно одну попытку.
+- Read-only transient failures могут повторяться в пределах настроенного числа попыток. Managed full-access использует одну попытку; частичная работа сохраняется, а продолжение требует явного `--resume-after-failure`.
 - Результат воркера должен быть завершённым структурированным результатом. Malformed JSON, invalid UTF-8, terminal failure events и пустые успешные ответы отклоняются.
 - `DEEPSEEK_TEAM_DISABLED=1` отключает делегирование. `CODEX_DEEPSEEK_DISABLED=1` сохраняется для совместимости.
 - Имена DeepSeek/моделей в prompts — это запрошенная конфигурация, а не доказательство реально обслуживаемой удалённой модели; `doctor --live` выполняет доступную проверку routing.
@@ -494,7 +468,7 @@ deepseek-team sandbox remove-apparmor
 
 ## Область поддержки
 
-Текущий релиз остаётся **только для Linux**. Поддержка Windows сознательно отложена, чтобы не ослаблять гарантии writer.
+Текущий релиз остаётся **только для Linux**. Поддержка Windows сознательно отложена, чтобы не ослаблять гарантии изоляции воркеров.
 
 ## Лицензия
 
