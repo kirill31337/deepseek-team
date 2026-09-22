@@ -18,12 +18,16 @@ user-namespace restrictions to make delegation pass.
 ### Model, effort and native subagents
 
 DeepSeek Team workers always use **`deepseek-flash`**. Do not route to another DeepSeek
-model. For every DeepSeek assignment, the frontier coordinator should choose the effort
-automatically from the actual delegated scope and pass `--effort low|medium|high`: use
-`low` for short/mechanical or broad read-only scans, `medium` for ordinary implementation
-and analysis, and `high` for difficult debugging, cross-file reasoning, security-sensitive
-review or adversarial verification. If uncertain, use `medium`. Do not ask the user to
-choose routine effort levels.
+model. Resolve the current effort policy with the effective config before assigning work.
+The default is `effort=auto`: in that mode the frontier coordinator chooses the effort
+from the actual delegated scope and passes `--effort low|medium|high` (`low` for bounded
+or mechanical work, `medium` for the normal case, `high` for difficult debugging,
+cross-file reasoning, security-sensitive review or adversarial verification). If the
+resolved policy is explicitly `low`, `medium` or `high`, treat it as the saved forced
+level for new DeepSeek jobs and do not auto-select another value. `config set` can persist
+that choice per project or globally, and setting it back to `auto` restores frontier
+selection. A direct worker launched while policy is auto falls back to `medium` only when
+no frontier-selected concrete effort reaches the runner.
 
 The coordinator may also use its own **native subagents** when this materially improves
 parallelism, isolated context, independent verification, or access to a native capability.
