@@ -94,7 +94,8 @@ def handle(payload: dict) -> dict:
         policy = settings.resolve(root)
         base = (
             f"DeepSeek Team effective profile: {policy.delegation_level}%/"
-            f"{policy.effective_access}. Codex lifecycle enforcement is active for this "
+            f"{policy.effective_access}; effort={policy.effort}. "
+            "Codex lifecycle enforcement is active for this "
             "explicitly attached project. "
         )
         if task:
