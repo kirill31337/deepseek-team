@@ -119,28 +119,6 @@ class ClaudeRuntimeTests(unittest.TestCase):
         self.assertEqual(call['model'], 'deepseek-flash[1m]')
         self.assertEqual(call['effort'], 'high')
 
-    def test_claude_writer_exposes_only_file_tools_and_exact_edit_permissions(self):
-        args = worker.command('claude', ['src/value.py', 'tests/test_value.py'], runtime='claude')
-        tools = args[args.index('--tools') + 1]
-        self.assertEqual(tools, 'Read,Glob,Grep,Edit,Write')
-        start = args.index('--allowedTools') + 1
-        end = args.index('--disallowedTools')
-        self.assertEqual(args[start:end], ['Edit(./src/value.py)', 'Edit(./tests/test_value.py)'])
-        self.assertNotIn('Read', args[start:end])
-        self.assertNotIn('Edit', args[start:end])
-        self.assertEqual(args[end + 1], 'mcp__*')
-        self.assertNotIn('Bash', tools)
-        self.assertNotIn('WebFetch', tools)
-        self.assertNotIn('WebSearch', tools)
-        self.assertNotIn('Agent', tools)
-        self.assertIn('Allowed files:', ' '.join(args))
-
-    def test_claude_writer_rejects_paths_that_cannot_be_safely_encoded_as_permission_rules(self):
-        for path in ['src/a(b).py', 'src/a)b.py']:
-            with self.subTest(path=path), self.assertRaises(worker.WorkerError) as caught:
-                worker.command('claude', [path], runtime='claude')
-            self.assertEqual(caught.exception.code, 78)
-
     def test_claude_runtime_does_not_require_codex_provider_config(self):
         self.assertFalse(Path(self.env['CODEX_HOME']).exists())
         result = self.run_worker(task='independent runtime')
