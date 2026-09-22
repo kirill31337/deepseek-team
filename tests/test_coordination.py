@@ -149,6 +149,60 @@ class StateAndDistributionTests(CoordinationCase):
         issues = coordination.validate_task(self.repo, task["id"])
         self.assertTrue(any("implementation" in item.lower() for item in issues), issues)
 
+    def test_native_agent_requires_reason_and_cannot_take_protected_responsibility(self):
+        task = self.start()
+        with self.assertRaises(coordination.CoordinationError):
+            coordination.plan_task(self.repo, task["id"], {
+                "classification": "substantial",
+                "deliverables": [
+                    {"id": "native-review", "kind": "review", "scope": ["a.py"],
+                     "executor": "native-agent", "acceptance": ["findings"],
+                     "dependencies": [], "checks": []},
+                ],
+            })
+        with self.assertRaises(coordination.CoordinationError):
+            coordination.plan_task(self.repo, task["id"], {
+                "classification": "substantial",
+                "deliverables": [
+                    {"id": "native-arch", "kind": "architecture", "scope": ["design"],
+                     "executor": "native-agent",
+                     "delegation_reason": "independent architecture decision",
+                     "acceptance": ["decision"], "dependencies": [], "checks": []},
+                ],
+            })
+
+    def test_native_agent_is_additive_and_does_not_replace_required_deepseek_worker(self):
+        task = self.start(50, "full-access")
+        coordination.plan_task(self.repo, task["id"], {
+            "classification": "substantial",
+            "deliverables": [
+                {"id": "native-impl", "kind": "implementation", "scope": ["a.py"],
+                 "executor": "native-agent",
+                 "delegation_reason": "parallel isolated implementation for comparison",
+                 "acceptance": ["candidate implementation"], "dependencies": [], "checks": []},
+            ],
+        })
+        issues = coordination.validate_task(self.repo, task["id"])
+        self.assertTrue(any("worker implementation" in item.lower() for item in issues), issues)
+
+    def test_justified_native_agent_can_complement_a_valid_deepseek_plan(self):
+        task = self.start()
+        planned = coordination.plan_task(self.repo, task["id"], {
+            "classification": "substantial",
+            "deliverables": [
+                {"id": "impl", "kind": "implementation", "scope": ["a.py"],
+                 "executor": "worker", "acceptance": ["implemented"],
+                 "dependencies": [], "checks": []},
+                {"id": "native-review", "kind": "review", "scope": ["a.py"],
+                 "executor": "native-agent",
+                 "delegation_reason": "independent native review in isolated context",
+                 "acceptance": ["independent findings"], "dependencies": [], "checks": []},
+            ],
+        })
+        self.assertEqual(coordination.validate_task(self.repo, task["id"]), [])
+        self.assertEqual(len(planned["assignments"]), 1)
+        self.assertEqual(planned["assignments"][0]["deliverable_id"], "impl")
+
     def test_readonly_override_never_expands_write_access(self):
         task = self.start(75, "read-only")
         coordination.plan_task(self.repo, task["id"], {
@@ -219,7 +273,7 @@ class StateAndDistributionTests(CoordinationCase):
         assignment = planned["assignments"][0]
         coordination.assignment_started(self.repo, task["id"], assignment["id"],
                                         workspace_id="ws-1", runtime="codex",
-                                        prepared_changes=["prepared.patch"])
+                                        prepared_changes=["prepared.patch"], effort="high")
         coordination.assignment_finished(
             self.repo, task["id"], assignment["id"], status="succeeded",
             result_summary="race hypothesis", worker_changes=["a.py"],
@@ -228,6 +282,7 @@ class StateAndDistributionTests(CoordinationCase):
         reloaded = coordination.load_task(self.repo, task["id"])
         row = reloaded["assignments"][0]
         self.assertEqual(row["prepared_changes"], ["prepared.patch"])
+        self.assertEqual(row["effort"], "high")
         self.assertEqual(row["worker_changes"], ["a.py"])
         self.assertEqual(row["result_summary"], "race hypothesis")
         self.assertIsNone(row["disposition"])
