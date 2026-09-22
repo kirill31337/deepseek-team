@@ -33,7 +33,7 @@ jobs:
           export HOME="$RUNNER_TEMP/home"
           export CODEX_HOME="$HOME/.codex"
           mkdir -p "$HOME" "$CODEX_HOME"
-          OLD="$RUNNER_TEMP/v040"
+          OLD="$RUNNER_TEMP/v050"
           PREFIX="$RUNNER_TEMP/prefix"
           BIN="$RUNNER_TEMP/bin"
           PROJECT="$RUNNER_TEMP/project"
