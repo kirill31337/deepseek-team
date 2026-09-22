@@ -100,7 +100,7 @@ class ClaudeRuntimeTests(unittest.TestCase):
         self.assertEqual(call['base_url'], 'https://api.deepseek.com/anthropic')
         self.assertEqual(call['model'], 'deepseek-flash[1m]')
         self.assertEqual(call['haiku_model'], 'deepseek-flash')
-        self.assertEqual(call['effort'], 'max')
+        self.assertEqual(call['effort'], 'medium')
         self.assertEqual(call['compact_window'], '786432')
         self.assertEqual(call['auth_digest'], hashlib.sha256(self.key.encode()).hexdigest())
         self.assertFalse(call['parent_api_key'])
@@ -111,6 +111,13 @@ class ClaudeRuntimeTests(unittest.TestCase):
         self.assertEqual(Path(call['home']).parent, self.state)
         self.assertFalse(Path(call['home']).exists())
         self.assertNotIn('inspect only', args)
+
+    def test_frontier_can_select_high_effort_for_claude_harness(self):
+        result = self.run_worker(task='hard review', extra=('--effort', 'high'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        call, = self.calls()
+        self.assertEqual(call['model'], 'deepseek-flash[1m]')
+        self.assertEqual(call['effort'], 'high')
 
     def test_claude_writer_exposes_only_file_tools_and_exact_edit_permissions(self):
         args = worker.command('claude', ['src/value.py', 'tests/test_value.py'], runtime='claude')
