@@ -77,7 +77,10 @@ def handle(payload: dict) -> dict:
             ". For a genuinely small single-output task, record it as small with evidence. "
             "At 75/full-access, worker-eligible implementation/tests/fixtures/docs/metadata "
             "default to DeepSeek unless a supported concrete constraint is recorded. "
-            "Do not report a useful-work percentage from counts."
+            "Coordinator-native subagents are also allowed when the plan uses executor "
+            "native-agent with a concrete delegation_reason; they complement and do not replace "
+            "required DeepSeek worker assignments. Choose each DeepSeek worker effort explicitly "
+            "as low, medium or high from task complexity. Do not report a useful-work percentage from counts."
         )
         return _context(text, event)
     task = coordination.latest_task(root, session)
