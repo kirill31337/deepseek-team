@@ -1,7 +1,7 @@
 """Sparse, network-isolated development boundary for managed working copies.
 
-Legacy exact-file writers retain their native sandbox. Managed copies use this
-external boundary for BOTH runtimes; an inner CLI permission is not isolation.
+Managed copies use this external boundary for BOTH runtimes; an inner CLI
+permission is not treated as an isolation boundary.
 """
 from __future__ import annotations
 
