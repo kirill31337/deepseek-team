@@ -437,16 +437,25 @@ def run(args):
         try:
             copy = workspace.load(args.state_dir, args.workspace) if getattr(args, 'workspace', None) else None
             root = settings.project_root(copy.source if copy else Path.cwd())
-            policy = settings.resolve(root, delegation_level=getattr(args, 'delegation_level', None),
-                                      access=getattr(args, 'access', None))
+            policy = settings.resolve(
+                root,
+                delegation_level=getattr(args, 'delegation_level', None),
+                access=getattr(args, 'access', None),
+                effort=getattr(args, 'effort', None),
+            )
         except (settings.SettingsError, workspace.WorkspaceError) as error:
             raise WorkerError(getattr(error, 'code', 78), str(error)) from None
         print(settings.describe(policy), file=sys.stderr)
+        if policy.effort == 'auto':
+            args.effort = DEFAULT_EFFORT
+            print('DeepSeek effort auto: no concrete frontier selection reached the runner; using medium fallback.', file=sys.stderr)
+        else:
+            args.effort = policy.effort
         if args.write:
             print('Actual access: legacy exact-file writer (source: CLI --write --allow-write).', file=sys.stderr)
         elif policy.effective_access == 'full-access' or copy is not None or getattr(args, 'coord_task', None):
             return managed.run(args, policy, sys.modules.get(__name__) or _worker_api(), copy)
-    elif any(getattr(args, name, None) for name in ('delegation_level', 'access', 'workspace')):
+    elif any(getattr(args, name, None) for name in ('delegation_level', 'access', 'effort', 'workspace')):
         raise WorkerError(78, 'Delegation configuration support is unavailable; reinstall DeepSeek Team.')
     if not args.write:
         return run_worker(args, None)
@@ -464,7 +473,8 @@ def run(args):
 
 
 def run_worker(args, scope):
-    effort = effort_level(getattr(args, 'effort', DEFAULT_EFFORT))
+    requested_effort = getattr(args, 'effort', None)
+    effort = DEFAULT_EFFORT if requested_effort in (None, 'auto') else effort_level(requested_effort)
     runtime, binary = resolve_runtime(args.runtime, args.codex, args.claude)
     sandbox, backend = resolve_os_sandbox(args.os_sandbox)
     if runtime == 'codex':
@@ -534,8 +544,8 @@ def parse_args():
                         help='CLI harness for the DeepSeek worker; default keeps legacy Codex behavior.')
     parser.add_argument('--os-sandbox', choices=['required', 'off'], default='required',
                         help='required: enforce Bubblewrap/AppArmor containment (default); off: explicit unsafe compatibility bypass.')
-    parser.add_argument('--effort', choices=EFFORT_LEVELS, default=DEFAULT_EFFORT,
-                        help='DeepSeek Flash reasoning effort. Managed coordinators should choose low/medium/high per assignment; default: medium.')
+    parser.add_argument('--effort', choices=EFFORT_LEVELS,
+                        help='One-job DeepSeek Flash effort override. Omit to use saved policy; policy default is auto.')
     parser.add_argument('--timeout', type=float, default=0,
                         help='0: wait without a total deadline (default); 1..900: explicit total limit in seconds, including retries.')
     parser.add_argument('--attempts', type=int, choices=[1, 2, 3],
