@@ -81,11 +81,17 @@ class PolicyResolutionTests(RepoCase):
         self.assertIn('coordination use', text)
         self.assertIn('Codex PreToolUse', text)
         self.assertIn('Do not calculate an actual useful-work percentage', text)
+        self.assertIn('deepseek-flash', text)
+        self.assertIn('--effort low', text)
+        self.assertIn('native-agent', text)
+        self.assertIn('delegation_reason', text)
 
     def test_claude_instructions_label_process_as_instruction_driven(self):
         policy = settings.resolve(self.repo, delegation_level=75, access='full-access')
         text = settings.instructions(policy, 'claude')
         self.assertIn('instruction-driven', text)
+        self.assertIn('native-agent', text)
+        self.assertIn('per-assignment DeepSeek effort selection', text)
         self.assertNotIn('Claude PreToolUse gate', text)
 
     def test_read_only_override_keeps_high_delegation_target_without_write_authority(self):
@@ -168,6 +174,7 @@ class LegacyCompatibilityTests(unittest.TestCase):
         self.assertIsNone(args.access)
         self.assertIsNone(args.delegation_level)
         self.assertEqual(args.attempts, 1)
+        self.assertEqual(args.effort, 'medium')
 
     def test_conflicting_legacy_and_new_access_is_rejected(self):
         with self.assertRaises(SystemExit):
