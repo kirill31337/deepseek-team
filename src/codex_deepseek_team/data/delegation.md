@@ -113,9 +113,6 @@ A failed or interrupted workspace is retained. Inspect it before explicit
 `--resume-after-failure`; do not automatically repeat implementation over unknown
 state. At most three workers may run and the default total timeout remains unlimited.
 
-The legacy `--write --allow-write FILE` exact-file mode remains separate and cannot
-be combined with coordinated managed-access flags.
-
 ### Integration boundary
 
 Codex: distribution/source-mutation gates use supported lifecycle hooks, but native
