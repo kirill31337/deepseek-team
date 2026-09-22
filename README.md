@@ -2,7 +2,7 @@
 
 One Linux package for **Codex and/or Claude Code coordinators** delegating bounded coding work to DeepSeek workers. The current source supports configurable **25/50/75% delegation profiles**, independent `read-only/full-access` policy, reusable isolated development copies, and the legacy exact-file writer.
 
-**The coordinator owns:** scope, architecture, security decisions, final diff review, integration, commits and production actions. **DeepSeek contributes:** focused research/review and, when full-access is selected, independent implementation, local tests/builds and documentation inside a dedicated copy. DeepSeek workers stay on `deepseek-flash`; the frontier coordinator chooses `low`/`medium`/`high` effort per assignment. Codex/Claude may also use their own native subagents when they can state a concrete reason for doing so; native subagents complement rather than replace required DeepSeek assignments. The coordinator should verify useful evidence instead of automatically repeating the whole delegated investigation or rewriting correct code.
+**The coordinator owns:** scope, architecture, security decisions, final diff review, integration, commits and production actions. **DeepSeek contributes:** focused research/review and, when full-access is selected, independent implementation, local tests/builds and documentation inside a dedicated copy. DeepSeek workers stay on `deepseek-flash`; effort defaults to `auto`, so the frontier coordinator chooses `low`/`medium`/`high` per assignment unless a persistent forced effort is configured. Codex/Claude may also use their own native subagents when they can state a concrete reason for doing so; native subagents complement rather than replace required DeepSeek assignments. The coordinator should verify useful evidence instead of automatically repeating the whole delegated investigation or rewriting correct code.
 
 The percentages are **target work-distribution profiles**, not measured token/time/line quotas and not promises of exact useful contribution. Small or inseparable tasks may delegate less. Without any new settings, behavior remains compatible: the default is **25% + access=auto → read-only**.
 
@@ -206,7 +206,7 @@ Access is independent of the target percentage. An explicit `read-only` remains 
 
 ### DeepSeek model, effort and coordinator-native subagents
 
-DeepSeek Team currently routes every managed worker to **`deepseek-flash`**. There is intentionally no Flash/Pro model router. Instead, the frontier coordinator selects the reasoning effort for each DeepSeek assignment with `--effort low|medium|high`: `low` for bounded/mechanical work or broad scans, `medium` for the normal case, and `high` for difficult debugging, cross-file reasoning or demanding independent review. Direct/manual calls default to `medium`; managed guidance tells Codex/Claude to choose explicitly without asking the user for routine effort decisions.
+DeepSeek Team currently routes every managed worker to **`deepseek-flash`**. There is intentionally no Flash/Pro model router. The saved effort policy defaults to **`auto`**. In `auto`, the frontier Codex/Claude coordinator selects `--effort low|medium|high` for each DeepSeek assignment: `low` for bounded/mechanical work or broad scans, `medium` for the normal case, and `high` for difficult debugging, cross-file reasoning or demanding independent review. A direct worker that reaches the runner without a concrete frontier selection uses `medium` only as an execution fallback.
 
 The primary Codex/Claude coordinator keeps its native subagent capability. For substantial work, a native-subagent deliverable is represented in the coordination plan as `"executor": "native-agent"` with a concrete `"delegation_reason"`. Native subagents are useful for genuinely parallel work, isolated context, or native-runtime capabilities, but they do **not** count as a DeepSeek worker assignment required by the 50/75 profiles. Protected coordinator responsibilities remain coordinator-owned. The DeepSeek workers themselves still have agent/delegation tools disabled and remain leaf workers.
 
@@ -223,11 +223,20 @@ deepseek-team config set --global --delegation-level 25 --access read-only
 deepseek-team config show --effective
 deepseek-team config show --effective --json
 
+# Persist effort for this project (frontier no longer chooses per job)
+deepseek-team config set --project --effort high
+
+# Or persist it user-wide
+deepseek-team config set --global --effort high
+
+# Restore automatic frontier selection
+deepseek-team config set --project --effort auto
+
 # One-job override
 deepseek-team worker --runtime codex --delegation-level 75 --access full-access --effort high
 ```
 
-Project settings live in `.deepseek-team.toml`; global settings live under the user's XDG config directory. Settings are snapshotted when a new job starts and do not change permissions of an already running process.
+Project settings live in `.deepseek-team.toml`; global settings live under the user's XDG config directory. `effort` follows the same precedence as the other policy fields: one-job CLI override > project > global > default (`auto`). Settings are snapshotted when a new job starts and do not change an already running process.
 
 `config show --effective --instructions --runtime codex|claude` renders the current coordinator guidance. Managed AGENTS.md/CLAUDE.md blocks tell the coordinator to resolve this current policy before each assignment instead of relying on a stale percentage embedded in the file.
 
