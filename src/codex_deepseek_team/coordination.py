@@ -237,8 +237,16 @@ def _normalize_deliverable(raw: dict) -> dict:
         raise CoordinationError("Deliverables require id/kind/scope/executor/acceptance/dependencies/checks.", 64)
     if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", str(raw["id"])):
         raise CoordinationError("Invalid deliverable id.", 64)
-    if raw["executor"] not in ("worker", "coordinator"):
-        raise CoordinationError("Deliverable executor must be worker or coordinator.", 64)
+    if raw["executor"] not in ("worker", "coordinator", "native-agent"):
+        raise CoordinationError("Deliverable executor must be worker, coordinator or native-agent.", 64)
+    if raw["executor"] == "native-agent":
+        reason = raw.get("delegation_reason")
+        if not isinstance(reason, str) or len(reason.strip()) < 12:
+            raise CoordinationError(
+                "native-agent deliverables require a concrete delegation_reason.", 64)
+        if raw.get("kind") in PROTECTED_COORDINATOR_KINDS:
+            raise CoordinationError(
+                "Protected coordinator responsibilities cannot be assigned to a native agent.", 64)
     value = dict(raw)
     value["scope"] = list(raw["scope"]) if isinstance(raw["scope"], list) else [str(raw["scope"])]
     value["acceptance"] = list(raw["acceptance"])
@@ -288,7 +296,7 @@ def plan_task(root: Path, task_id: str, plan: dict) -> dict:
             assignments.append({
                 "id": assignment_id, "deliverable_id": item["id"],
                 "status": "planned", "workspace_id": None, "runtime": None,
-                "prepared_changes": [], "worker_changes": [], "checks": [],
+                "effort": None, "prepared_changes": [], "worker_changes": [], "checks": [],
                 "result_summary": None, "disposition": None,
             })
         task.update(classification=classification,
@@ -371,14 +379,14 @@ def _assignment(task: dict, assignment_id: str) -> dict:
 
 def assignment_started(root: Path, task_id: str, assignment_id: str,
                        workspace_id: str, runtime: str,
-                       prepared_changes: list[str]) -> dict:
+                       prepared_changes: list[str], effort: str | None = None) -> dict:
     with _lock(root):
         task = load_task(root, task_id)
         row = _assignment(task, assignment_id)
         if row["status"] not in ("planned", "failed"):
             raise CoordinationError("Assignment is already active or completed.", 64)
         row.update(status="running", workspace_id=workspace_id, runtime=runtime,
-                   prepared_changes=sorted(set(prepared_changes)),
+                   effort=effort, prepared_changes=sorted(set(prepared_changes)),
                    started_at=time.time())
         task.update(status="active", updated_at=time.time())
         _atomic(_task_path(root, task_id), task)
