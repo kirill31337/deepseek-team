@@ -18,7 +18,8 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
     if getattr(args, 'attempts_explicit', False) and args.attempts != 1:
         raise api.WorkerError(64, 'Managed copies use one attempt; inspect and explicitly continue instead of retrying.')
     task = args.task if args.task is not None else api.sys.stdin.read()
-    effort = api.effort_level(getattr(args, 'effort', api.DEFAULT_EFFORT))
+    requested_effort = getattr(args, 'effort', None)
+    effort = api.DEFAULT_EFFORT if requested_effort in (None, 'auto') else api.effort_level(requested_effort)
     if not task.strip():
         raise api.WorkerError(64, 'Pass a task on stdin or as one argument.')
     slot = api.acquire_slot(args.state_dir)
