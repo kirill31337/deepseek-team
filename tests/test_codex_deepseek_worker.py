@@ -227,6 +227,16 @@ wire_api = "responses"
         self.assertEqual((self.user / 'auth.json').read_text(), '{"synthetic":true}')
         self.assertNotIn('PRIVATE_REASONING', r.stdout + r.stderr)
 
+    def test_saved_forced_effort_applies_without_one_job_override(self):
+        config = self.user / '.config/deepseek-team/config.toml'
+        config.parent.mkdir(parents=True)
+        config.write_text('effort = "high"\n')
+        r = self.run_worker()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        c, = self.calls()
+        self.assertIn('model_reasoning_effort="high"', c['args'])
+        self.assertIn('effort: high', r.stderr)
+
     def test_frontier_can_select_high_effort_without_changing_model(self):
         r = self.run_worker(args=['--effort', 'high'])
         self.assertEqual(r.returncode, 0, r.stderr)
