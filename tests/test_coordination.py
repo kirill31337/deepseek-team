@@ -202,6 +202,32 @@ class StateAndDistributionTests(CoordinationCase):
         self.assertEqual(coordination.validate_task(self.repo, task["id"]), [])
         self.assertEqual(len(planned["assignments"]), 1)
         self.assertEqual(planned["assignments"][0]["deliverable_id"], "impl")
+        summary = coordination.summary(planned)
+        self.assertIn("native-agent deliverable=native-review", summary)
+        self.assertIn("isolated context", summary)
+
+    def test_started_worker_deliverable_cannot_be_reassigned_to_native_agent(self):
+        task = self.start()
+        planned = coordination.plan_task(self.repo, task["id"], {
+            "classification": "substantial",
+            "deliverables": [
+                {"id": "impl", "kind": "implementation", "scope": ["a.py"],
+                 "executor": "worker", "acceptance": ["implemented"],
+                 "dependencies": [], "checks": []},
+            ],
+        })
+        aid = planned["assignments"][0]["id"]
+        coordination.assignment_started(self.repo, task["id"], aid, "ws", "codex", [], effort="medium")
+        with self.assertRaises(coordination.CoordinationError):
+            coordination.plan_task(self.repo, task["id"], {
+                "classification": "substantial",
+                "deliverables": [
+                    {"id": "impl", "kind": "implementation", "scope": ["a.py"],
+                     "executor": "native-agent",
+                     "delegation_reason": "switching implementation to a native agent",
+                     "acceptance": ["implemented"], "dependencies": [], "checks": []},
+                ],
+            })
 
     def test_readonly_override_never_expands_write_access(self):
         task = self.start(75, "read-only")
