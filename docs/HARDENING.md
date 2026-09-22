@@ -18,7 +18,7 @@ For **Claude Code**, 0.5.0 does not claim equivalent coordinator-side technical 
 
 Coordinator-native subagents are deliberately a **coordinator capability**, not a DeepSeek-worker capability. A planned native-agent deliverable requires a concrete `delegation_reason`, cannot own protected coordinator responsibilities, and does not satisfy DeepSeek worker requirements in the 50/75 profiles. Native subagents execute under Codex/Claude's own native agent model, permissions and sandboxing; DeepSeek Team does not wrap them in the DeepSeek worker Bubblewrap boundary. Conversely, DeepSeek workers keep agent tools disabled and remain leaf workers.
 
-DeepSeek workers stay fixed to `deepseek-flash`. The frontier coordinator selects only `low`/`medium`/`high` reasoning effort per DeepSeek assignment; that selected value is propagated consistently through the Codex or Claude harness and recorded for coordinated managed assignments.
+DeepSeek workers stay fixed to `deepseek-flash`. Effort policy defaults to `auto`, where the frontier coordinator selects `low`/`medium`/`high` per assignment. A user may persist a forced `low`, `medium` or `high` value at project or global scope; setting it back to `auto` restores frontier selection. The resolved concrete effort is propagated consistently through the Codex or Claude harness and recorded for coordinated managed assignments. When an `auto` worker reaches the runner without a concrete frontier selection, `medium` is only an execution fallback.
 
 ### Persistent coordination state
 
