@@ -39,7 +39,7 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
             with tempfile.TemporaryDirectory(prefix='session-', dir=args.state_dir) as session, \
                     tempfile.TemporaryDirectory(prefix='dst-') as transport:
                 home, control = Path(session), Path(transport)
-                env = api.child_environment(home, relay.LOCAL_CREDENTIAL, runtime)
+                env = api.child_environment(home, relay.LOCAL_CREDENTIAL, runtime, args.effort)
                 if runtime == 'codex':
                     api.transient_config(home)
                 else:
@@ -77,16 +77,18 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
                 key = api.load_api_key()
                 if not key.strip():
                     raise api.WorkerError(78, 'Provider credential is absent; configure it locally. Workspace retained.')
-                development.write_launch(control, binary, runtime, env, writable=writable)
+                development.write_launch(control, binary, runtime, env, writable=writable,
+                                         effort=args.effort)
                 if coord_task:
                     coordination.assignment_started(
                         copy.source, coord_task, coord_assignment, copy.id, runtime,
-                        prepared_changes)
+                        prepared_changes, effort=args.effort)
                     coord_started = True
                 copy.begin('execution')
                 copy.metadata.update(delegation_level=policy.delegation_level,
                                      requested_access=policy.access, effective_access=policy.effective_access,
-                                     configuration_sources=dict(policy.sources), runtime=runtime)
+                                     configuration_sources=dict(policy.sources), runtime=runtime,
+                                     model=api.MODEL, effort=args.effort)
                 copy.save()
                 provider = None
                 try:
