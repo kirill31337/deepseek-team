@@ -398,10 +398,12 @@ def run(args):
         package_parent = str(sibling.parent.parent)
         if package_parent not in sys.path:
             sys.path.insert(0, package_parent)
-        from codex_deepseek_team import settings, workspace, managed
+        from codex_deepseek_team import activation, settings, workspace, managed
         try:
             copy = workspace.load(args.state_dir, args.workspace) if getattr(args, 'workspace', None) else None
-            root = settings.project_root(copy.source if copy else Path.cwd())
+            root = settings.project_root(copy.source if copy else Path.cwd(), required=copy is not None)
+            if not activation.resolve(root).enabled:
+                raise WorkerError(69, activation.DISABLED_GUIDANCE)
             policy = settings.resolve(
                 root,
                 delegation_level=getattr(args, 'delegation_level', None),

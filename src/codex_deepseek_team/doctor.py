@@ -65,9 +65,24 @@ def stream_model(lines):
     raise ValueError('Stream did not expose model metadata')
 
 
+def _delegation_disabled():
+    # Keep direct doctor.py execution working as well as package entry points.
+    if os.environ.get('DEEPSEEK_TEAM_DISABLED') == '1' or os.environ.get('CODEX_DEEPSEEK_DISABLED') == '1':
+        return True
+    if (HERE / 'activation.py').exists():
+        if str(HERE.parent) not in sys.path:
+            sys.path.insert(0, str(HERE.parent))
+        from codex_deepseek_team import activation, settings
+        try:
+            return not activation.resolve().enabled
+        except settings.SettingsError as error:
+            raise worker.WorkerError(78, str(error)) from None
+    return False
+
+
 def api_probe():
     """Runs in a separate, bounded process. Never writes credentials or raw responses."""
-    if os.environ.get('DEEPSEEK_TEAM_DISABLED') == '1' or os.environ.get('CODEX_DEEPSEEK_DISABLED') == '1':
+    if _delegation_disabled():
         print('API probe: DISABLED — remove the DeepSeek delegation disable switch to run live tests.')
         return 69
     key = worker.load_api_key()
@@ -193,7 +208,7 @@ def coordination_status(runtime, root=None):
 
 
 def live_tests(runtimes=('codex',), os_sandbox='required'):
-    if os.environ.get('DEEPSEEK_TEAM_DISABLED') == '1' or os.environ.get('CODEX_DEEPSEEK_DISABLED') == '1':
+    if _delegation_disabled():
         print('Live check disabled by DeepSeek delegation switch.')
         return 69
     key = worker.load_api_key()
@@ -248,6 +263,9 @@ def main(argv=None):
         policy = resolve_policy(delegation_level=args.delegation_level,
                                 access=args.access, effort=args.effort)
         print(settings.describe(policy))
+        if args.live and not policy.enabled:
+            print('Live check disabled by DeepSeek delegation switch.')
+            return 69
         if policy.effective_access == 'full-access' and args.os_sandbox == 'off':
             raise worker.WorkerError(
                 64, 'Effective full-access requires the OS sandbox; diagnostics cannot validate it with --os-sandbox off.')

@@ -193,6 +193,26 @@ deepseek-team auth status    # availability only
 
 The saved key is `~/.config/codex-deepseek/api-key`, directory mode `700`, file mode `600`. `DEEPSEEK_API_KEY` overrides it. For automation, pipe a secret manager to `deepseek-team auth set --stdin`. Never put a key in command arguments, repository files or worker prompts.
 
+## Turn DeepSeek Team on or off
+
+Run these commands from the project directory, or ask Codex or Claude Code to run them:
+
+~~~bash
+deepseek-team off       # Disable new DeepSeek jobs in this project
+deepseek-team on        # Enable them again
+deepseek-team status    # Show the effective and saved state
+~~~
+
+For example: “Turn off DeepSeek Team in this project” or “Turn DeepSeek Team back on.” These are terminal commands, not built-in slash commands. Both coordinators use the same saved state.
+
+The choice persists across sessions and package updates. It is stored locally for your user, separately for each checkout, under `${XDG_CONFIG_HOME:-~/.config}/deepseek-team/activation/`. Nothing is added to Git. Commands also work from subdirectories; you can pass a project path explicitly, for example `deepseek-team off /path/to/project`. `status --json` reports the effective state, saved state and source. Outside a Git working copy, specify a project path.
+
+By default, delegation is enabled. `off` prevents new workers from starting, including reuse of workspaces belonging to that source project, and disables Codex coordination gates on subsequent hook events. Live diagnostics also respect it. Already running workers continue; their results and coordination records are retained. `on` restores delegation with the existing access, percentage and effort settings. Credentials and project instruction files are unchanged. It does not install hooks or attach a new project; initial setup still uses `setup` and `init`.
+
+`DEEPSEEK_TEAM_DISABLED=1` and the legacy `CODEX_DEEPSEEK_DISABLED=1` override the saved choice. If either is set, `on` saves the enabled state but reports that delegation remains disabled until the environment override is removed. `config show --effective --instructions` also reports activation and tells the coordinator to continue locally while disabled.
+
+Codex receives the current state through its installed, trusted hooks. Claude Code follows the project instructions and checks the current configuration before assigning work; the worker command enforces the switch for both runtimes even if a chat still contains old instructions. Existing attached projects can optionally refresh their instruction blocks once with `deepseek-team init --coordinator both .` to include the new switch guidance (choose `codex` or `claude` if only one is used). Toggling itself never requires another `init`.
+
 ## Delegation profiles and access
 
 Settings are layered independently:

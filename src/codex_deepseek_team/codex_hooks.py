@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import re
 
-from . import coordination, project, settings
+from . import activation, coordination, project, settings
 
 
 def _context(text: str, event: str) -> dict:
@@ -61,6 +61,10 @@ def handle(payload: dict) -> dict:
         if not project.is_attached(root, 'codex'):
             return {}
     except project.ProjectError:
+        return {}
+    if not activation.resolve(root).enabled:
+        if event in ('SessionStart', 'UserPromptSubmit'):
+            return _context(activation.DISABLED_GUIDANCE, event)
         return {}
     session = str(payload.get("session_id") or "")
     if not session:

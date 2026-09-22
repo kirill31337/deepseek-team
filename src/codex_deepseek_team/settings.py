@@ -30,6 +30,8 @@ class Policy:
     access: str
     sources: Mapping[str, str]
     effort: str = 'auto'
+    enabled: bool = True
+    enabled_source: str = 'default'
 
     @property
     def effective_access(self) -> str:
@@ -39,6 +41,8 @@ class Policy:
 
     def as_dict(self) -> dict:
         return {
+            'enabled': self.enabled,
+            'enabled_source': self.enabled_source,
             'delegation_level': self.delegation_level,
             'access': self.access,
             'effective_access': self.effective_access,
@@ -142,8 +146,10 @@ def resolve(root: Path | None = None, *, delegation_level: int | None = None,
     _validate(overrides)
     for key, value in overrides.items():
         values[key], sources[key] = value, 'cli'
+    from . import activation
+    active = activation.resolve(project)
     return Policy(values['delegation_level'], values['access'], MappingProxyType(sources),
-                  values['effort'])
+                  values['effort'], active.enabled, active.source)
 
 
 def set_values(path: Path, *, delegation_level: int | None = None,
@@ -201,6 +207,7 @@ def set_values(path: Path, *, delegation_level: int | None = None,
 def describe(policy: Policy) -> str:
     data = policy.as_dict()
     return '\n'.join((
+        f'enabled: {str(policy.enabled).lower()} (source={policy.enabled_source})',
         f'delegation_level: {policy.delegation_level}% (target; source={policy.sources["delegation_level"]})',
         f'access: {policy.access} (source={policy.sources["access"]})',
         f'effective_access: {policy.effective_access} (source={data["effective_access_source"]})',
@@ -213,6 +220,10 @@ def describe(policy: Policy) -> str:
 def instructions(policy: Policy, runtime: str = 'codex') -> str:
     if runtime not in ('codex', 'claude'):
         raise SettingsError('Instruction runtime must be codex or claude.')
+
+    if not policy.enabled:
+        from .activation import DISABLED_GUIDANCE
+        return DISABLED_GUIDANCE + '\n'
 
     if policy.effort == 'auto':
         effort_guidance = (

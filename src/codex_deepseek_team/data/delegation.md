@@ -1,6 +1,13 @@
 ## DeepSeek delegation
 
-Always resolve the CURRENT policy for a new assignment:
+Before delegating, check `deepseek-team status` and resolve the CURRENT policy.
+The user can request `deepseek-team off` or `deepseek-team on` for this project;
+these commands persist across sessions for both Codex and Claude Code. They preserve
+instructions, credentials and delegation/access/effort settings. Never turn delegation
+back on without the user's request. If disabled, continue locally: the delegation and
+coordination-plan requirements below do not apply. Existing workers are not cancelled;
+inspect their results before integration. Check again before every new assignment:
+
 
 ```bash
 deepseek-team config show --effective --instructions --runtime {runtime}

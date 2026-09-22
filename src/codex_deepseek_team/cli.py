@@ -1,6 +1,7 @@
 """User-facing CLI for setup, project instructions and isolated DeepSeek workers."""
 import argparse
 import getpass
+import json
 from pathlib import Path
 import shutil
 import sys
@@ -40,7 +41,7 @@ def main(argv=None):
     if sys.platform != 'linux':
         print('This release supports Linux with Python 3.11+ and Codex and/or Claude Code.', file=sys.stderr)
         return 78
-    from . import config, doctor, sandbox, worker
+    from . import activation, config, doctor, sandbox, settings, worker
     if argv and argv[0] == 'coordinator-hook':
         from . import codex_hooks
         return codex_hooks.main()
@@ -62,6 +63,10 @@ def main(argv=None):
     parser = argparse.ArgumentParser(prog='deepseek-team', description=__doc__)
     parser.add_argument('--version', action='version', version=f'deepseek-team {__version__}')
     commands = parser.add_subparsers(dest='command', required=True)
+    for name in ('on', 'off', 'status'):
+        toggle = commands.add_parser(name, help='Save or show local project activation for both coordinators.')
+        toggle.add_argument('path', nargs='?', type=Path, default=Path.cwd())
+        toggle.add_argument('--json', action='store_true', help='Print effective and saved activation as JSON.')
     setup = commands.add_parser('setup', help='Configure DeepSeek without changing coordinator auth or primary model.')
     setup.add_argument('--runtime', choices=['codex', 'claude', 'both', 'auto'], default='codex',
                        help='Coordinator runtime(s) to prepare; default codex preserves legacy behavior.')
@@ -96,7 +101,21 @@ def main(argv=None):
     commands.add_parser('worker', help='Run a worker; use worker --help for runtime/read/write options.')
     args = parser.parse_args(argv)
     try:
-        if args.command == 'setup':
+        if args.command in ('on', 'off', 'status'):
+            root = settings.project_root(args.path, required=True)
+            if args.command != 'status':
+                activation.set_enabled(root, args.command == 'on')
+            value = activation.resolve(root)
+            if args.json:
+                print(json.dumps(dict(value.as_dict(), project=str(root)), indent=2))
+            else:
+                print(activation.describe(value))
+                print('Project: ' + str(root))
+                if args.command != 'status':
+                    print('Applies to new jobs and subsequent hook events; running workers are unchanged.')
+                if value.source.startswith('environment:'):
+                    print('Remove the environment disable switch to use the saved project state.')
+        elif args.command == 'setup':
             runtimes = _runtimes(args.runtime)
             if 'codex' in runtimes:
                 changed = config.configure(worker.codex_home())
@@ -176,7 +195,7 @@ def main(argv=None):
     except sandbox.SandboxError as error:
         print(error.message, file=sys.stderr)
         return error.code
-    except (config.ConfigError, worker.WorkerError) as error:
+    except (config.ConfigError, settings.SettingsError, worker.WorkerError) as error:
         print(error.message if isinstance(error, worker.WorkerError) else str(error), file=sys.stderr)
         return error.code if isinstance(error, worker.WorkerError) else 78
     except (OSError, EOFError):
