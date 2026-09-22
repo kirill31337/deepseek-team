@@ -52,6 +52,38 @@ codex-deepseek-team   # legacy compatibility alias
 
 The legacy Python distribution/namespace is intentionally preserved so existing installations and automation continue to work.
 
+### Codex lifecycle hooks
+
+Starting with **0.5.0**, the standard installer detects Codex on `PATH` and installs or refreshes the stable DeepSeek Team user-level lifecycle hooks in `$CODEX_HOME/hooks.json`. `deepseek-team setup --runtime codex` also installs the same hook definition while preserving the primary Codex model and existing OpenAI authentication.
+
+Useful commands:
+
+```bash
+deepseek-team hooks install
+deepseek-team hooks status
+deepseek-team hooks remove
+```
+
+The user-level hook is deliberately inert in unrelated repositories. Coordinator enforcement becomes active only in a repository explicitly attached with:
+
+```bash
+deepseek-team init --coordinator codex /path/to/project
+```
+
+Codex owns native hook trust. Review/trust the stable DeepSeek Team hook once from Codex with `/hooks`; DeepSeek Team does not bypass or infer that decision. Normal package updates keep the same hook command and **do not require re-running `init` for projects that are already attached**.
+
+`hooks remove` removes only the package-owned DeepSeek Team handlers and preserves unrelated user hooks.
+
+## Install with an agent prompt
+
+You can ask Codex to install or update DeepSeek Team for the repository it is currently working in. Paste this short prompt into Codex from the project you want to enable:
+
+```text
+Install or update DeepSeek Team in this Linux project from https://github.com/kirill31337/deepseek-team. Use the repository's standard install.py; on Ubuntu use --with-sandbox unless a working DeepSeek Team sandbox is already configured. Preserve my existing Codex model/auth, DeepSeek Team settings, and credential. Configure Codex support without asking me to paste secrets into this prompt; if no DeepSeek key exists, leave secret entry to "deepseek-team auth set". Ensure the stable Codex lifecycle hooks are installed and healthy with "deepseek-team hooks install" and "deepseek-team hooks status". If this repository does not already contain the DeepSeek Team managed block in AGENTS.md, attach it with "deepseek-team init --coordinator codex ."; if it is already attached, do not re-run init just because the package was updated. Verify "deepseek-team --version", "deepseek-team sandbox status", "deepseek-team hooks status", and "deepseek-team doctor --runtime codex --offline". Do not use --os-sandbox off and do not weaken AppArmor/Bubblewrap. At the end remind me to review/trust the stable hook once with Codex "/hooks" if I have not already done so.
+```
+
+The prompt intentionally does **not** contain an API key and does not change your delegation level or access policy. Configure the private DeepSeek credential separately with `deepseek-team auth set`, and set `delegation_level` / `access` explicitly if you want values other than the existing configuration or defaults.
+
 ### Rootless/manual install
 
 Plain installation never invokes `sudo`:
@@ -270,11 +302,7 @@ Existing bytes outside the managed block and file permissions are preserved. Man
 
 Changing project settings refreshes package-owned managed blocks when present, without changing surrounding user text. The block still resolves the current policy before every new assignment.
 
-Re-run `init` after package upgrades to refresh the managed block:
-
-```bash
-deepseek-team init --coordinator both /path/to/project
-```
+With **0.5.0+**, an ordinary package update does **not** require re-running `init` for a project that is already attached. The stable user-level Codex hook is refreshed by the installer/setup path, while the existing managed project block remains the activation marker. Run `init` only when attaching a new repository, enabling an additional coordinator, or deliberately restoring a managed block after it was detached.
 
 ## Read-only delegation
 
@@ -420,10 +448,13 @@ Installer-managed checkout:
 ```bash
 git pull --ff-only
 python3 install.py --with-sandbox   # recommended on Ubuntu
-deepseek-team init --coordinator both /path/to/project
+deepseek-team hooks status
+deepseek-team doctor --runtime codex --offline
 ```
 
-For pipx: `pipx upgrade codex-deepseek-team`, then run `deepseek-team sandbox status`.
+If the repository was already attached before the update, do **not** re-run `init` just for the upgrade. For a new repository, attach it once with `deepseek-team init --coordinator codex /path/to/project` (or `--coordinator both` when both coordinator instruction files are desired). In Codex, review/trust the stable hook once with `/hooks`.
+
+For pipx: `pipx upgrade codex-deepseek-team`, then run `deepseek-team hooks install`, `deepseek-team hooks status`, and `deepseek-team sandbox status`.
 
 Detach project instructions/package-owned coordinator configuration:
 
