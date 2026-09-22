@@ -1,5 +1,7 @@
 # DeepSeek Team
 
+**English** | [Русский](README.ru.md)
+
 One Linux package for **Codex and/or Claude Code coordinators** delegating bounded coding work to DeepSeek workers. The current source supports configurable **25/50/75% delegation profiles**, independent `read-only/full-access` policy, reusable isolated development copies, and the legacy exact-file writer.
 
 **The coordinator owns:** scope, architecture, security decisions, final diff review, integration, commits and production actions. **DeepSeek contributes:** focused research/review and, when full-access is selected, independent implementation, local tests/builds and documentation inside a dedicated copy. DeepSeek workers stay on `deepseek-flash`; effort defaults to `auto`, so the frontier coordinator chooses `low`/`medium`/`high` per assignment unless a persistent forced effort is configured. Codex/Claude may also use their own native subagents when they can state a concrete reason for doing so; native subagents complement rather than replace required DeepSeek assignments. The coordinator should verify useful evidence instead of automatically repeating the whole delegated investigation or rewriting correct code.
