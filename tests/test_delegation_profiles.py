@@ -110,7 +110,8 @@ class PolicyResolutionTests(RepoCase):
         text = settings.instructions(policy, 'claude')
         self.assertIn('instruction-driven', text)
         self.assertIn('native-agent', text)
-        self.assertIn('per-assignment DeepSeek effort selection', text)
+        self.assertIn('Effort policy is auto', text)
+        self.assertIn('resolved effort policy', text)
         self.assertNotIn('Claude PreToolUse gate', text)
 
     def test_read_only_override_keeps_high_delegation_target_without_write_authority(self):
@@ -124,6 +125,8 @@ class PolicyResolutionTests(RepoCase):
     def test_invalid_values_fail_closed(self):
         with self.assertRaises(settings.SettingsError):
             settings.resolve(self.repo, delegation_level=40)
+        with self.assertRaises(settings.SettingsError):
+            settings.resolve(self.repo, effort='max')
         (self.repo / settings.PROJECT_FILE).write_text('delegation_level = 60\n')
         with self.assertRaises(settings.SettingsError):
             settings.resolve(self.repo)
@@ -215,13 +218,13 @@ class ManagedBlockTests(RepoCase):
         agents.write_text(agents.read_text() + 'USER SUFFIX\n')
 
         settings.set_values(self.repo / settings.PROJECT_FILE,
-                            delegation_level=75, access='read-only')
+                            delegation_level=75, access='read-only', effort='high')
         self.assertTrue(project.attach(self.repo, coordinator='codex'))
         text = agents.read_text()
         self.assertTrue(text.startswith('USER PREFIX\n'))
         self.assertTrue(text.endswith('USER SUFFIX\n'))
         self.assertEqual(text.count(project.START_MARKER.decode()), 1)
-        self.assertIn('Effective delegation profile: 75% / read-only', text)
+        self.assertIn('Effective delegation profile: 75% / read-only; effort=high', text)
         self.assertIn('explicit read-only always remains read-only', text)
 
         self.assertTrue(project.detach(self.repo, coordinator='codex'))
