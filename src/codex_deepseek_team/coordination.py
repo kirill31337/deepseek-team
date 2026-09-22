@@ -530,6 +530,7 @@ def summary(task: dict) -> str:
     lines = [
         f"DeepSeek Team coordination task {task['id']}: "
         f"{task['policy']['delegation_level']}%/{task['policy']['effective_access']}; "
+        f"effort={task['policy'].get('effort', 'auto')}; "
         f"classification={task.get('classification') or 'pending'}.",
     ]
     for row in task.get("assignments", []):
