@@ -127,5 +127,5 @@ Coordinator-native subagents run under the coordinator runtime's own native agen
 permissions and sandboxing; they are not placed inside the DeepSeek Team worker sandbox.
 This does not change the isolation of DeepSeek workers.
 
-No worker stages, commits, pushes, deploys, publishes, accesses production, or reads
-coordinator secrets.
+No DeepSeek worker stages, commits, pushes, deploys, publishes, accesses production,
+reads coordinator secrets, or delegates to another agent.
