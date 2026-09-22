@@ -70,6 +70,12 @@ def handle(payload: dict) -> dict:
         task = coordination.begin_turn(
             root, session_id=session, turn_id=str(payload.get("turn_id") or "turn"),
             prompt=str(payload.get("prompt") or ""), policy=policy)
+        effort_context = (
+            "Effort policy is auto: choose low, medium or high for each DeepSeek assignment "
+            "from task complexity and pass it explicitly. "
+            if policy.effort == "auto" else
+            f"Effort policy is forced to {policy.effort}: use that level for new DeepSeek assignments. "
+        )
         text = (
             coordination.summary(task) + "\n"
             "Before coordinator source edits for a substantial task, register a concrete "
@@ -79,8 +85,8 @@ def handle(payload: dict) -> dict:
             "default to DeepSeek unless a supported concrete constraint is recorded. "
             "Coordinator-native subagents are also allowed when the plan uses executor "
             "native-agent with a concrete delegation_reason; they complement and do not replace "
-            "required DeepSeek worker assignments. Choose each DeepSeek worker effort explicitly "
-            "as low, medium or high from task complexity. Do not report a useful-work percentage from counts."
+            "required DeepSeek worker assignments. " + effort_context +
+            "Do not report a useful-work percentage from counts."
         )
         return _context(text, event)
     task = coordination.latest_task(root, session)
