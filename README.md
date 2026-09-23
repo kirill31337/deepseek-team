@@ -4,594 +4,180 @@
 
 **English** | [Русский](https://github.com/kirill31337/deepseek-team/blob/main/README.ru.md)
 
-One Linux package for **Codex and/or Claude Code coordinators** delegating bounded coding work to DeepSeek workers. The current source supports **Auto delegation with project learning** and manual **25/50/75% profiles**, independent `read-only/full-access` policy, and reusable isolated development copies.
+DeepSeek Team lets **Codex and Claude Code** delegate implementation, tests, documentation and research to isolated **DeepSeek workers**. The coordinator plans the work, reviews the results and integrates accepted changes. Workers handle independent tasks; full-access jobs use their own development copies.
 
-**The coordinator owns:** scope, architecture, security decisions, final diff review, integration, commits and production actions. **DeepSeek contributes:** focused research/review and, when full-access is selected, independent implementation, local tests/builds and documentation inside a dedicated copy. DeepSeek workers stay on `deepseek-flash`; effort defaults to `auto`, so the frontier coordinator chooses `low`/`medium`/`high` per assignment unless a persistent forced effort is configured. Codex/Claude may also use their own native subagents when they can state a concrete reason for doing so; native subagents complement rather than replace required DeepSeek assignments. The coordinator should verify useful evidence instead of automatically repeating the whole delegated investigation or rewriting correct code.
+Workers always run the `deepseek-flash` model. Effort policy is `auto`, so the coordinator chooses `low`, `medium` or `high` for each assignment unless you save a fixed level. Live delegation needs its own **DeepSeek API key**; DeepSeek Team does not reuse the credentials your coordinator already has.
 
-The percentages are **target work-distribution profiles**, not measured token/time/line quotas and not promises of exact useful contribution. Small or inseparable tasks may delegate less. Fresh installs default to **Auto + access=auto → read-only**. Auto immediately admits eligible bounded work and learns from recorded outcomes. Saved manual 25/50/75 preferences retain priority and continue collecting outcomes.
+This README describes version **0.8.0** of the `codex-deepseek-team` distribution, which installs the single `deepseek-team` executable.
 
-Version **0.8.0** adds immediate useful delegation and a FIFO worker queue alongside the product installation flow, and keeps hybrid routing, persistent learning, chronological evaluation and transactional experiment budgets; see [the routing guide](https://github.com/kirill31337/deepseek-team/blob/main/docs/ROUTING.md). It retains frontier-selected DeepSeek effort with persistent `auto|low|medium|high` policy, preserves justified native Codex/Claude subagents alongside DeepSeek workers, and keeps DeepSeek workers fixed on `deepseek-flash` as isolated leaf workers. The release supports **Linux, Python 3.11+, Git, Bubblewrap, and Codex CLI and/or Claude Code CLI**. Ubuntu has first-class AppArmor setup for its restricted unprivileged-user-namespace policy. A DeepSeek API key is required for live work. There are no Python runtime dependencies; Bubblewrap/AppArmor are system components.
+## Prerequisites
 
-The current source also supports Claude Code coordination hooks: both coordinators use the persistent task ledger and the saved project `on/off` switch.
+- **Linux.** Native Windows and macOS are not supported.
+- **Python 3.11 or newer** and **Git** on `PATH`.
+- **Codex CLI and/or Claude Code CLI** on `PATH`, normally configured. Install whichever coordinator you intend to use; `both` covers both.
+- **Bubblewrap** (`bwrap`) and a working Linux OS sandbox. Every worker needs it before any credential is read, and it cannot be turned off.
 
-## Quick start
+On Ubuntu, `setup --with-sandbox` can install the required system components (see below). On other distributions, install Bubblewrap and any AppArmor prerequisites with your own package manager first, then check `deepseek-team sandbox status`.
 
-Install the CLI once for your user. PyPI publication is still pending, so install from the tested Git source:
+## Install
+
+PyPI publication is not available yet, so install from the Git repository. [pipx](https://pipx.pypa.io/latest/how-to/install-pipx.html) keeps the CLI in its own environment and is the recommended route:
 
 ```bash
-# Ubuntu 23.04+: install pipx once.
-sudo apt-get install pipx
+sudo apt-get install pipx      # Ubuntu, once
 pipx ensurepath
-
-# Open a new terminal, then install DeepSeek Team.
+# Open a new terminal so PATH is refreshed.
 pipx install 'git+https://github.com/kirill31337/deepseek-team.git'
-# Or, after cloning the repository: pipx install .
 ```
 
-`pipx ensurepath` changes shell configuration, so open a new terminal before running `pipx install`. See the [pipx installation guide](https://pipx.pypa.io/latest/how-to/install-pipx.html) for other distributions. After the first PyPI release, the equivalent package command will be `pipx install codex-deepseek-team`. With [uv](https://docs.astral.sh/uv/getting-started/installation/), use `uv tool install 'git+https://github.com/kirill31337/deepseek-team.git'` now, or `uv tool install codex-deepseek-team` after publication.
-
-For a virtual-environment installation instead of pipx:
+Compact alternatives, if you already prefer another manager:
 
 ```bash
+# uv
+uv tool install 'git+https://github.com/kirill31337/deepseek-team.git'
+
+# pip inside a virtual environment only
 python3 -m venv ~/venvs/deepseek-team
 . ~/venvs/deepseek-team/bin/activate
 python -m pip install 'git+https://github.com/kirill31337/deepseek-team.git'
 ```
 
-Use `pip` only inside a virtual environment; do not use `sudo pip` or `--break-system-packages`.
-
-Set up the user-level integration, then attach each project by its explicit path:
-
-```bash
-# Ubuntu: explicitly permit installation and probing of Bubblewrap/AppArmor.
-deepseek-team setup --with-sandbox
-
-# Attach a project. Replace this example with the project you want to enable.
-deepseek-team init --coordinator codex /path/to/project
-cd /path/to/project
-deepseek-team doctor --runtime auto --offline
-```
-
-On a non-Ubuntu system, or when the sandbox prerequisites are already installed, replace `setup --with-sandbox` with `setup`. `setup` defaults to `--runtime auto` and detects Codex and Claude Code on `PATH`; use `--runtime codex`, `claude`, or `both` to choose explicitly. `setup --with-sandbox` authorizes privileged Ubuntu package/profile installation. Both ordinary setup and `setup --with-sandbox` probe the sandbox. Ordinary `setup` never uses `sudo`: it reports missing prerequisites and the action needed. `setup --no-key` skips credential access and prompting. It prints readiness and native hook-trust instructions, but does not attach projects. In Codex, review the package hook through `/hooks`; for Claude, start a new session and check `/hooks`.
-
-Use `--coordinator claude` for Claude Code or `--coordinator both` when the project will use both coordinators. Keep the DeepSeek credential private and set it separately with `deepseek-team auth set` when live work is needed.
-
-For release-owner steps, see [PUBLISHING.md](https://github.com/kirill31337/deepseek-team/blob/main/docs/PUBLISHING.md).
-
-## How routing works: classifier, estimator, router
-
-The system answers three questions in order: **what is this task, how likely is DeepSeek to complete it well, and is delegating it worthwhile?**
-
-1. **The classifier describes the task.** Before execution, the Codex or Claude coordinator records what needs changing, where the code is, how many components are involved, the risk, and how the result will be checked. It also records the worker's model, runtime and reasoning effort. Unknown task details stay unknown. This feature card is filled by the coordinator; the package does not train a separate classifier.
-2. **The estimator learns from comparable results.** It estimates the chance that a DeepSeek result will be accepted without rework and shows how uncertain that estimate is. A Python bug fix is compared with the same kind of operation under matching execution conditions. Old results gradually lose weight. Explicitly imported public benchmarks can help, but their contribution is capped so that enough local experience can outweigh them.
-3. **The router chooses an executor.** It first checks permissions and which responsibilities belong to the coordinator. Auto immediately admits eligible bounded tasks while learning from quality and measured total cost, including review and rework. The decision and its reasons are saved; the coordinator launches any assigned worker and reviews its work.
-
-**Example:** for “add a `--quiet` flag to `status` and a unit test,” the coordinator can record a small, localized Python change with a clear check. After execution it records whether the result was accepted, needed rework, or was rejected, plus the total cost when known. This updates the statistics for later comparable tasks. Learning needs no model fine-tuning or separate paid training runs; saved manual `25`/`50`/`75` profiles collect the same feedback.
-
-**Auto delegates useful bounded work immediately by default**. Small or medium tasks with low or medium risk, known or partial localization, local or component coupling, clear requirements and declared tests or a reproducer can be assigned from the first session. Manual verification is allowed for read, review, research, diagnostic, test-plan and documentation tasks with explicit acceptance criteria. Implementation requires executable checks and `full-access`.
-
-Unknown costs stay unknown and do not block eligible work; supported poor measured economics still veto delegation. One rework is recorded without a family pause. A rejection or three distinct rework cases within the cooldown window pause the family for the configured `failure_cooldown_seconds` (300 seconds by default). Immediate admission resumes after the pause. Failed implementation never retries automatically.
-
-Fresh Auto access remains **read-only**. To delegate implementation, explicitly opt in:
-
-```bash
-deepseek-team config set --project --access full-access
-```
-
-The coordinator decomposes meaningful independent slices, reviews actual diffs and declared checks, and reports accepted work and rework without repeating the worker's investigation or inventing percentage savings. Architecture, security, integration, final verification, commits and production remain coordinator-owned. Saved manual profiles, explicit permissions and `off` retain priority.
-
-See [the routing guide](https://github.com/kirill31337/deepseek-team/blob/main/docs/ROUTING.md) for the diagram, scoring details and commands.
-
-## Installation from a local clone and sandbox setup
-
-Install the coordinator CLI(s) you intend to use, then install this standard Python distribution:
+To install from a local checkout instead:
 
 ```bash
 git clone https://github.com/kirill31337/deepseek-team.git
 cd deepseek-team
 pipx install .
-deepseek-team setup --with-sandbox --no-key
-deepseek-team sandbox status
 ```
 
-Use `uv tool install .` or `python -m pip install .` inside a virtual environment as alternatives. The distribution is `codex-deepseek-team`, the Python package is `codex_deepseek_team`, and the executable is `deepseek-team`.
+## Quick start
 
-`setup --with-sandbox` explicitly permits privileged Ubuntu installation of `bubblewrap`, `apparmor` and the package-owned named profile `deepseek-team-bwrap`. Setup probes the sandbox before credential access. AppArmor and `kernel.apparmor_restrict_unprivileged_userns` stay enabled. On other distributions, or with prerequisites already installed, use `deepseek-team setup --no-key`.
-
-For reference, explicit coordinator setup remains available:
+`setup` prepares your user-level integration. `init` then attaches the Git project where you want to use delegation.
 
 ```bash
-# Codex only
-deepseek-team setup --runtime codex
-deepseek-team hooks status
+# 1. Prepare the user-level integration for Codex. --no-key defers the credential.
+deepseek-team setup --runtime codex --no-key
+
+# 2. Store the DeepSeek API key. The prompt is hidden; the key is never echoed.
+deepseek-team auth set
+
+# 3. Attach a project so its coordinator reads the delegation instructions.
+cd /path/to/project
+deepseek-team init --coordinator codex .
+
+# 4. Optional: allow implementation inside an isolated development copy.
+deepseek-team config set --project --access full-access
+
+# 5. Confirm local readiness. This stays offline: no key is read and no request is sent.
 deepseek-team doctor --runtime codex --offline
-deepseek-team init --coordinator codex /path/to/project
-# In Codex, review/trust the stable hook definition once with /hooks.
-
-# Claude Code only
-deepseek-team setup --runtime claude
-deepseek-team hooks status --runtime claude
-deepseek-team doctor --runtime claude --offline
-deepseek-team init --coordinator claude /path/to/project
-# Start a new Claude session and check /hooks.
-
-# Or both
-deepseek-team setup --runtime both
-deepseek-team doctor --runtime both --offline
-deepseek-team init --coordinator both /path/to/project
 ```
 
-### Codex lifecycle hooks
+A few notes:
 
-`deepseek-team setup --runtime codex` installs or refreshes the stable DeepSeek Team user-level lifecycle hooks in `$CODEX_HOME/hooks.json`, while preserving the primary Codex model and existing OpenAI authentication.
+- `--no-key` deliberately defers authentication so `setup` never prompts for or reads a secret. Store the key separately with `deepseek-team auth set`, or omit `--no-key` on a terminal when you are ready.
+- Fresh access defaults are **read-only**. Step 4 lets Auto delegate implementation by explicitly granting write access. Full-access means a private, owned development copy, not the host system.
+- On Ubuntu, the very first setup may need to install the sandbox package and a named AppArmor profile. Use `deepseek-team setup --runtime codex --with-sandbox --no-key` for that explicit, administrator-authorized step. Ordinary setup never invokes `sudo`; on other distributions install the system prerequisites yourself.
+- For Claude Code, substitute `claude` for `codex` in `--runtime` and `--coordinator`, or pass `both` to prepare both coordinators.
+- Codex owns native hook trust: review and trust the installed hook once with `/hooks`. In Claude Code, start a fresh session and check `/hooks` there.
 
-Useful commands:
+## What gets delegated
 
-```bash
-deepseek-team hooks install
-deepseek-team hooks status
-deepseek-team hooks remove
-```
+Auto delegation admits suitable work immediately; it does not wait for prior history to accumulate. A task is a good candidate when it is:
 
-The user-level hook is deliberately inert in unrelated repositories. Coordinator enforcement becomes active only in a repository explicitly attached with:
+- small or medium, with low or medium risk;
+- localized to a known or partially known place, with local or component-level coupling;
+- clear about acceptance, with a way to check the result.
 
-```bash
-deepseek-team init --coordinator codex /path/to/project
-```
+Implementation needs an executable check - tests, a build or a reproducer. Review, research and documentation tasks may use manual acceptance criteria instead. Unknown costs never block eligible work, and the coordinator keeps anything whose measured economics do not justify delegation.
 
-Codex owns native hook trust. Review/trust the stable DeepSeek Team hook once from Codex with `/hooks`; DeepSeek Team does not bypass or infer that decision. Normal package updates keep the same hook command and **do not require re-running `init` for projects that are already attached**.
+The coordinator records what actually happened after reviewing the real diff and the declared checks. One rework is recorded without pausing anything; a rejection, or three distinct recent reworks, pauses only that task family for 300 seconds. Failed implementation is never retried automatically.
 
-`hooks remove` removes only the package-owned DeepSeek Team handlers and preserves unrelated user hooks.
+Access is independent of effort and history:
 
-### Claude Code lifecycle hooks
+- **Read-only** (fresh default): workers inspect and report, and cannot modify the project.
+- **Full-access** (explicit): workers implement, run local checks and write documentation inside an isolated copy owned by the job.
 
-`deepseek-team setup --runtime claude` installs DeepSeek Team handlers in `~/.claude/settings.json`, or in `$CLAUDE_CONFIG_DIR/settings.json` when that environment variable is set. Existing model, permissions, credentials and unrelated hooks are preserved. Projects opt in with `deepseek-team init --coordinator claude /path/to/project`.
+Workers never commit, push, publish, deploy, touch production services or spawn further agents. Those remain coordinator actions.
 
-```bash
-deepseek-team hooks install --runtime claude
-deepseek-team hooks status --runtime claude
-deepseek-team hooks remove --runtime claude
-```
+## Asking for help in a session
 
-Use `--runtime both` for both coordinators, or `--runtime auto` for those found on `PATH`. Without the flag, `hooks` continues to target Codex.
+Once setup and attachment are done, you do not run workers by hand. Ask in your normal coordinator session, in plain language:
 
-After installation, start a new Claude session and check `/hooks`. `hooks status` verifies the user-level definitions; it cannot confirm which hooks a running session has loaded. Claude's `disableAllHooks`, managed settings, or `--bare` can disable them. Installation preserves those settings. The [Claude hook reference](https://code.claude.com/docs/en/hooks) describes the native controls.
+> Implement the new cache layer under `src/cache/`. Delegate the independent implementation and its tests to DeepSeek workers, run the test suite inside the worker copies, and integrate only what you have verified. Keep the public API stable and show me the final diff before you commit.
 
-Package updates and `on/off` changes do not require another `init` for an attached project.
+The coordinator splits that into bounded assignments, runs them through the worker queue and reports the accepted work.
 
-## Install with an agent prompt
+## Current defaults
 
-You can ask Codex to install or update DeepSeek Team for the repository it is currently working in. Paste this short prompt into Codex from the project you want to enable:
-
-```text
-Install or update DeepSeek Team for /path/to/project from https://github.com/kirill31337/deepseek-team. Install it with pipx from the Git source; on Ubuntu run "deepseek-team setup --with-sandbox --no-key", otherwise run "deepseek-team setup --no-key" after the sandbox prerequisites are installed. Preserve my existing Codex model/auth, DeepSeek Team settings, and credential. Do not ask me to paste secrets into this prompt; if no DeepSeek key exists, leave secret entry to a human using "deepseek-team auth set". Attach this project with "deepseek-team init --coordinator codex /path/to/project" only if it is not already attached. Verify "deepseek-team --version", "deepseek-team sandbox status", "deepseek-team hooks status", and, from /path/to/project, "deepseek-team doctor --runtime codex --offline". Keep the required OS sandbox and AppArmor/Bubblewrap restrictions enabled. Review/trust the package-owned hook only through Codex "/hooks"; do not bypass its native trust process.
-```
-
-The prompt intentionally does **not** contain an API key and does not change your delegation level, access policy, or saved effort policy. Configure the private DeepSeek credential separately with `deepseek-team auth set`, and set `delegation_level` / `access` / `effort` explicitly if you want values other than the existing configuration or defaults.
-
-### Rootless/manual install
-
-A user-level package installation never invokes `sudo`:
-
-```bash
-pipx install .
-deepseek-team setup --no-key
-deepseek-team sandbox status
-```
-
-If `sandbox status` succeeds, no AppArmor change is needed. If Ubuntu blocks Bubblewrap while `kernel.apparmor_restrict_unprivileged_userns=1`, install the package profile explicitly:
-
-```bash
-deepseek-team sandbox install-apparmor
-deepseek-team sandbox status
-```
-
-or run `deepseek-team setup --with-sandbox --no-key`.
-
-On other Linux distributions, install Bubblewrap using the distribution package manager and run `deepseek-team sandbox status`. The package-managed AppArmor profile is specifically intended for Ubuntu/AppArmor user-namespace mediation.
-
-**Do not solve Ubuntu failures with** `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`. DeepSeek Team intentionally keeps the host restriction enabled and grants user-namespace creation only through its named AppArmor path when that fallback is needed.
-
-A working system Bubblewrap backend is required before workers run.
-
-## Why AppArmor + Bubblewrap
-
-Ubuntu can deny unprivileged applications access to user namespaces unless an AppArmor profile explicitly permits them. DeepSeek Team therefore ships this **named, non-attached** profile:
-
-```text
-profile deepseek-team-bwrap flags=(unconfined) {
-  userns,
-}
-```
-
-It is selected explicitly with `aa-exec -p deepseek-team-bwrap -- ...`. The profile does not attach globally to `/usr/bin/bwrap`, so it avoids replacing or competing with distribution/administrator profiles. Its job is only to permit creation of the initial user namespace; **Bubblewrap defines the actual filesystem/process sandbox policy**.
-
-Worker startup is fail-closed by default:
-
-1. locate `bwrap` and verify the required options;
-2. try a direct user-namespace probe;
-3. if Ubuntu AppArmor blocks direct Bubblewrap and the restriction is active, retry through `aa-exec -p deepseek-team-bwrap`;
-4. if neither path works, stop **before reading the DeepSeek credential**.
-
-There is no automatic unsandboxed fallback.
-
-## Isolation modes
-
-Read-only workers retain their runtime-specific boundary. Managed development copies used by full-access use a stricter sparse outer Bubblewrap boundary for **both** runtimes.
-
-### Read-only runtime boundary
-
-### Codex worker
-
-Current Codex on Linux already has its own Bubblewrap-backed sandbox. Nesting Codex inside another Bubblewrap namespace with further user-namespace creation disabled would break that native sandbox.
-
-DeepSeek Team therefore:
-
-- probes a usable system/AppArmor-aware Bubblewrap backend before worker credentials are read;
-- creates a private temporary `bwrap` shim inside the worker session;
-- puts that shim first on the worker `PATH`;
-- lets **Codex itself** build its normal Linux sandbox using that verified `bwrap` path;
-- keeps the delegated read-only job under Codex's native `read-only` policy.
-
-The parent Codex auth/history/rules/plugins/apps/memories are not copied; the worker receives a temporary `HOME`/`CODEX_HOME` and only the DeepSeek provider configuration it needs.
-
-### Claude Code worker
-
-Claude Code does not provide the same native Linux Bubblewrap boundary for these built-in file tools, so DeepSeek Team puts the entire isolated Claude worker harness inside an **outer Bubblewrap namespace**:
-
-- read-only root filesystem;
-- fresh process/user/IPC/UTS namespaces;
-- dropped capabilities;
-- private `/tmp` and `/var/tmp`;
-- real user HOME masked, with only runtime roots needed to start the CLI re-exposed read-only;
-- common credential stores masked again after runtime mounts;
-- temporary worker HOME writable;
-- repository/worktree mounted read-only;
-- `--disable-userns` prevents the worker payload from creating another user namespace.
-
-Claude itself still runs `--bare`, with no session persistence. Built-in tools are restricted to `Read,Glob,Grep`; Bash, web tools and agents are absent, and MCP tools are explicitly denied.
-
-### Managed full-access boundary
-
-For both Codex and Claude, DeepSeek Team surrounds managed development copies with a sparse Bubblewrap namespace that exposes only the owned working copy, required runtime prefixes, a temporary HOME and a per-run control directory. Git administrative files are remounted read-only. The namespace uses `--unshare-net`; the worker cannot reach arbitrary host/network services.
-
-DeepSeek API access is provided only through a fixed-destination host relay connected to the namespace through a per-run Unix socket and namespace-local loopback bridge. The real provider credential stays in the host-side relay; the isolated runtime sees only a synthetic local credential. The relay is not a general proxy and accepts only the provider endpoints needed by the supported runtime protocols.
-
-Full-access therefore means **full development access to the assigned copy**, not full host access. It does not grant access to the user's other checkouts, dirty source checkout, secrets, production databases, system services, deployment credentials, publishing or Git integration/commits.
-
-### Read-only network boundary
-
-The read-only Claude worker must reach DeepSeek directly, so its outer sandbox intentionally does **not** unshare the network namespace. Network-facing model tools remain excluded by the Claude tool surface, while Codex keeps its own native sandbox/network policy.
-
-## DeepSeek credential
-
-Both runtimes share the same private DeepSeek credential:
-
-```bash
-deepseek-team auth set       # hidden terminal prompt
-deepseek-team auth status    # availability only
-```
-
-The saved key is `~/.config/codex-deepseek/api-key`, directory mode `700`, file mode `600`. `DEEPSEEK_API_KEY` overrides it. For automation, pipe a secret manager to `deepseek-team auth set --stdin`. Never put a key in command arguments, repository files or worker prompts.
-
-## Turn DeepSeek Team on or off
-
-Run these commands from the project directory, or ask Codex or Claude Code to run them:
-
-~~~bash
-deepseek-team off       # Disable new DeepSeek jobs in this project
-deepseek-team on        # Enable them again
-deepseek-team status    # Show the effective and saved state
-~~~
-
-For example: “Turn off DeepSeek Team in this project” or “Turn DeepSeek Team back on.” These are terminal commands, not built-in slash commands. Both coordinators use the same saved state.
-
-The choice persists across sessions and package updates. It is stored locally for your user, separately for each checkout, under `${XDG_CONFIG_HOME:-~/.config}/deepseek-team/activation/`. Nothing is added to Git. Commands also work from subdirectories; you can pass a project path explicitly, for example `deepseek-team off /path/to/project`. `status --json` reports the effective state, saved state and source. Outside a Git working copy, specify a project path.
-
-By default, delegation is enabled. `off` prevents new workers from starting, including reuse of workspaces belonging to that source project, and disables Codex and Claude coordination gates on subsequent hook events. Live diagnostics also respect it. Already running workers continue; their results and coordination records are retained. `on` restores delegation with the existing access, percentage and effort settings. Credentials and project instruction files are unchanged. It does not install hooks or attach a new project; initial setup still uses `setup` and `init`.
-
-`DEEPSEEK_TEAM_DISABLED=1` overrides the saved choice. If it is set, `on` saves the enabled state but reports that delegation remains disabled until the environment override is removed. `config show --effective --instructions` also reports activation and tells the coordinator to continue locally while disabled.
-
-Both coordinators receive the current state through their installed, enabled hooks. The worker command also enforces the switch even if a chat still contains old instructions. Existing attached projects can optionally refresh their instruction blocks once with `deepseek-team init --coordinator both .` to include the new switch guidance (choose `codex` or `claude` if only one is used). Toggling itself never requires another `init`.
-
-## Delegation profiles and access
-
-Settings are layered independently:
-
-`CLI arguments > project settings > global settings > defaults`.
-
-| Profile | `access=auto` | Intended practice |
+| Setting | Current default | Notes |
 | --- | --- | --- |
-| **Auto (default)** | `read-only` | Immediately delegate eligible bounded tasks; learn from outcomes within configured access. |
-| **25%** | `read-only` | Bounded research, diagnosis and review; coordinator performs the main implementation. |
-| **50%** | `full-access` | Delegate independent implementation slices and their tests before doing the same work locally; coordinator owns architecture/interfaces and integration. |
-| **75%** | `full-access` | Delegate most separable implementation, tests, docs and independent review; run independent assignments within the configured concurrency limit. |
+| Delegation | `auto` | Chooses the executor per task; no fixed quota. |
+| Access | `auto` -> read-only in Auto | Full-access enables isolated implementation. |
+| Model | `deepseek-flash` | Fixed for all workers. |
+| Effort | `auto` | Coordinator picks `low`/`medium`/`high` per assignment. |
+| Workers | `8` | Configurable 1-64; further jobs queue FIFO. |
+| Total timeout | unlimited | An explicit timeout also includes queue time. |
 
-Access is independent of the target percentage. An explicit `read-only` remains read-only at 50/75, and an explicit `full-access` can be selected at 25. Changing the percentage does not overwrite an explicit access choice; return access to `auto` when you want profile defaults again.
-
-### Worker queue and parallel execution
-
-Eligible assignments remain assigned to workers when execution slots are busy. Assignment is separate from execution: launches wait FIFO, with **8 concurrent workers by default**, configurable from 1 to 64. Each managed assignment needs an owned isolated copy; parallel work must be independent.
+Inspect or change the settings per project:
 
 ```bash
+deepseek-team config show --effective
 deepseek-team config set --project --max-workers 8
-# Or save a user-wide limit:
-deepseek-team config set --global --max-workers 8
-# One-job override:
-deepseek-team worker --runtime codex --max-workers 4
+deepseek-team on      # enable delegation for this project
+deepseek-team off     # disable it without deleting settings
+deepseek-team status  # show the saved and effective state
 ```
 
-Default waiting and total timeout are unlimited. `worker --no-wait` returns capacity exit code `75` when no slot is available; explicit `--timeout` includes queue time. Before provider launch or credential access, queued work rechecks `off`, access, routing authorization and project HEAD. Waiting never widens permissions. The required OS sandbox, private network and fixed relay for managed copies are unchanged.
+The optional manual **25/50/75** profiles are target distributions, not measured quotas. With `access=auto`, profile 25 uses read-only and profiles 50/75 use full-access. An explicitly saved `read-only` setting always takes priority. See the [routing guide](https://github.com/kirill31337/deepseek-team/blob/main/docs/ROUTING.md) for how admission, evidence and feedback work.
 
-### DeepSeek model, effort and coordinator-native subagents
+## Isolation
 
-DeepSeek Team currently routes every managed worker to **`deepseek-flash`**. There is intentionally no Flash/Pro model router. The saved effort policy defaults to **`auto`**. In `auto`, the frontier Codex/Claude coordinator selects `--effort low|medium|high` for each DeepSeek assignment: `low` for bounded/mechanical work or broad scans, `medium` for the normal case, and `high` for difficult debugging, cross-file reasoning or demanding independent review. A direct worker that reaches the runner without a concrete frontier selection uses `medium` only as an execution fallback.
+Workers require the Linux OS sandbox. Full-access work runs in an owned development copy with restricted filesystem and network access. The coordinator retains architecture, security decisions, final verification and integration.
 
-The primary Codex/Claude coordinator keeps its native subagent capability. For substantial work, a native-subagent deliverable is represented in the coordination plan as `"executor": "native-agent"` with a concrete `"delegation_reason"`. Native subagents are useful for genuinely parallel work, isolated context, or native-runtime capabilities, but they do **not** count as a DeepSeek worker assignment required by the 50/75 profiles. Protected coordinator responsibilities remain coordinator-owned. The DeepSeek workers themselves still have agent/delegation tools disabled and remain leaf workers.
+Read-only and full-access workers have different isolation boundaries; see [Hardening](https://github.com/kirill31337/deepseek-team/blob/main/docs/HARDENING.md) for the exact filesystem, credential and network rules.
 
-Examples:
+## Diagnostics
 
 ```bash
-# Project policy
-deepseek-team config set --project --delegation-level 50 --access auto
-
-# User-wide policy
-deepseek-team config set --global --delegation-level 25 --access read-only
-
-# Effective values plus the source of each field
-deepseek-team config show --effective
-deepseek-team config show --effective --json
-
-# Persist effort for this project (frontier no longer chooses per job)
-deepseek-team config set --project --effort high
-
-# Or persist it user-wide
-deepseek-team config set --global --effort high
-
-# Restore automatic frontier selection
-deepseek-team config set --project --effort auto
-
-# One-job override
-deepseek-team worker --runtime codex --delegation-level 75 --access full-access --effort high
+deepseek-team doctor --runtime codex --offline   # local readiness; no key read
+deepseek-team hooks status --runtime codex      # whether managed hooks are installed
+deepseek-team sandbox status                    # Bubblewrap and AppArmor backend
+deepseek-team auth status                       # whether a saved key exists
 ```
 
-Project settings live in `.deepseek-team.toml`; global settings live under the user's XDG config directory. `effort` follows the same precedence as the other policy fields: one-job CLI override > project > global > default (`auto`). Settings are snapshotted when a new job starts and do not change an already running process.
+These checks make no provider requests. Local readiness does not validate the key with DeepSeek; live worker requests use your DeepSeek API account.
 
-`config show --effective --instructions --runtime codex|claude` renders the current coordinator guidance. Managed AGENTS.md/CLAUDE.md blocks tell the coordinator to resolve this current policy before each assignment instead of relying on a stale percentage embedded in the file.
+## Update and uninstall
 
-`doctor` resolves and prints the same effective policy. When effective access is full-access it checks the managed runtime capability surface that will actually be used. The OS sandbox is required for every worker.
-
-## Coordinator process enforcement
-
-DeepSeek Team uses a persistent coordination ledger outside the repository. It records session/task ids, deliverables, worker assignments, workspace ids, declared dependencies/checks, worker-only file deltas, results, dispositions and technical constraints. It is deliberately **not** a scheduler or project-management system.
-
-For Codex, `deepseek-team setup --runtime codex` places one stable user-level lifecycle hook definition in `$CODEX_HOME/hooks.json`. The hook is inert unless the current repository has already been explicitly attached with `deepseek-team init --coordinator codex /path/to/project`. Codex owns native hook trust; review/trust the stable definition once with Codex `/hooks`. DeepSeek Team does not bypass or infer that decision.
-
-Claude uses the same ledger through its user-level hooks and a project attached with `init --coordinator claude`. Both integrations handle these events:
-
-- `SessionStart` and `UserPromptSubmit` restore/inject the current coordination state, including after compaction;
-- `PreToolUse` can technically deny coordinator source mutation before execution when the distribution is missing/noncompliant, when a new scope was not planned, or when the path is still owned by a pending worker assignment;
-- `Stop` requests a continuation while assignments are pending, worker results have no disposition, or coordinator/native-agent deliverables lack a terminal outcome. In both runtimes, a repeated Stop shows the remaining work and leaves the task unfinished without vetoing another hook's continuation.
-
-An unplanned turn with no recorded work (for example, a status question) closes its provisional record without claiming implementation completion or requiring a distribution plan. A status question during an unfinished task preserves that task and its assignments.
-
-Claude's gate covers `Edit`, `Write`, `NotebookEdit` and recognized mutating `Bash` commands. File paths are checked against the project scopes, including absolute paths. In plan mode, Markdown files in Claude's native plan directory can be edited before a distribution is registered, and `Stop` leaves the task open. This exception supports the default directory and `plansDirectory` in user, project or local settings files. Shell detection distinguishes quoted text and heredoc bodies from actual redirections and known write commands; it does not intercept every possible write through arbitrary programs or external tools. Claude native-subagent events do not open, complete or enforce the coordinator's task. These hooks control the coordinator's workflow; worker isolation is enforced separately by the OS sandbox.
-
-At **75/full-access**, ordinary separable implementation, tests, fixtures, documentation and non-secret metadata are worker-eligible by default. Merely running one implementation/review worker does not satisfy the profile if the coordinator then retains the remaining worker-eligible work without a supported constraint. At **50/full-access**, a review-only worker does not substitute for delegating an available implementation/test/docs slice. Access remains independent: an explicit read-only override never becomes writable.
-
-Before a substantial task mutates source, either coordinator registers concrete deliverables:
-
-```bash
-deepseek-team coordination plan --task TASK_ID <<'JSON'
-{
-  "classification": "substantial",
-  "deliverables": [
-    {
-      "id": "implementation",
-      "kind": "implementation",
-      "scope": ["src/example.py"],
-      "executor": "worker",
-      "acceptance": ["focused behavior implemented"],
-      "dependencies": [{"kind": "command", "value": "python3"}],
-      "checks": ["python3 -m unittest tests.test_example -q"]
-    }
-  ]
-}
-JSON
-```
-
-The assignment returned by that plan is tied to the runner. Use `--runtime claude` when Claude Code is coordinating; the example below uses Codex:
-
-```bash
-deepseek-team worker --runtime codex --effort medium \
-  --coord-task TASK_ID --coord-assignment ASSIGNMENT_ID <<'TASK'
-Implement the assigned deliverable and satisfy its registered acceptance criteria.
-TASK
-```
-
-Runner start/completion, workspace id, worker-only delta and declared checks are recorded automatically. After coordinator inspection:
-
-```bash
-deepseek-team coordination use --task TASK_ID --assignment ASSIGNMENT_ID \
-  --disposition incorporated --evidence "reviewed diff and accepted result"
-```
-
-Record each verified coordinator or native-agent deliverable before completion:
-
-```bash
-deepseek-team coordination result --task TASK_ID --deliverable DELIVERABLE_ID \
-  --outcome accepted --evidence "reviewed changes and checks passed"
-```
-
-An explicit current result is required; feedback observations alone cannot complete a deliverable. Only `accepted` and explicitly `cancelled` outcomes are terminal; rework, rejection and infrastructure failures keep the deliverable open. A later recognized mutation in its scope requires fresh acceptance. Native-agent results are recorded for completion but do not train coordinator routing estimates. Compatible replans preserve recorded results.
-
-If an assignment needs selected uncommitted source, import only the required files:
-
-```bash
-deepseek-team workspace import WORKSPACE_ID --include path/to/needed.py
-```
-
-Those files are recorded as coordinator-prepared input, not worker authorship. Declared dependencies are also checked **inside the actual worker sandbox before the provider credential is read**. Host-only JDK/SDK/tools are not assumed to exist in full-access. Missing dependencies must be prepared explicitly with `workspace prepare`; replacing them with stubs is not treated as equivalent verification.
-
-Both coordinators may use justified native subagents; those native agents use the host runtime's own model/permissions/sandbox and are outside the DeepSeek worker sandbox.
-
-The 25/50/75 value remains a **target policy, not a measured productivity percentage**. DeepSeek Team records observable facts; it does not convert call counts, files, lines, tokens, task bullets or subjective outcomes into a fake "actual contribution %" metric.
-
-## Project integration
-
-`init` manages one marked instruction block in the coordinator-native file:
-
-- Codex: `AGENTS.md`
-- Claude Code: `CLAUDE.md`
-- `--coordinator both`: both files
-
-Existing bytes outside the managed block and file permissions are preserved. Managed instructions require the OS sandbox; if the sandbox is unavailable, fix it or continue locally. At 50/75 full-access the guidance explicitly says to delegate an independent implementation slice **before** the coordinator independently implements the same slice, while architecture, final verification and integration remain coordinator-owned.
-
-Changing project settings refreshes package-owned managed blocks when present, without changing surrounding user text. The block still resolves the current policy before every new assignment.
-
-An ordinary package update does **not** require re-running `init` for a project that is already attached. The stable user-level Codex hook is refreshed by the setup command, while the existing managed project block remains the activation marker. Run `init` only when attaching a new repository, enabling an additional coordinator, or deliberately restoring a managed block after it was detached.
-
-## Read-only delegation
-
-Codex:
-
-```bash
-deepseek-team worker --runtime codex <<'TASK'
-Inspect src/parser.py and tests/test_parser.py.
-Find the cause of the empty-input failure. Do not implement changes.
-Return concise evidence, suggested fix, risks and tests.
-TASK
-```
-
-Claude Code:
-
-```bash
-deepseek-team worker --runtime claude <<'TASK'
-Inspect src/parser.py and tests/test_parser.py.
-Find the cause of the empty-input failure. Do not implement changes.
-Return concise evidence, suggested fix, risks and tests.
-TASK
-```
-
-`--runtime auto` prefers Codex when both CLIs are available, otherwise Claude Code. Package-managed instructions use an explicit runtime so coordinator behavior does not silently switch.
-
-## Managed full-access development
-
-With effective `full-access`, `deepseek-team worker` creates an owned isolated copy from the source repository's **committed HEAD** unless an existing owned workspace is supplied. The worker may create, edit and delete previously unlisted project files and may run local tests/builds using dependencies prepared in that copy.
-
-The original checkout is never cleaned or adopted. Dirty, untracked and ignored user files remain untouched and are **not silently copied** into the worker environment. If the task depends on them, the coordinator must deliberately provide safe source context rather than asking the user to clean their checkout.
-
-Typical one-shot use:
-
-```bash
-deepseek-team worker --runtime claude --delegation-level 50 --access full-access <<'TASK'
-Implement the bounded parser fix.
-Acceptance criteria:
-- preserve the public parser API;
-- add a regression test for empty input;
-- run the focused local tests;
-- report changed files and checks actually run.
-TASK
-```
-
-For prepared dependencies or sequential iterations, explicitly create/reuse an owned workspace:
-
-```bash
-deepseek-team workspace create /path/to/project
-# note the printed workspace ID
-
-deepseek-team workspace prepare WORKSPACE_ID -- python3 -m venv .venv
-deepseek-team workspace prepare WORKSPACE_ID -- .venv/bin/pip install -r requirements.txt
-
-deepseek-team worker --runtime codex --workspace WORKSPACE_ID --access full-access <<'TASK'
-Implement the assigned change and run the relevant local tests.
-TASK
-
-deepseek-team workspace diff WORKSPACE_ID
-```
-
-A successful modified workspace can be reused for another iteration. If execution fails after partial edits, files and a recorded diff are retained. A further implementation does **not** start automatically; inspect the workspace first, then continue explicitly with `--resume-after-failure --workspace WORKSPACE_ID`.
-
-By default, up to eight workers run concurrently; additional launches wait FIFO. Each full-access assignment owns a separate copy and lock; one worker cannot see another worker's copy or the user's source checkout. The coordinator remains responsible for final review, integration, committing, pushing and deployment.
-
-## Sandbox commands
-
-```bash
-deepseek-team sandbox status
-deepseek-team sandbox install-apparmor
-deepseek-team sandbox remove-apparmor
-```
-
-`install-apparmor` refuses to overwrite a different/symlinked/non-file `/etc/apparmor.d/deepseek-team-bwrap`. `remove-apparmor` removes the policy only when its installed bytes still exactly match the package copy; administrator-modified policy is preserved.
-
-Every worker requires the OS sandbox. If the sandbox is unavailable, fix its configuration or perform the work with the coordinator.
-
-## Reliability and security boundaries
-
-- The configurable concurrency limit defaults to eight workers with user-level locks; managed workspaces additionally use ownership locks.
-- Default total timeout is `0` (unlimited). A slow/silent worker is not treated as failed.
-- Read-only transient failures can retry within the configured bounded attempt count. Managed full-access uses one attempt; partial work is retained and continuation requires explicit `--resume-after-failure`.
-- Worker output must be a completed structured result. Malformed JSON, invalid UTF-8, terminal failure events and empty successful answers are rejected.
-- `DEEPSEEK_TEAM_DISABLED=1` disables delegation.
-- DeepSeek/model names in prompts are requested configuration, not proof of the remotely served model; `doctor --live` performs the available routing probe.
-
-Bubblewrap + AppArmor materially tighten host isolation, but DeepSeek Team is **not a complete confidentiality boundary for arbitrary hostile repositories or coordinator binaries**. The Claude sandbox intentionally exposes the worktree and the runtime files required to start the CLI; Codex relies on Codex's native Bubblewrap policy. If the repository itself contains credentials, the model may be allowed to read them as project files. Use a dedicated OS user/container/VM when stronger isolation is required.
-
-## Checks
-
-```bash
-deepseek-team sandbox status
-deepseek-team config show --effective
-deepseek-team doctor --runtime codex --offline
-deepseek-team doctor --runtime claude --offline
-deepseek-team doctor --runtime both --offline
-
-# Verify the managed full-access capability surface selected by policy
-deepseek-team doctor --runtime both --offline --delegation-level 50 --access auto
-
-PYTHONPATH=src python3 -m unittest discover -s tests -v
-```
-
-`doctor --offline` verifies local sandbox/runtime capabilities and reports hook installation and project binding for the selected coordinator, without a DeepSeek API request or key validation. It does not confirm that a running session has enabled those hooks. `doctor --live` makes billable DeepSeek calls, uses a synthetic repository, and verifies that selected read-only workers do not modify it.
-
-Offline tests use synthetic credentials/transports. GitHub Actions runs the full unittest suite, builds/installs the wheel and exercises the `deepseek-team` command on Python 3.11, 3.12 and 3.13. A separate Ubuntu sandbox job exercises Bubblewrap/AppArmor. The dedicated **Delegation verification** workflow additionally installs pinned real Codex/Claude versions and drives their actual tool/protocol surfaces against an offline local provider fixture: read-only write denial, full-access unlisted-file creation/local tests, parallel isolated copies, explicit continuation after failure and provider-vs-execution failure classification are checked without a real DeepSeek key or paid request. A green CI matrix is not evidence of a live DeepSeek inference request.
-
-## Update and remove
-
-Update through the package manager that installed the tool:
+For a pipx Git install, upgrade through pipx and re-run the local setup steps:
 
 ```bash
 pipx upgrade codex-deepseek-team
-deepseek-team setup --runtime auto --no-key
-deepseek-team hooks status --runtime auto
-deepseek-team doctor --runtime auto --offline
+deepseek-team setup --runtime codex --no-key
+cd /path/to/project
+deepseek-team init --coordinator codex .
+deepseek-team doctor --runtime codex --offline
 ```
 
-If the repository was already attached before the update, do **not** re-run `init` just for the upgrade. For a new repository, attach it once with `deepseek-team init --coordinator codex /path/to/project` (or `--coordinator both` when both coordinator instruction files are desired). In Codex, review/trust the stable hook once with `/hooks`.
+Run `init` for each attached project to refresh its managed instructions; your own instruction text and saved preferences are preserved. With uv, refresh the Git installation using `uv tool install --force --refresh 'git+https://github.com/kirill31337/deepseek-team.git'`. In a virtual environment, use its `python -m pip install --upgrade` with the same Git source. A local-clone pipx installation is replaced with `pipx install --force .` from the updated clone.
 
-For a Git-source pipx installation, use `pipx upgrade codex-deepseek-team`: pipx retains the original installation source. For a local clone, run `pipx install --force .` from that clone. With uv, use `uv tool install --force --refresh 'git+https://github.com/kirill31337/deepseek-team.git'` to refresh Git and replace the installed tool. After the PyPI release, registry installs can use `pipx upgrade codex-deepseek-team` or `uv tool upgrade codex-deepseek-team`. For a venv, use its Python with `-m pip install --upgrade` and the same package source. Then run `deepseek-team setup --runtime auto --no-key`, `deepseek-team hooks status --runtime auto`, and `deepseek-team sandbox status`.
-
-Detach project instructions/package-owned coordinator configuration:
+To remove DeepSeek Team, detach each project before uninstalling. If you also want to delete the saved DeepSeek key, run `deepseek-team auth remove` while the command is still installed.
 
 ```bash
-deepseek-team detach --coordinator both /path/to/project
-deepseek-team reset --runtime both
-deepseek-team auth remove       # optional
+deepseek-team detach --coordinator codex /path/to/project   # for each attached project
+deepseek-team reset --runtime codex                         # remove managed integration
+pipx uninstall codex-deepseek-team
 ```
 
-If you also want to remove only the unchanged package-owned AppArmor policy:
+`detach` preserves your own instruction content, and `reset` removes only the package-owned provider block and hooks; your primary authentication and unrelated configuration are kept. Saved keys are **not** deleted by uninstall. For uv use `uv tool uninstall codex-deepseek-team`; for a venv use its `python -m pip uninstall codex-deepseek-team`. Substitute `claude` or `both` for `codex` wherever your runtime differs.
 
-```bash
-deepseek-team sandbox remove-apparmor
-```
+## Further reading
 
-`reset --runtime codex` removes this package's unmodified DeepSeek provider block and its Codex hooks. `reset --runtime claude` removes only the package-owned handlers from Claude settings. Both preserve primary auth/model, permissions and unrelated configuration. Environment keys and private Codex config backups are retained.
-
-Run `detach` and `reset` above before uninstalling. Then use `pipx uninstall codex-deepseek-team`, `uv tool uninstall codex-deepseek-team`, or `python -m pip uninstall codex-deepseek-team` with the virtual environment Python. A dedicated venv can then be deactivated and removed.
-
-## Scope
-
-This release remains **Linux-only**. Windows support is deliberately deferred rather than weakening worker isolation guarantees.
+- [Routing guide](https://github.com/kirill31337/deepseek-team/blob/main/docs/ROUTING.md) - admission, evidence and feedback.
+- [Hardening](https://github.com/kirill31337/deepseek-team/blob/main/docs/HARDENING.md) - coordinator and worker boundaries.
+- [Publishing](https://github.com/kirill31337/deepseek-team/blob/main/docs/PUBLISHING.md) - release-maintainer details.
+- [0.8.0 release notes](https://github.com/kirill31337/deepseek-team/blob/main/docs/releases/0.8.0.md)
+- Russian README: [README.ru.md](https://github.com/kirill31337/deepseek-team/blob/main/README.ru.md)
 
 ## License
 
