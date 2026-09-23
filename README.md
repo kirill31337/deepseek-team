@@ -108,6 +108,8 @@ Auto delegation admits suitable work immediately; it does not wait for prior his
 
 Implementation needs an executable check - tests, a build or a reproducer. Review, research and documentation tasks may use manual acceptance criteria instead. Unknown costs never block eligible work, and the coordinator keeps anything whose measured economics do not justify delegation.
 
+Every delegated subtask - even a small read-only history, search or review request - is planned and routed before another agent is assigned; in Auto a resolved worker decision means DeepSeek. The coordinator's own native subagents are an explicit exception: they need a `delegation_reason` and a `native_exception` (an explicit user request, or a native capability a DeepSeek worker cannot reach), the coordinator attests that evidence, and the native prompt carries `[deepseek-team:TASK_ID:DELIVERABLE_ID]` binding the registered scope.
+
 The coordinator records what actually happened after reviewing the real diff and the declared checks. One rework is recorded without pausing anything; a rejection, or three distinct recent reworks, pauses only that task family for 300 seconds. Failed implementation is never retried automatically.
 
 Access is independent of effort and history:

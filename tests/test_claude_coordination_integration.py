@@ -80,12 +80,17 @@ class RealClaudeCoordinatorHookTests(unittest.TestCase):
                     step = state['step']
                     state['step'] += 1
                     if step == 0:
+                        block = {'type': 'tool_use', 'id': 'tool_native', 'name': 'Agent',
+                                 'input': {'description': 'Inspect history',
+                                           'subagent_type': 'general-purpose',
+                                           'prompt': 'Inspect Git history independently'}}
+                    elif step == 1:
                         block = {'type': 'tool_use', 'id': 'tool_0', 'name': 'Read',
                                  'input': {'file_path': str(repo / 'a.py')}}
-                    elif step in (1, 3):
+                    elif step in (2, 4):
                         block = {'type': 'tool_use', 'id': f'tool_{step}', 'name': 'Write',
                                  'input': {'file_path': str(repo / 'a.py'), 'content': 'VALUE = 999\n'}}
-                    elif step == 2 and state['task']:
+                    elif step == 3 and state['task']:
                         plan = {'classification': 'substantial', 'deliverables': [{
                             'id': 'review', 'kind': 'review', 'scope': ['a.py'], 'executor': 'worker',
                             'acceptance': ['review the value'], 'dependencies': [], 'checks': [],
@@ -143,7 +148,7 @@ class RealClaudeCoordinatorHookTests(unittest.TestCase):
                 result = subprocess.run([
                     binary, '-p', '--no-session-persistence', '--output-format', 'json',
                     '--model', 'claude-sonnet-4-6', '--permission-mode', 'dontAsk',
-                    '--tools', 'Bash,Read,Write', '--allowedTools', 'Bash', 'Read', 'Write',
+                    '--tools', 'Bash,Read,Write,Agent', '--allowedTools', 'Bash', 'Read', 'Write', 'Agent',
                     '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}',
                     '--setting-sources', 'user', '--disable-slash-commands', '--max-turns', '8',
                     '--system-prompt', 'Offline coordinator fixture. Follow hook instructions.',
@@ -151,8 +156,9 @@ class RealClaudeCoordinatorHookTests(unittest.TestCase):
                 ], cwd=repo, env=env, capture_output=True, text=True, timeout=60)
                 self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
                 self.assertIsNotNone(state['task'], 'Hook task id did not reach Claude: ' + result.stdout)
-                self.assertGreaterEqual(state['step'], 6, 'Stop did not request a continuation')
+                self.assertGreaterEqual(state['step'], 7, 'Stop did not request a continuation')
                 results = '\n'.join(state['results']).lower()
+                self.assertIn('native delegation gate', results)
                 self.assertIn('distribution gate', results)
                 self.assertIn('pending worker assignment', results)
                 self.assertEqual((repo / 'a.py').read_text(), 'VALUE = 1\n')

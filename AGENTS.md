@@ -96,23 +96,35 @@ jobs and do not auto-select another value (a saved legacy `medium` normalizes to
 `auto` restores frontier selection. A direct worker launched while policy is auto falls
 back to `high` only when no frontier-selected concrete effort reaches the runner.
 
-The coordinator may also use its own **native subagents** when this materially improves
-parallelism, isolated context, independent verification, or access to a native capability.
-For a substantial planned deliverable, record this as `executor: "native-agent"` and add a
-concrete `delegation_reason`. A native subagent is additive: it does **not** satisfy a
-DeepSeek worker assignment required by the 50/75 profiles. Architecture/security decisions,
-final integration/verification, secrets/signing, commit/push and production actions remain
-coordinator-owned. DeepSeek workers themselves remain leaf workers and must not delegate.
+The coordinator may use its own **native subagents** only as an explicit exception, never for
+generic parallelism, isolated context or convenience alone. Every native-agent deliverable needs
+a concrete `delegation_reason` and a `native_exception`:
+
+- `{"code": "explicit_user_request", "evidence": "specific user request"}`, or
+- `{"code": "native_capability", "capability": "specific capability or tool unavailable to a DeepSeek worker", "evidence": "why it is required"}`.
+
+The coordinator attests this evidence; it is not mechanically proven user provenance. The native
+prompt or message must include `[deepseek-team:TASK_ID:DELIVERABLE_ID]` binding the registered
+native-agent scope, and its accepted or cancelled outcome is recorded like any other deliverable.
+A native subagent is additive: it does **not** satisfy a DeepSeek worker assignment required by the
+50/75 profiles. Architecture/security decisions, final integration/verification, secrets/signing,
+commit/push and production actions remain coordinator-owned. DeepSeek workers themselves remain
+leaf workers and must not delegate.
 
 ### Process
 
-For a substantial task, identify concrete deliverables before duplicating their
-implementation. Each deliverable needs: id, kind, concrete scope, executor,
-acceptance criteria, dependencies, and checks. `native-agent` executors additionally
-need `delegation_reason` explaining why native delegation is useful for that scope. Architecture, security decisions,
-final verification, integration, secrets/signing, commit/push and production stay
-with the coordinator. That responsibility alone does not reserve ordinary
-implementation, tests, fixtures, documentation, or non-secret metadata.
+Plan and route every delegated subtask before assigning another agent, even a small
+read-only history, search or review task. In Auto mode register `executor: "auto"` and
+inspect the resolved plan; a worker decision means DeepSeek. Ordinary short answers the
+coordinator gives directly need no fake worker, wait and control calls create no work,
+and new work sent to an already running agent also requires routing. Identify concrete
+deliverables before duplicating their implementation. Each deliverable needs: id, kind,
+concrete scope, executor, acceptance criteria, dependencies, checks, and for Auto a
+`features` card. `native-agent` executors additionally need `delegation_reason` and a
+`native_exception`. Architecture, security decisions, final verification, integration,
+secrets/signing, commit/push and production stay with the coordinator. That responsibility
+alone does not reserve ordinary implementation, tests, fixtures, documentation, or
+non-secret metadata.
 
 At 75/full-access, separable implementation/tests/fixtures/docs/non-secret metadata
 default to worker assignments. Retaining worker-eligible work requires a supported
@@ -213,6 +225,11 @@ hook trust is owned by Codex and must be reviewed there once; DeepSeek Team does
 bypass or infer it. Hooks are a coordinator-process guardrail, not a replacement for
 the worker Bubblewrap/AppArmor security boundary.
 
+The parent launch/message gate covers only the events the runtime actually delivers, not
+every possible write. Codex and Claude coverage is verified separately, so universal hook
+coverage must never be claimed; where the runtime cannot intercept an action these
+instructions remain authoritative. The mandatory worker OS sandbox is unchanged.
+
 For both runtimes, an unplanned turn with no recorded work closes without requiring
 a distribution plan or claiming implementation completion. Status prompts retain
 existing unfinished tasks. Stop requests continuation for unfinished assignments,
@@ -241,11 +258,12 @@ reads coordinator secrets, or delegates to another agent.
 ### Effective delegation profile: auto (adaptive) / full-access; effort=auto
 Percentages are target profiles of useful work, not call/token/line quotas. Do not manufacture tasks to reach a percentage. For a genuinely small single-output task, record the small classification and concrete scope instead of creating a fake worker. The coordinator owns architecture, security decisions, final verification, integration, secrets/signing, commit/push and production actions. These responsibilities do not by themselves reserve ordinary implementation, tests, fixtures, documentation or non-secret metadata from workers. Do not calculate an actual useful-work percentage from calls, deliverable counts, lines or files.
 DeepSeek Team workers always use deepseek-flash. Effort policy is auto, so before each DeepSeek assignment the frontier coordinator must choose --effort low, --effort high or --effort max from the assigned task without asking the user: low for bounded/mechanical work, high for the normal case, and max for difficult debugging, cross-file reasoning or adversarial review. The legacy spelling --effort medium is still accepted and treated exactly as high. If a DeepSeek worker is launched directly without a frontier-selected effort, the runner uses high as an execution fallback only.
-Coordinator-native subagents remain available. Use them only when parallelism, isolated context or a native capability materially helps. Represent that choice in the plan with executor: "native-agent" plus a concrete delegation_reason. Native agents complement DeepSeek workers and do not satisfy DeepSeek worker assignments required by the effective profile. Protected coordinator responsibilities remain with the coordinator. DeepSeek workers themselves remain leaf workers and must never delegate.
+Plan and route every delegated subtask before assigning another agent, even a small read-only history, search or review task; a worker decision means DeepSeek. Generic parallelism, isolated context or convenience alone is not a sufficient reason to use a native subagent. Ordinary short answers the coordinator gives directly need no fake worker or plan; wait and control calls create no work, and new work sent to an already running agent also requires routing.
+Coordinator-native subagents remain available only as an explicit exception. Represent that choice in the plan with executor: "native-agent", a concrete delegation_reason, and a native_exception: either {"code": "explicit_user_request", "evidence": "specific user request"} or {"code": "native_capability", "capability": "specific capability or tool unavailable to a DeepSeek worker", "evidence": "why it is required"}. The coordinator attests this evidence; it is not mechanically proven user provenance. In auto mode use executor: "auto" and let the router resolve DeepSeek or coordinator. The native prompt or message must include [deepseek-team:TASK_ID:DELIVERABLE_ID] binding the registered native-agent scope, and its accepted or cancelled outcome is recorded like any other deliverable. Native agents complement DeepSeek workers and do not satisfy DeepSeek worker assignments required by the effective profile. Protected coordinator responsibilities remain with the coordinator: architecture, security, integration, final verification, secrets/signing and publishing stay coordinator-only. DeepSeek workers themselves remain leaf workers and must never delegate.
 Auto delegates suitable work immediately by default. Actively split substantial work into meaningful independent implementation, test, fixture, documentation and review deliverables with executor:auto. Prepare interfaces and acceptance criteria before assigning; do not retain eligible work merely because history is missing or worker slots are busy.
 Delegation level is auto: the profile is adaptive per task, chosen from local outcomes and bounded external evidence instead of a fixed percentage. New auto plans must record executor: "auto" together with a "features" card capturing the task before execution: kind, domain, operation, localization, coupling, verification, clarity, risk, scope_size, runtime, model, effort and context_version. The coordinator classifies the task; the router resolves its saved feature card. Workers must not self-select a profile or stage. Admission is immediate: suitable small/medium low/medium-risk local/component tasks with clear requirements, known/partial localization and declared tests or a reproducer can start without prior evidence. Read-only deliverables and documentation may use explicit manual acceptance criteria. High/protected/unknown-risk, unbounded or unverifiable work stays with the coordinator. There is no initial trial quota or periodic coordinator holdout. Missing data and unknown prices do not block suitable work and never imply measured savings; supported poor economics still veto delegation. A rejected result or three distinct recent rework cases pause only that family for the configured cooldown (300 seconds by default). One rework is recorded without pausing the family; after a pause immediate admission resumes. There is no automatic paid exploration outside the normal task stream and no automatic permission widening; keep the resolved access and explicit executor choices. Inspect adaptive routing state with deepseek-team routing status and adjust it with deepseek-team routing configure.
 Full-access is development inside an owned isolated copy, not host access. Allow the worker to create/edit/delete project files in its assigned copy and run declared local checks. Prepare missing dependencies with workspace prepare. If selected uncommitted source is required, import only those files with workspace import; it is recorded as coordinator-prepared source, not worker output. Host SDK/JDK/tools are not assumed to exist inside the sandbox.
-Codex process integration: after project init and enabling hooks in the runtime, SessionStart/UserPromptSubmit provide the current coordination task id. For every substantial task, before coordinator source edits, submit a concrete JSON distribution with deepseek-team coordination plan --task TASK_ID; include deliverable id/kind/scope, executor, acceptance criteria, dependencies and checks. Run each worker assignment with deepseek-team worker --runtime codex --effort high --coord-task TASK_ID --coord-assignment ASSIGNMENT_ID. Because effort policy is auto, replace high with low or max when the assigned task warrants it (medium is the accepted legacy alias for high). The runner records start/result/workspace/checks automatically. After reviewing a result, record its use with deepseek-team coordination use. Record verified coordinator and native-agent outcomes with deepseek-team coordination result; accepted or explicitly cancelled outcomes are required for completion. Later recognized scope mutations require fresh acceptance. New substantial scope requires a revised plan. Codex PreToolUse blocks recognized source edits while the distribution is missing/noncompliant, blocks unplanned scope, and blocks duplicate work owned by a pending worker assignment. Hook coverage depends on the tools and native runtime settings; it does not replace the worker OS sandbox. An unplanned turn without recorded work closes without a distribution plan; status prompts retain existing unfinished tasks. Stop requests continuation for unfinished assignments/results, including coordinator and native-agent outcomes. On repeated Stop it warns and keeps the ledger unfinished without vetoing another hook continuation. Native hook trust is controlled by Codex and is not inferred by this package.
+Codex process integration: after project init and enabling hooks in the runtime, SessionStart/UserPromptSubmit provide the current coordination task id. Plan and route every delegated subtask, even a small read-only history, search or review task, before assigning another agent; Auto registers executor:auto and a worker decision means DeepSeek. Before coordinator source edits, submit a concrete JSON distribution with deepseek-team coordination plan --task TASK_ID; include deliverable id/kind/scope, executor, acceptance criteria, dependencies and checks. Run each worker assignment with deepseek-team worker --runtime codex --effort high --coord-task TASK_ID --coord-assignment ASSIGNMENT_ID. Because effort policy is auto, replace high with low or max when the assigned task warrants it (medium is the accepted legacy alias for high). The runner records start/result/workspace/checks automatically. After reviewing a result, record its use with deepseek-team coordination use. Record verified coordinator and native-agent outcomes with deepseek-team coordination result; accepted or explicitly cancelled outcomes are required for completion. Later recognized scope mutations require fresh acceptance. New substantial scope requires a revised plan. Codex PreToolUse blocks recognized source edits while the distribution is missing/noncompliant, blocks unplanned scope, and blocks duplicate work owned by a pending worker assignment. This parent launch/message gate covers only the events the runtime actually delivers, not every possible write; Codex and Claude coverage is verified separately and universal hook coverage must never be claimed. Where the runtime cannot intercept an action, these instructions remain authoritative. Hooks do not replace the mandatory, unchanged worker OS sandbox. An unplanned turn without recorded work closes without a distribution plan; status prompts retain existing unfinished tasks. Stop requests continuation for unfinished assignments/results, including coordinator and native-agent outcomes. On repeated Stop it warns and keeps the ledger unfinished without vetoing another hook continuation. Native hook trust is controlled by Codex and is not inferred by this package.
 Execution capacity is 8; configure max_workers independently of access. Plan all eligible deliverables; launch independent jobs concurrently and let excess jobs wait in FIFO order. Capacity is not a reason to retain their implementation with the coordinator. Report accepted work, verification results and any rework; only report money savings when measured.
 While a worker runs, work only on independent scope. Review the actual diff and recorded checks without repeating the whole investigation or rewriting correct code. DeepSeek workers never stage, commit, push, publish, deploy, access production services or delegate.
 ### Final reporting of performed work

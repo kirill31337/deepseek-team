@@ -35,6 +35,9 @@ class RealCodexCoordinatorHookTests(unittest.TestCase):
     def test_repeated_stop_does_not_veto_another_hooks_continuation(self):
         self._run_hook_fixture('other-hook')
 
+    def test_native_spawn_reaches_parent_hook_before_child_starts(self):
+        self._run_hook_fixture('native-dispatch')
+
     def _run_hook_fixture(self, scenario):
         binary = self._codex()
         requests = []
@@ -129,7 +132,36 @@ class RealCodexCoordinatorHookTests(unittest.TestCase):
                             "arguments": json.dumps(arguments), "status": "completed",
                         }
 
-                    if scenario == 'status':
+                    if scenario == 'native-dispatch' and step == 0:
+                        candidates = []
+                        for item in body.get('tools', []):
+                            if item.get('type') == 'namespace':
+                                candidates.extend((item['name'] + '.' + child.get('name', ''), child)
+                                                  for child in item.get('tools', []))
+                            else:
+                                candidates.append((item.get('name', ''), item))
+                        found = next(((name, item) for name, item in candidates
+                                      if name.rsplit('.', 1)[-1] == 'spawn_agent'), None)
+                        spec = found[1] if found else None
+                        if spec is None:
+                            output = [{
+                                'type': 'message', 'id': 'missing_spawn', 'role': 'assistant',
+                                'status': 'completed', 'content': [{
+                                    'type': 'output_text', 'text': 'SPAWN_NOT_EXPOSED: ' +
+                                    repr([name for name, _ in candidates]), 'annotations': []}]}]
+                        else:
+                            properties = spec.get('parameters', {}).get('properties', {})
+                            args = {'message' if 'message' in properties else 'prompt':
+                                    'Inspect Git history for the delegation limit.'}
+                            if 'task_name' in properties:
+                                args['task_name'] = 'history_probe'
+                            call = {'type': 'function_call', 'id': 'fc_native',
+                                    'call_id': 'call_native', 'name': spec['name'],
+                                    'arguments': json.dumps(args), 'status': 'completed'}
+                            if '.' in found[0]:
+                                call['namespace'] = found[0].rsplit('.', 1)[0]
+                            output = [call]
+                    elif scenario in ('status', 'native-dispatch'):
                         output = [{
                             "type": "message", "id": f"msg_status_{step}", "role": "assistant",
                             "status": "completed", "content": [{
@@ -209,7 +241,7 @@ class RealCodexCoordinatorHookTests(unittest.TestCase):
                     'model_provider = "fixture"\n'
                     'approval_policy = "never"\n'
                     'model_reasoning_effort = "low"\n'
-                    '[features]\nhooks = true\n'
+                    '[features]\nhooks = true\nmulti_agent = true\n'
                     '[model_providers.fixture]\n'
                     'name = "Fixture"\n'
                     f'base_url = "http://127.0.0.1:{server.server_port}/"\n'
@@ -248,6 +280,15 @@ class RealCodexCoordinatorHookTests(unittest.TestCase):
                     self.assertEqual(task['status'], 'closed')
                     self.assertEqual(task['deliverables'], [])
                     self.assertIn('STATUS_REPORTED', result.stdout)
+                    return
+                if scenario == 'native-dispatch':
+                    self.assertNotIn('SPAWN_NOT_EXPOSED', result.stdout,
+                                     'Installed Codex does not expose spawn_agent in this fixture')
+                    self.assertTrue(any('native delegation gate' in value.lower() for value in tool_outputs),
+                                    str(tool_outputs) + result.stdout)
+                    self.assertEqual(len(requests), 2, 'A child or extra continuation reached the model fixture')
+                    self.assertEqual(task['status'], 'closed')
+                    self.assertEqual(task['deliverables'], [])
                     return
                 self.assertGreaterEqual(len(requests), 3, result.stderr + result.stdout)
                 self.assertIsNotNone(state["assignment_id"], str(tool_outputs))

@@ -80,23 +80,35 @@ jobs and do not auto-select another value (a saved legacy `medium` normalizes to
 `auto` restores frontier selection. A direct worker launched while policy is auto falls
 back to `high` only when no frontier-selected concrete effort reaches the runner.
 
-The coordinator may also use its own **native subagents** when this materially improves
-parallelism, isolated context, independent verification, or access to a native capability.
-For a substantial planned deliverable, record this as `executor: "native-agent"` and add a
-concrete `delegation_reason`. A native subagent is additive: it does **not** satisfy a
-DeepSeek worker assignment required by the 50/75 profiles. Architecture/security decisions,
-final integration/verification, secrets/signing, commit/push and production actions remain
-coordinator-owned. DeepSeek workers themselves remain leaf workers and must not delegate.
+The coordinator may use its own **native subagents** only as an explicit exception, never for
+generic parallelism, isolated context or convenience alone. Every native-agent deliverable needs
+a concrete `delegation_reason` and a `native_exception`:
+
+- `{"code": "explicit_user_request", "evidence": "specific user request"}`, or
+- `{"code": "native_capability", "capability": "specific capability or tool unavailable to a DeepSeek worker", "evidence": "why it is required"}`.
+
+The coordinator attests this evidence; it is not mechanically proven user provenance. The native
+prompt or message must include `[deepseek-team:TASK_ID:DELIVERABLE_ID]` binding the registered
+native-agent scope, and its accepted or cancelled outcome is recorded like any other deliverable.
+A native subagent is additive: it does **not** satisfy a DeepSeek worker assignment required by the
+50/75 profiles. Architecture/security decisions, final integration/verification, secrets/signing,
+commit/push and production actions remain coordinator-owned. DeepSeek workers themselves remain
+leaf workers and must not delegate.
 
 ### Process
 
-For a substantial task, identify concrete deliverables before duplicating their
-implementation. Each deliverable needs: id, kind, concrete scope, executor,
-acceptance criteria, dependencies, and checks. `native-agent` executors additionally
-need `delegation_reason` explaining why native delegation is useful for that scope. Architecture, security decisions,
-final verification, integration, secrets/signing, commit/push and production stay
-with the coordinator. That responsibility alone does not reserve ordinary
-implementation, tests, fixtures, documentation, or non-secret metadata.
+Plan and route every delegated subtask before assigning another agent, even a small
+read-only history, search or review task. In Auto mode register `executor: "auto"` and
+inspect the resolved plan; a worker decision means DeepSeek. Ordinary short answers the
+coordinator gives directly need no fake worker, wait and control calls create no work,
+and new work sent to an already running agent also requires routing. Identify concrete
+deliverables before duplicating their implementation. Each deliverable needs: id, kind,
+concrete scope, executor, acceptance criteria, dependencies, checks, and for Auto a
+`features` card. `native-agent` executors additionally need `delegation_reason` and a
+`native_exception`. Architecture, security decisions, final verification, integration,
+secrets/signing, commit/push and production stay with the coordinator. That responsibility
+alone does not reserve ordinary implementation, tests, fixtures, documentation, or
+non-secret metadata.
 
 At 75/full-access, separable implementation/tests/fixtures/docs/non-secret metadata
 default to worker assignments. Retaining worker-eligible work requires a supported
@@ -196,6 +208,11 @@ Codex: distribution/source-mutation gates use supported lifecycle hooks, but nat
 hook trust is owned by Codex and must be reviewed there once; DeepSeek Team does not
 bypass or infer it. Hooks are a coordinator-process guardrail, not a replacement for
 the worker Bubblewrap/AppArmor security boundary.
+
+The parent launch/message gate covers only the events the runtime actually delivers, not
+every possible write. Codex and Claude coverage is verified separately, so universal hook
+coverage must never be claimed; where the runtime cannot intercept an action these
+instructions remain authoritative. The mandatory worker OS sandbox is unchanged.
 
 For both runtimes, an unplanned turn with no recorded work closes without requiring
 a distribution plan or claiming implementation completion. Status prompts retain

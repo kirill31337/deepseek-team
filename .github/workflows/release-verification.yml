@@ -87,6 +87,11 @@ jobs:
                                  tool_input={'file_path': str(project / 'a.py')})
                   output = json.loads(run(team, 'coordinator-hook', '--runtime', runtime, payload=payload))
                   assert output['hookSpecificOutput']['permissionDecision'] == 'deny', output
+                  payload.update(tool_name='spawn_agent' if runtime == 'codex' else 'Agent',
+                                 tool_input={'prompt': 'Inspect Git history independently'})
+                  output = json.loads(run(team, 'coordinator-hook', '--runtime', runtime, payload=payload))
+                  assert output['hookSpecificOutput']['permissionDecision'] == 'deny', output
+                  assert 'native delegation gate' in output['hookSpecificOutput']['permissionDecisionReason'], output
               preserved = dict(sentinels)
               preserved[project / 'CLAUDE.md'] = b''
               for directory in (Path(env['HOME']), Path(env['CODEX_HOME']),

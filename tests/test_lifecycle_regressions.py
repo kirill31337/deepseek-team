@@ -27,6 +27,10 @@ class LifecycleRegressions(CoordinationCase):
         }
         if executor == 'native-agent':
             deliverable['delegation_reason'] = 'Independent review in isolated context'
+            deliverable['native_exception'] = {
+                'code': 'explicit_user_request',
+                'evidence': 'User requested an independent native review for this scope',
+            }
         return coordination.plan_task(self.repo, task['id'], {
             'classification': 'small',
             'small_evidence': 'One bounded review with a single result',

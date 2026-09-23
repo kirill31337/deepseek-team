@@ -1,3 +1,40 @@
+# Version 0.8.3 verification
+
+Date: 2026-09-23. Scope: route every delegated subtask before native dispatch,
+require explicit native exceptions, and bind parent launch/message events to the
+coordination ledger without widening worker access.
+
+The final local suite ran **660 tests, all passing without skips**, with Codex
+**0.153.2** and Claude Code **2.1.278** available. The command was
+`PYTHONPATH=src python3 -m unittest discover -s tests -v`, with the isolated Claude
+installation added to PATH. Real runtime fixtures used local offline providers:
+both native launch attempts reached the parent hook and were denied before
+unplanned delegation. Codex additionally verified that no child request reached
+the model fixture. Synthetic hook tests cover message dispatch, structured text,
+binding replay, revoked access, outcome closure and freeform patch scope.
+
+Wheel and sdist builds passed `twine check --strict`. The exact wheel passed
+install/replacement/uninstall checks with pip, pipx and uv, preserving external
+configuration. Archive inspection found no local configuration, credentials or
+raw logs. The installed-package gate in GitHub Actions also checks native denial
+for both coordinator hook protocols; workflow results are attached to the release
+commit rather than inferred from local checks.
+
+Three real DeepSeek assignments supplied ledger implementation, instructions/docs
+and independent hook review. The ledger implementation required coordinator
+corrections for replay, immutable started scopes and manual-profile enforcement;
+the hook review led to three additional regression fixes. No native subagent
+performed the release work. A separate paid `doctor --runtime codex --live
+--effort low` passed provider streaming and sandboxed worker checks, preserving
+primary coordinator configuration/authentication. The Ubuntu unprivileged-userns
+restriction remained enabled.
+
+Coverage applies to hook events actually delivered by each tested runtime.
+Attestation text is coordinator evidence, not cryptographic proof of user intent.
+Native hook trust remains owned by Codex. Worker OS isolation was not weakened.
+
+---
+
 # Version 0.5.0 verification
 
 > Historical record: this document describes an earlier implementation or verification run. Commands, defaults and compatibility claims here are not current instructions. See [README](https://github.com/kirill31337/deepseek-team/blob/main/README.md) and the current routing guide for supported behavior.

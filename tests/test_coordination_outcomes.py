@@ -24,6 +24,10 @@ class DeliverableOutcomeTests(OutcomeCase):
                     dependencies=[], checks=['python3 -m unittest'])
         if executor == 'native-agent':
             item['delegation_reason'] = 'Independent implementation in an isolated context'
+            item['native_exception'] = {
+                'code': 'explicit_user_request',
+                'evidence': 'user asked for a native implementation of this deliverable',
+            }
         item.update(changes)
         self.plan_input = {'classification': 'substantial', 'deliverables': [item]}
         return coordination.plan_task(self.repo, task['id'], self.plan_input)

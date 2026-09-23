@@ -25,6 +25,7 @@ from typing import Any
 from . import settings
 from .config import sync_directory
 from .effort import DEFAULT_EFFORT, normalize_effort, normalize_policy_effort
+from .native_delegation import validate_native_exception
 from .routing import RoutingService
 from .routing_models import RoutingError, fingerprint, number, validate_features
 
@@ -325,9 +326,14 @@ def _normalize_deliverable(raw: dict) -> dict:
         if raw.get("kind") in PROTECTED_COORDINATOR_KINDS:
             raise CoordinationError(
                 "Protected coordinator responsibilities cannot be assigned to a native agent.", 64)
+        try:
+            validate_native_exception(raw)
+        except ValueError as error:
+            raise CoordinationError(str(error), 64) from None
     value = dict(raw)
     # Derived state is read only from our ledger, never accepted from a plan.
-    for key in ('routing', 'routing_feedback', 'result', 'result_invalidated_at'):
+    for key in ('routing', 'routing_feedback', 'result', 'result_invalidated_at',
+                'native_dispatches', 'native_dispatch_started_at'):
         value.pop(key, None)
     value["scope"] = list(raw["scope"]) if isinstance(raw["scope"], list) else [str(raw["scope"])]
     value["acceptance"] = list(raw["acceptance"])
@@ -337,8 +343,14 @@ def _normalize_deliverable(raw: dict) -> dict:
 
 
 def _definition(item):
-    return {key: item[key] for key in ('id', 'kind', 'scope', 'acceptance',
-                                      'dependencies', 'checks', 'features')}
+    definition = {key: item[key] for key in ('id', 'kind', 'scope', 'acceptance',
+                                             'dependencies', 'checks', 'features')}
+    if item.get('executor') == 'native-agent':
+        # The native attestation is part of the identity of a native deliverable
+        # so a started/attested dispatch cannot be rewritten by replanning.
+        definition['delegation_reason'] = item.get('delegation_reason')
+        definition['native_exception'] = item.get('native_exception')
+    return definition
 
 
 def _binding(task_id, item):
@@ -352,7 +364,8 @@ def _prepare_routing(root, task, items, service):
     started = {row['deliverable_id'] for row in task.get('assignments', [])
                if row['status'] != 'planned'}
     started.update(item['id'] for item in previous.values()
-                   if item.get('routing_feedback') or item.get('result'))
+                   if item.get('routing_feedback') or item.get('result')
+                   or item.get('native_dispatches'))
     ids = set()
     for item in items:
         if item['id'] in ids:
@@ -377,7 +390,8 @@ def _prepare_routing(root, task, items, service):
             item['features'] = prior['features']
             item['executor'] = prior['executor']
             item['routing'] = prior.get('routing')
-            for key in ('routing_feedback', 'result', 'result_invalidated_at'):
+            for key in ('routing_feedback', 'result', 'result_invalidated_at',
+                        'native_dispatches', 'native_dispatch_started_at'):
                 if key in prior:
                     item[key] = prior[key]
             continue
@@ -444,11 +458,12 @@ def plan_task(root: Path, task_id: str, plan: dict) -> dict:
             if row.get("status") not in ("planned",) and row.get("deliverable_id") not in incoming_ids
         ]
         historical_missing.extend(item['id'] for item in task.get('deliverables', [])
-                                  if (item.get('routing_feedback') or item.get('result'))
+                                  if (item.get('routing_feedback') or item.get('result')
+                                      or item.get('native_dispatches'))
                                   and item['id'] not in incoming_ids)
         if historical_missing:
             raise CoordinationError(
-                "Plan revision cannot remove started/completed worker deliverables: " +
+                "Plan revision cannot remove started/completed deliverables: " +
                 ", ".join(historical_missing) +
                 ". Add a new deliverable id for revised scope.", 64)
         assignments = []
@@ -503,19 +518,42 @@ def _retention_ok(task: dict, deliverable: dict) -> bool:
     return False
 
 
+def native_exception_issue(item) -> str | None:
+    """Return an actionable issue for an unsupported native attestation."""
+    try:
+        validate_native_exception(item)
+    except ValueError as error:
+        return f"{item.get('id')}: {error}"
+    return None
+
+
+def native_deliverable_issues(task: dict) -> list[str]:
+    issues = []
+    for item in task.get('deliverables', []):
+        if item.get('executor') != 'native-agent':
+            continue
+        issue = native_exception_issue(item)
+        if issue:
+            issues.append(issue)
+    return issues
+
+
 def validate_task(root: Path, task_id: str) -> list[str]:
     task = load_task(root, task_id)
     if task.get("classification") is None:
         return ["distribution plan is missing"]
+    # Native attestations are validated for every classification, including
+    # small tasks and ledger plans written before this check existed.
+    native_issues = native_deliverable_issues(task)
     if task["classification"] == "small":
-        return []
+        return native_issues
     policy = task["policy"]
     level = policy['delegation_level']
     # A task's distribution profile is a snapshot across compaction. Current
     # access revocations still apply immediately and cannot force a writer.
     current = settings.resolve(root)
     access = _effective_task_access(task, current)
-    issues = []
+    issues = list(native_issues)
     worker_count = 0
     worker_write_count = 0
     eligible_count = 0
@@ -867,6 +905,144 @@ def record_coordinator_event(root: Path, task_id: str, kind: str,
                 task.pop('completed_at', None)
         task["updated_at"] = now
         _atomic(_task_path(root, task_id), task)
+
+
+def _deliverable(task: dict, deliverable_id: str) -> dict | None:
+    return next((item for item in task.get('deliverables', [])
+                 if item.get('id') == deliverable_id), None)
+
+
+def _native_dispatch_binding(task: dict, tool_use_id: str) -> dict | None:
+    for item in task.get('deliverables', []):
+        for entry in item.get('native_dispatches', []) or []:
+            if isinstance(entry, dict) and entry.get('tool_use_id') == tool_use_id:
+                return entry
+    return None
+
+
+def _foreign_dispatch_binding(root: Path, task_id: str, tool_use_id: str) -> dict | None:
+    """A platform tool_use_id is idempotent only inside its original binding."""
+    directory = _task_path(root, task_id).parent
+    if not directory.exists():
+        return None
+    for path in sorted(directory.glob('task-*.json')):
+        if path.name == task_id + '.json':
+            continue
+        try:
+            other = _read(path)
+        except CoordinationError:
+            continue
+        entry = _native_dispatch_binding(other, tool_use_id)
+        if entry is not None:
+            return entry
+    return None
+
+
+def _conflicting_worker(root: Path, task: dict, item: dict) -> dict | None:
+    for row in task.get('assignments', []):
+        if row.get('status') in ('succeeded', 'failed', 'cancelled'):
+            continue
+        if row.get('deliverable_id') == item['id']:
+            return row
+        other = _deliverable(task, row.get('deliverable_id'))
+        if other is None:
+            continue
+        if (item.get('kind') in WORKER_WRITE_KINDS
+                and other.get('kind') in WORKER_WRITE_KINDS
+                and _mutation_touches_scope(root, item.get('scope', []),
+                                            other.get('scope', []))):
+            return row
+    return None
+
+
+def authorize_native_dispatch(root: Path, task_id: str, deliverable_id: str,
+                              tool_name: str, tool_use_id: str) -> dict:
+    """Authorize one native-agent tool dispatch against the ledger.
+
+    The root hook owns prompt parsing; this function only checks the ledger and
+    records the binding. It never stores a prompt and never recurses into the
+    task lock. Tool use is idempotent for one binding and rejected for another.
+    """
+    if not isinstance(deliverable_id, str) or not deliverable_id.strip():
+        raise CoordinationError(
+            'Native dispatch requires the planned deliverable id (missing binding).', 64)
+    if not isinstance(tool_use_id, str) or not tool_use_id.strip():
+        raise CoordinationError(
+            'Native dispatch requires the platform tool_use_id (missing binding).', 64)
+    tool_name = tool_name if isinstance(tool_name, str) else ''
+    with _lock(root):
+        task = load_task(root, task_id)
+        item = _deliverable(task, deliverable_id)
+        if item is None:
+            raise CoordinationError(
+                f'Task {task_id} has no planned deliverable {deliverable_id}; '
+                'register the native deliverable before dispatching it.', 64)
+        existing = _native_dispatch_binding(task, tool_use_id)
+        if existing is not None:
+            if (existing.get('deliverable_id') != deliverable_id
+                    or existing.get('tool_name') != tool_name):
+                raise CoordinationError(
+                    f"tool_use_id already binds deliverable {existing.get('deliverable_id')}; "
+                    'a platform tool id is idempotent only for its original binding and tool.', 64)
+        if item.get('executor') != 'native-agent':
+            raise CoordinationError(
+                f'{deliverable_id} is bound to {item.get("executor")}, not a native agent '
+                '(foreign binding).', 64)
+        foreign = _foreign_dispatch_binding(root, task_id, tool_use_id)
+        if foreign is not None:
+            raise CoordinationError(
+                f"tool_use_id already binds deliverable {foreign.get('deliverable_id')} "
+                f"of task {foreign.get('task_id')}; foreign bindings are rejected.", 64)
+        try:
+            validate_native_exception(item)
+        except ValueError as error:
+            raise CoordinationError(f'{deliverable_id}: {error}', 64) from None
+        if item.get('kind') in PROTECTED_COORDINATOR_KINDS:
+            raise CoordinationError(
+                'Protected coordinator responsibilities stay with the coordinator; '
+                f'{deliverable_id} cannot be dispatched to a native agent.', 64)
+        if item.get('kind') not in WORKER_WRITE_KINDS | WORKER_READ_KINDS:
+            raise CoordinationError(
+                f"{deliverable_id}: unknown deliverable kind {item.get('kind')!r}; "
+                'native dispatch requires a known non-protected kind.', 64)
+        current = settings.resolve(root)
+        if not current.enabled:
+            raise CoordinationError(
+                'DeepSeek Team is disabled for this project; the root hook must bypass the '
+                'off state explicitly before any native dispatch is authorized.', 69)
+        access = _effective_task_access(task, current)
+        if item.get('kind') in WORKER_WRITE_KINDS and access != 'full-access':
+            raise CoordinationError(
+                'Current access is read-only; a native-writing dispatch is not authorized.', 78)
+        outcome = _deliverable_outcome(task, item)
+        if outcome in ('accepted', 'cancelled'):
+            raise CoordinationError(
+                f'{deliverable_id} already recorded a terminal {outcome} outcome.', 64)
+        if task.get('status') in ('completed', 'closed'):
+            raise CoordinationError(
+                f"Coordination task is already {task.get('status')}; no native dispatch is authorized.", 64)
+        issues = validate_task(root, task_id)
+        if issues:
+            raise CoordinationError('Native dispatch distribution is noncompliant: ' + '; '.join(issues), 78)
+        conflict = _conflicting_worker(root, task, item)
+        if conflict is not None:
+            raise CoordinationError(
+                f"{deliverable_id} conflicts with pending worker assignment {conflict['id']} "
+                f"for deliverable {conflict.get('deliverable_id')}; use the worker-owned scope.", 64)
+        # Replay is a bookkeeping optimization, never an exemption from current
+        # access, completion, or distribution checks.
+        if existing is not None:
+            return task
+        now = time.time()
+        entry = {'task_id': task['id'], 'deliverable_id': deliverable_id,
+                 'tool_name': tool_name, 'tool_use_id': tool_use_id, 'at': now}
+        item.setdefault('native_dispatches', []).append(entry)
+        item['native_dispatch_started_at'] = now
+        task.setdefault('coordinator_events', []).append(dict(entry, kind='native_dispatch'))
+        task['status'] = 'active'
+        task['updated_at'] = now
+        _atomic(_task_path(root, task_id), task)
+        return task
 
 
 def assignment_deliverable(task: dict, assignment_id: str) -> dict:

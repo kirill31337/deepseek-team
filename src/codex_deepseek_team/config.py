@@ -21,7 +21,7 @@ CODEX_HOOK_COMMAND = 'deepseek-team coordinator-hook'
 CODEX_HOOK_EVENTS = {
     'SessionStart': {'matcher': 'startup|resume|clear|compact', 'context': True},
     'UserPromptSubmit': {'matcher': None, 'context': True},
-    'PreToolUse': {'matcher': 'Bash|apply_patch|Edit|Write', 'context': False},
+    'PreToolUse': {'matcher': 'Bash|apply_patch|Edit|Write|(?:.*[./])?(?:spawn_agent|send_message|send_input|followup_task|assign_agent_task|resume_agent|Agent|Task)', 'context': False},
     'Stop': {'matcher': None, 'context': False},
 }
 

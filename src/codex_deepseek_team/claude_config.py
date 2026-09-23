@@ -11,7 +11,7 @@ HOOK_COMMAND = 'deepseek-team coordinator-hook --runtime claude'
 HOOK_EVENTS = {
     'SessionStart': 'startup|resume|clear|compact',
     'UserPromptSubmit': None,
-    'PreToolUse': 'Bash|Edit|Write|NotebookEdit',
+    'PreToolUse': 'Bash|Edit|Write|NotebookEdit|(?:.*[./])?(?:spawn_agent|send_message|send_input|followup_task|assign_agent_task|resume_agent|Agent|Task)',
     'Stop': None,
 }
 

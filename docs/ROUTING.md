@@ -95,6 +95,8 @@ Routing modes are:
 - `advisory` returns a recommendation for the coordinator to review.
 - `auto` may resolve an explicitly requested `executor: auto`. Existing plans with an explicit worker or coordinator keep their executor. Ineligible work stays with the coordinator and the reason is recorded.
 
+Every delegated subtask is planned and routed before another agent is assigned, even a small read-only history, search or review request; a resolved worker decision means DeepSeek. Coordinator-native subagents are an explicit exception, not a convenience: a native deliverable needs a `delegation_reason` and a `native_exception` (`explicit_user_request` naming the specific request, or `native_capability` naming the capability a DeepSeek worker cannot reach). The coordinator attests that evidence, the native prompt must carry `[deepseek-team:TASK_ID:DELIVERABLE_ID]`, and its accepted or cancelled outcome is recorded.
+
 Automatic routing cannot widen the configured access level. Architecture, security, integration, final verification, commit/push, production, and secret-signing work remains coordinator-owned. Unknown or high risk and weak verification prevent automatic admission. Missing local history or costs do not block eligible assignments.
 
 Configure only the values you want to change:

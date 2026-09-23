@@ -253,7 +253,10 @@ class IntegrationTests(unittest.TestCase):
         result = self.plan(self.task(), 'coordinator')
         self.assertEqual(result['deliverables'][0]['routing']['action'], 'worker')
         self.assertEqual(result['assignments'], [])
-        result = self.plan(self.task(turn='native'), 'native-agent', delegation_reason='Independent context for a native capability')
+        result = self.plan(self.task(turn='native'), 'native-agent',
+                           delegation_reason='Native connector required for the requested review',
+                           native_exception={'code': 'native_capability', 'capability': 'connected issue tracker',
+                                             'evidence': 'The review needs a connector unavailable in the worker sandbox'})
         self.assertEqual(result['deliverables'][0]['executor'], 'native-agent')
 
     def test_worker_snapshot_uses_actual_fixed_model(self):

@@ -171,6 +171,8 @@ class StateAndDistributionTests(CoordinationCase):
                     {"id": "native-arch", "kind": "architecture", "scope": ["design"],
                      "executor": "native-agent",
                      "delegation_reason": "independent architecture decision",
+                     "native_exception": {"code": "explicit_user_request",
+                                          "evidence": "user asked for a native architecture pass"},
                      "acceptance": ["decision"], "dependencies": [], "checks": []},
                 ],
             })
@@ -182,7 +184,10 @@ class StateAndDistributionTests(CoordinationCase):
             "deliverables": [
                 {"id": "native-impl", "kind": "implementation", "scope": ["a.py"],
                  "executor": "native-agent",
-                 "delegation_reason": "parallel isolated implementation for comparison",
+                 "delegation_reason": "native toolchain implementation for comparison",
+                 "native_exception": {"code": "native_capability",
+                                      "capability": "vendor simulator harness",
+                                      "evidence": "the simulator harness only exists in the native tool"},
                  "acceptance": ["candidate implementation"], "dependencies": [], "checks": []},
             ],
         })
@@ -200,6 +205,8 @@ class StateAndDistributionTests(CoordinationCase):
                 {"id": "native-review", "kind": "review", "scope": ["a.py"],
                  "executor": "native-agent",
                  "delegation_reason": "independent native review in isolated context",
+                 "native_exception": {"code": "explicit_user_request",
+                                      "evidence": "user asked for a native second reviewer here"},
                  "acceptance": ["independent findings"], "dependencies": [], "checks": []},
             ],
         })
@@ -229,6 +236,8 @@ class StateAndDistributionTests(CoordinationCase):
                     {"id": "impl", "kind": "implementation", "scope": ["a.py"],
                      "executor": "native-agent",
                      "delegation_reason": "switching implementation to a native agent",
+                     "native_exception": {"code": "explicit_user_request",
+                                          "evidence": "user asked to keep this change native here"},
                      "acceptance": ["implemented"], "dependencies": [], "checks": []},
                 ],
             })

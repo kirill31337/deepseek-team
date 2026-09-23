@@ -48,7 +48,14 @@ def _mutation(payload: dict) -> tuple[bool, list[str]]:
     data = payload.get("tool_input") or {}
     command = data.get("command", "") if isinstance(data, dict) else ""
     if tool == "apply_patch":
-        return True, _paths_from_apply_patch(command)
+        if isinstance(data, str):
+            patch = data
+        elif isinstance(data, dict):
+            patch = '\n'.join(data[key] for key in ('command', 'input', 'patch')
+                              if isinstance(data.get(key), str))
+        else:
+            patch = ''
+        return True, _paths_from_apply_patch(patch)
     if tool in ("Edit", "Write", "NotebookEdit"):
         if not isinstance(data, dict):
             return True, []
@@ -57,6 +64,64 @@ def _mutation(payload: dict) -> tuple[bool, list[str]]:
     if tool != "Bash":
         return False, []
     return classify_shell_mutation(command)
+
+
+_NATIVE_START = frozenset(('spawn_agent', 'Agent', 'Task'))
+_NATIVE_MESSAGE = frozenset(('send_message', 'send_input', 'followup_task',
+                             'assign_agent_task', 'resume_agent'))
+_NATIVE_CONTROLS = frozenset(('id', 'agent_id', 'receiver', 'recipient', 'target',
+                              'interrupt', 'agent_ids', 'ids'))
+_NATIVE_BINDING = re.compile(
+    r'\[deepseek-team:(task-[0-9a-f]{20}):([A-Za-z0-9_.-]{1,80})\]')
+
+
+def _native_work(payload: dict) -> tuple[bool, str]:
+    """Recognize parent dispatches; empty resume/wait controls are not new work."""
+    name = str(payload.get('tool_name', '')).replace('/', '.').rsplit('.', 1)[-1]
+    if name not in _NATIVE_START | _NATIVE_MESSAGE:
+        return False, ''
+    data = payload.get('tool_input')
+    if not isinstance(data, dict):
+        return True, ''
+    supplied = [data[key] for key in ('prompt', 'message', 'input', 'items') if key in data]
+    has_work = name in _NATIVE_START or any(
+        value for key, value in data.items() if key not in _NATIVE_CONTROLS)
+    # Accept supported text items, but never treat an unknown nonempty shape as
+    # a control-only message. Markers hidden in arbitrary blobs are not bindings.
+    texts = []
+    for value in supplied:
+        if isinstance(value, str):
+            texts.append(value)
+        elif isinstance(value, list):
+            texts.extend(item['text'] for item in value
+                         if isinstance(item, dict) and item.get('type') in ('text', 'input_text')
+                         and isinstance(item.get('text'), str))
+    text = '\n'.join(texts)
+    return has_work, text
+
+
+def _check_native_dispatch(root, task, payload):
+    is_work, text = _native_work(payload)
+    if not is_work:
+        return None
+    prefix = 'DeepSeek Team native delegation gate: '
+    if task is None:
+        return _deny(prefix + 'register a coordination task and route the subtask before delegation.')
+    bindings = _NATIVE_BINDING.findall(text)
+    if len(bindings) != 1 or text.count('[deepseek-team:') != 1:
+        return _deny(prefix + 'route this subtask with executor:auto first. An approved native '
+                     'exception requires exactly one [deepseek-team:TASK_ID:DELIVERABLE_ID] '
+                     'marker in its prompt or message; small/read-only work is included.')
+    task_id, deliverable_id = bindings[0]
+    if task_id != task['id']:
+        return _deny(prefix + 'the native dispatch marker must refer to the active coordination task.')
+    try:
+        coordination.authorize_native_dispatch(
+            root, task_id, deliverable_id, str(payload.get('tool_name', '')),
+            str(payload.get('tool_use_id') or ''))
+    except coordination.CoordinationError as error:
+        return _deny(prefix + str(error))
+    return {}
 
 
 def handle(payload: dict, runtime: str = 'codex') -> dict:
@@ -98,14 +163,18 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
         )
         text = (
             coordination.summary(task) + "\n"
-            "Before coordinator source edits for a substantial task, register a concrete "
+            "Before delegating any subtask (including small/read-only research), or before "
+            "coordinator source edits for a substantial task, register a concrete "
             "distribution with deepseek-team coordination plan --task " + task["id"] +
             ". For a genuinely small single-output task, record it as small with evidence. "
             "At 75/full-access, worker-eligible implementation/tests/fixtures/docs/metadata "
             "default to DeepSeek unless a supported concrete constraint is recorded. "
-            "Coordinator-native subagents are also allowed when the plan uses executor "
-            "native-agent with a concrete delegation_reason; they complement and do not replace "
-            "required DeepSeek worker assignments. " + effort_context +
+            "In Auto route delegated work with executor:auto first. Native-agent exceptions require "
+            "delegation_reason and native_exception for explicit_user_request or native_capability "
+            "with evidence; parallelism/isolated context alone is insufficient. Include "
+            "[deepseek-team:TASK_ID:DELIVERABLE_ID] in an approved native prompt/message. "
+            "New work sent to an existing agent also requires routing. Simple coordinator-only "
+            "answers need no artificial worker. " + effort_context +
             f"Run assigned workers with --runtime {runtime}. "
             "Do not report a useful-work percentage from counts. "
             "Capture a structured features card before execution. In delegation Auto, use executor:auto "
@@ -141,6 +210,10 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
         else:
             base += '\n' + settings.final_reporting_guidance()
         return _context(base, event)
+    if event == 'PreToolUse':
+        native = _check_native_dispatch(root, task, payload)
+        if native is not None:
+            return native
     if task is None:
         return {}
     coordination.sync_routing_feedback(root, task['id'])
@@ -166,6 +239,8 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
         issues = coordination.validate_task(root, task["id"])
         if issues:
             return _deny("DeepSeek Team distribution gate: " + "; ".join(issues))
+        if payload.get('tool_name') == 'apply_patch' and not paths:
+            return _deny('Patch targets could not be mapped to the registered distribution.')
         policy = task.get("policy", {})
         if not paths and task.get("classification") == "substantial" and (
                 policy.get("delegation_level", 'auto') in ('auto', 75)

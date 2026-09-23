@@ -10,7 +10,8 @@ import unittest
 from unittest import mock
 from contextlib import redirect_stdout
 
-from codex_deepseek_team import delegation_cli, development, doctor, project, sandbox, settings, worker
+from codex_deepseek_team import (activation, delegation_cli, development, doctor, project,
+                                 sandbox, settings, worker)
 
 
 class RepoCase(unittest.TestCase):
@@ -496,6 +497,78 @@ class DoctorPolicyTests(RepoCase):
         self.assertEqual(rejected.exception.code, 2)
         runtime_check.assert_not_called()
         self.assertIn('invalid choice', errors.getvalue())
+
+
+class ReleaseInstructionContractTests(RepoCase):
+    """The 0.8.3 plan-every-subtask and native-exception instruction contract."""
+
+    def test_instructions_require_planning_and_routing_every_delegated_subtask(self):
+        for runtime in ('codex', 'claude'):
+            policy = settings.resolve(self.repo, delegation_level='auto', access='auto')
+            text = settings.instructions(policy, runtime)
+            with self.subTest(runtime=runtime):
+                self.assertIn('every delegated subtask', text)
+                self.assertIn('read-only history, search or review', text)
+                self.assertIn('worker decision means DeepSeek', text)
+                self.assertIn('executor: "auto"', text)
+                self.assertIn('Ordinary short answers', text)
+                self.assertIn('wait and control calls create no work', text)
+                self.assertIn('already running agent also requires routing', text)
+                self.assertNotIn('%', text)
+
+    def test_native_exception_contract_is_documented(self):
+        policy = settings.resolve(self.repo, delegation_level=75, access='full-access')
+        text = settings.instructions(policy, 'codex')
+        self.assertIn('native_exception', text)
+        self.assertIn('explicit_user_request', text)
+        self.assertIn('native_capability', text)
+        self.assertIn('delegation_reason', text)
+        self.assertIn('[deepseek-team:TASK_ID:DELIVERABLE_ID]', text)
+        self.assertIn('not mechanically proven user provenance', text)
+        self.assertIn('publishing stay coordinator-only', text)
+        self.assertIn('convenience alone is not a sufficient reason', text)
+
+    def test_hook_coverage_is_not_overclaimed_and_sandbox_is_unchanged(self):
+        policy = settings.resolve(self.repo, delegation_level='auto', access='auto')
+        for runtime in ('codex', 'claude'):
+            text = settings.instructions(policy, runtime)
+            with self.subTest(runtime=runtime):
+                self.assertIn('only the events the runtime actually delivers', text)
+                self.assertIn('universal hook coverage must never be claimed', text)
+                self.assertIn('mandatory, unchanged worker OS sandbox', text)
+                self.assertNotIn('--os-sandbox off', text)
+
+    def test_packaged_delegation_guidance_carries_the_same_contract(self):
+        body = project.DATA_FILE.read_text()
+        for marker in (
+            'every delegated subtask', 'executor: "auto"', 'worker decision means DeepSeek',
+            'native_exception', 'explicit_user_request', 'native_capability',
+            '[deepseek-team:TASK_ID:DELIVERABLE_ID]', 'not mechanically proven user provenance',
+            'mandatory worker OS sandbox is unchanged',
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, body)
+
+    def test_off_read_only_and_manual_profiles_are_preserved(self):
+        settings.set_values(self.repo / settings.PROJECT_FILE,
+                            delegation_level=25, access='read-only')
+        read_only = settings.instructions(settings.resolve(self.repo), 'codex')
+        self.assertIn('Actual access is read-only', read_only)
+
+        auto_read_only = settings.instructions(
+            settings.resolve(self.repo, delegation_level='auto', access='read-only'), 'codex')
+        self.assertIn('Read-only auto does not delegate writing tasks', auto_read_only)
+
+        settings.set_values(self.repo / settings.PROJECT_FILE,
+                            delegation_level=75, access='full-access')
+        manual = settings.instructions(settings.resolve(self.repo), 'codex')
+        self.assertIn('collect feedback', manual)
+
+        activation.set_enabled(self.repo, False)
+        disabled = settings.instructions(settings.resolve(self.repo), 'codex')
+        self.assertIn('disabled', disabled.lower())
+        self.assertNotIn('native_exception', disabled)
+        activation.set_enabled(self.repo, True)
 
 
 if __name__ == '__main__':
