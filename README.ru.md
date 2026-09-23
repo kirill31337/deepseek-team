@@ -4,9 +4,9 @@
 
 [English](https://github.com/kirill31337/deepseek-team/blob/main/README.md) | **Русский**
 
-DeepSeek Team — пакет для Linux, который подключает координаторов **Codex и/или Claude Code** к изолированным воркерам DeepSeek. Координатор распределяет работу, проверяет результат и вносит принятые изменения в основной проект. Воркеры DeepSeek выполняют отдельные порученные задачи: исследование, ревью, а в режиме записи — реализацию, локальные тесты и документацию. Дистрибутив называется `codex-deepseek-team`, единственная запускаемая команда — `deepseek-team`.
+DeepSeek Team — пакет для Linux, который подключает координаторов **Codex и/или Claude Code** к изолированным воркерам DeepSeek. Координатор распределяет работу, проверяет результат и вносит принятые изменения в основной проект. Воркеры DeepSeek выполняют отдельные порученные задачи: исследование, ревью, а в режиме записи — реализацию, локальные тесты и документацию. Дистрибутив называется `deepseek-team`, единственная запускаемая команда — `deepseek-team`.
 
-Это руководство для версии **0.8.0**. Воркеры используют модель `deepseek-flash`; глубину рассуждений (`effort`) выбирает координатор. Для работы нужен отдельный ключ DeepSeek API.
+Это руководство для версии **0.8.1**. Воркеры используют модель `deepseek-flash`; глубину рассуждений (`effort`) выбирает координатор. Для работы нужен отдельный ключ DeepSeek API.
 
 Права воркеров выбираются отдельно. Свежая установка работает в профиле Auto с доступом **только для чтения**: воркер исследует и проверяет код, но не изменяет файлы. Чтобы разрешить реализацию в отдельной копии проекта, нужно явно выбрать `full-access` (см. ниже). Установка сама по себе права записи не даёт.
 
@@ -18,7 +18,7 @@ DeepSeek Team — пакет для Linux, который подключает �
 - Codex CLI и/или Claude Code CLI, уже установленные в `PATH` и настроенные обычным образом.
 - Bubblewrap (песочница обязательна, её нельзя отключить). В Ubuntu первый `setup` может установить пакет и профиль AppArmor через `--with-sandbox`.
 
-Публикация в PyPI пока не выполнена: выпуск зависит от отдельного шага сопровождающего, поэтому установка идёт из Git-репозитория.
+Версия 0.8.1 опубликована в [PyPI](https://pypi.org/project/deepseek-team/), поэтому установка выполняется по имени пакета.
 
 ## Возможности
 
@@ -32,25 +32,25 @@ DeepSeek Team — пакет для Linux, который подключает �
 
 ## Установка и первый запуск
 
-Основной способ — `pipx`:
+Основной способ — `pipx`; пакет ставится по имени из PyPI:
 
 ```bash
 # Ubuntu: pipx устанавливается один раз
 sudo apt-get install pipx
 pipx ensurepath          # затем открыть новый терминал
-pipx install 'git+https://github.com/kirill31337/deepseek-team.git'
+pipx install deepseek-team
 ```
 
 Компактные альтернативы:
 
 ```bash
 # uv
-uv tool install 'git+https://github.com/kirill31337/deepseek-team.git'
+uv tool install deepseek-team
 
 # venv + pip (только внутри виртуального окружения)
 python3 -m venv ~/venvs/deepseek-team
 . ~/venvs/deepseek-team/bin/activate
-python -m pip install 'git+https://github.com/kirill31337/deepseek-team.git'
+python -m pip install deepseek-team
 ```
 
 Установка из локальной копии репозитория:
@@ -162,14 +162,14 @@ deepseek-team status                             # текущее состоян
 Обновление выполняется через тот же менеджер пакетов:
 
 ```bash
-pipx upgrade codex-deepseek-team
+pipx upgrade deepseek-team
 deepseek-team setup --runtime codex --no-key
 cd /path/to/project
 deepseek-team init --coordinator codex .
 deepseek-team doctor --runtime codex --offline
 ```
 
-Повторите `init` в каждом подключённом проекте, чтобы обновить управляемые инструкции. Ваш собственный текст и сохранённые настройки сохраняются. Для Git-установки через uv используйте `uv tool install --force --refresh 'git+https://github.com/kirill31337/deepseek-team.git'`; в venv — его `python -m pip install --upgrade` с тем же Git-источником. Установку pipx из локального клона заменяют командой `pipx install --force .` из обновлённого клона.
+Повторите `init` в каждом подключённом проекте, чтобы обновить управляемые инструкции. Ваш собственный текст и сохранённые настройки сохраняются. Для uv используйте `uv tool upgrade deepseek-team`; в venv — его `python -m pip install --upgrade deepseek-team`. Держите на машине один канал установки; установку pipx из локального клона обновляют командой `pipx install --force .` из обновлённого клона.
 
 Если нужно удалить и сохранённый ключ DeepSeek, выполните `deepseek-team auth remove` до удаления пакета.
 
@@ -178,17 +178,17 @@ deepseek-team doctor --runtime codex --offline
 ```bash
 deepseek-team detach --coordinator codex /path/to/project   # для подключённых проектов
 deepseek-team reset --runtime codex                          # удаляет интеграцию пакета
-pipx uninstall codex-deepseek-team
+pipx uninstall deepseek-team
 ```
 
-Сначала отсоедините проекты командой `detach`, затем удалите принадлежащую пакету интеграцию командой `reset`, и только потом удаляйте сам пакет. `reset` не трогает ваши основные настройки и модель координатора. Сохранённый ключ DeepSeek при этом не удаляется. Для uv используйте `uv tool uninstall codex-deepseek-team`, для venv — его `python -m pip uninstall codex-deepseek-team`. Для Claude замените `codex` на `claude` или используйте `both`.
+Сначала отсоедините проекты командой `detach`, затем удалите принадлежащую пакету интеграцию командой `reset`, и только потом удаляйте сам пакет. `reset` не трогает ваши основные настройки и модель координатора. Сохранённый ключ DeepSeek при этом не удаляется. Для uv используйте `uv tool uninstall deepseek-team`, для venv — его `python -m pip uninstall deepseek-team`. Для Claude замените `codex` на `claude` или используйте `both`.
 
 ## Дополнительная документация
 
 - [Руководство по маршрутизации](https://github.com/kirill31337/deepseek-team/blob/main/docs/ROUTING.ru.md)
 - [docs/HARDENING.md](https://github.com/kirill31337/deepseek-team/blob/main/docs/HARDENING.md) — изоляция и границы безопасности
 - [docs/PUBLISHING.md](https://github.com/kirill31337/deepseek-team/blob/main/docs/PUBLISHING.md) — выпуск для сопровождающих
-- [docs/releases/0.8.0.md](https://github.com/kirill31337/deepseek-team/blob/main/docs/releases/0.8.0.md) — заметки о выпуске 0.8.0
+- [docs/releases/0.8.1.md](https://github.com/kirill31337/deepseek-team/blob/main/docs/releases/0.8.1.md) — заметки о выпуске 0.8.1
 
 ## Лицензия
 

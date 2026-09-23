@@ -8,7 +8,7 @@ DeepSeek Team lets **Codex and Claude Code** delegate implementation, tests, doc
 
 Workers always run the `deepseek-flash` model. Effort policy is `auto`, so the coordinator chooses `low`, `medium` or `high` for each assignment unless you save a fixed level. Live delegation needs its own **DeepSeek API key**; DeepSeek Team does not reuse the credentials your coordinator already has.
 
-This README describes version **0.8.0** of the `codex-deepseek-team` distribution, which installs the single `deepseek-team` executable.
+This README describes version **0.8.1** of the `deepseek-team` package, which installs the single `deepseek-team` executable.
 
 ## Prerequisites
 
@@ -21,25 +21,25 @@ On Ubuntu, `setup --with-sandbox` can install the required system components (se
 
 ## Install
 
-PyPI publication is not available yet, so install from the Git repository. [pipx](https://pipx.pypa.io/latest/how-to/install-pipx.html) keeps the CLI in its own environment and is the recommended route:
+Version 0.8.1 is published on [PyPI](https://pypi.org/project/deepseek-team/), so install the released package by name. [pipx](https://pipx.pypa.io/latest/how-to/install-pipx.html) keeps the CLI in its own environment and is the recommended route:
 
 ```bash
 sudo apt-get install pipx      # Ubuntu, once
 pipx ensurepath
 # Open a new terminal so PATH is refreshed.
-pipx install 'git+https://github.com/kirill31337/deepseek-team.git'
+pipx install deepseek-team
 ```
 
 Compact alternatives, if you already prefer another manager:
 
 ```bash
 # uv
-uv tool install 'git+https://github.com/kirill31337/deepseek-team.git'
+uv tool install deepseek-team
 
 # pip inside a virtual environment only
 python3 -m venv ~/venvs/deepseek-team
 . ~/venvs/deepseek-team/bin/activate
-python -m pip install 'git+https://github.com/kirill31337/deepseek-team.git'
+python -m pip install deepseek-team
 ```
 
 To install from a local checkout instead:
@@ -153,34 +153,34 @@ These checks make no provider requests. Local readiness does not validate the ke
 
 ## Update and uninstall
 
-For a pipx Git install, upgrade through pipx and re-run the local setup steps:
+Upgrade the released package through the same manager, then re-run the local setup steps:
 
 ```bash
-pipx upgrade codex-deepseek-team
+pipx upgrade deepseek-team
 deepseek-team setup --runtime codex --no-key
 cd /path/to/project
 deepseek-team init --coordinator codex .
 deepseek-team doctor --runtime codex --offline
 ```
 
-Run `init` for each attached project to refresh its managed instructions; your own instruction text and saved preferences are preserved. With uv, refresh the Git installation using `uv tool install --force --refresh 'git+https://github.com/kirill31337/deepseek-team.git'`. In a virtual environment, use its `python -m pip install --upgrade` with the same Git source. A local-clone pipx installation is replaced with `pipx install --force .` from the updated clone.
+Run `init` for each attached project to refresh its managed instructions; your own instruction text and saved preferences are preserved. With uv, use `uv tool upgrade deepseek-team`. In a virtual environment, use its `python -m pip install --upgrade deepseek-team`. Keep one install channel per machine; a local-clone pipx installation is refreshed with `pipx install --force .` from the updated clone.
 
 To remove DeepSeek Team, detach each project before uninstalling. If you also want to delete the saved DeepSeek key, run `deepseek-team auth remove` while the command is still installed.
 
 ```bash
 deepseek-team detach --coordinator codex /path/to/project   # for each attached project
 deepseek-team reset --runtime codex                         # remove managed integration
-pipx uninstall codex-deepseek-team
+pipx uninstall deepseek-team
 ```
 
-`detach` preserves your own instruction content, and `reset` removes only the package-owned provider block and hooks; your primary authentication and unrelated configuration are kept. Saved keys are **not** deleted by uninstall. For uv use `uv tool uninstall codex-deepseek-team`; for a venv use its `python -m pip uninstall codex-deepseek-team`. Substitute `claude` or `both` for `codex` wherever your runtime differs.
+`detach` preserves your own instruction content, and `reset` removes only the package-owned provider block and hooks; your primary authentication and unrelated configuration are kept. Saved keys are **not** deleted by uninstall. For uv use `uv tool uninstall deepseek-team`; for a venv use its `python -m pip uninstall deepseek-team`. Substitute `claude` or `both` for `codex` wherever your runtime differs.
 
 ## Further reading
 
 - [Routing guide](https://github.com/kirill31337/deepseek-team/blob/main/docs/ROUTING.md) - admission, evidence and feedback.
 - [Hardening](https://github.com/kirill31337/deepseek-team/blob/main/docs/HARDENING.md) - coordinator and worker boundaries.
 - [Publishing](https://github.com/kirill31337/deepseek-team/blob/main/docs/PUBLISHING.md) - release-maintainer details.
-- [0.8.0 release notes](https://github.com/kirill31337/deepseek-team/blob/main/docs/releases/0.8.0.md)
+- [0.8.1 release notes](https://github.com/kirill31337/deepseek-team/blob/main/docs/releases/0.8.1.md)
 - Russian README: [README.ru.md](https://github.com/kirill31337/deepseek-team/blob/main/README.ru.md)
 
 ## License

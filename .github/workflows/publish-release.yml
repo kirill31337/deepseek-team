@@ -104,7 +104,7 @@ jobs:
     runs-on: ubuntu-24.04
     environment:
       name: pypi
-      url: https://pypi.org/p/codex-deepseek-team
+      url: https://pypi.org/p/deepseek-team
     permissions:
       id-token: write
     steps:
@@ -120,7 +120,7 @@ jobs:
     runs-on: ubuntu-24.04
     environment:
       name: testpypi
-      url: https://test.pypi.org/p/codex-deepseek-team
+      url: https://test.pypi.org/p/deepseek-team
     permissions:
       id-token: write
     steps:

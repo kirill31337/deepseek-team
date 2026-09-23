@@ -136,6 +136,7 @@ class PackagingTests(unittest.TestCase):
         data = tomllib.loads((root / 'pyproject.toml').read_text())
         scripts = data['project']['scripts']
         self.assertEqual(scripts, {'deepseek-team': 'codex_deepseek_team.cli:main'})
+        self.assertEqual(data['project']['name'], 'deepseek-team')
         from codex_deepseek_team import __version__
         self.assertEqual(data['project']['version'], __version__)
         self.assertIn('data/apparmor/*', data['tool']['setuptools']['package-data']['codex_deepseek_team'])
@@ -145,6 +146,8 @@ class PackagingTests(unittest.TestCase):
         readme = (root / 'README.md').read_text()
         self.assertIn('git clone https://github.com/kirill31337/deepseek-team.git', readme)
         self.assertNotIn('github.com/kirill31337/codex-deepseek-team', readme)
+        for current in (readme, (root / 'README.ru.md').read_text()):
+            self.assertNotIn('codex-deepseek-team', current)
 
 
 if __name__ == '__main__':

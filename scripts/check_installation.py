@@ -14,7 +14,7 @@ import tempfile
 import zipfile
 
 
-DIST_NAME = 'codex-deepseek-team'
+DIST_NAME = 'deepseek-team'
 ENTRYPOINTS = ('deepseek-team',)
 RESOURCES = (
     'codex_deepseek_team/data/delegation.md',

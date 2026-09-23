@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -73,6 +74,28 @@ class InstallationCheckTests(unittest.TestCase):
 
             self.assertEqual(resolved, wheel.resolve())
             self.assertTrue(resolved.is_absolute())
+
+    @staticmethod
+    def _write_wheel(path, name, version):
+        with zipfile.ZipFile(path, 'w') as archive:
+            archive.writestr(
+                f'{name.replace("-", "_")}-{version}.dist-info/METADATA',
+                f'Metadata-Version: 2.1\nName: {name}\nVersion: {version}\n')
+        return path
+
+    def test_wheel_identity_accepts_only_the_neutral_distribution_name(self):
+        checker = load_checker()
+        self.assertEqual(checker.DIST_NAME, 'deepseek-team')
+        self.assertEqual(checker.ENTRYPOINTS, ('deepseek-team',))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            neutral = self._write_wheel(root / 'deepseek_team-0.8.1-py3-none-any.whl',
+                                        'deepseek-team', '0.8.1')
+            self.assertEqual(checker.wheel_identity(neutral), ('deepseek-team', '0.8.1'))
+            legacy = self._write_wheel(root / 'codex_deepseek_team-0.8.0-py3-none-any.whl',
+                                       'codex-deepseek-team', '0.8.0')
+            with self.assertRaisesRegex(checker.CheckError, 'expected distribution deepseek-team'):
+                checker.wheel_identity(legacy)
 
     def test_only_current_wheel_is_accepted(self):
         checker = load_checker()
