@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 import uuid
 
-from . import activation, coordination, project, settings
+from . import activation, coordination, project, scope_matching, settings
 from .shell_mutation import classify_shell_mutation
 
 
@@ -27,20 +27,14 @@ def _paths_from_apply_patch(command: str) -> list[str]:
     return re.findall(r"^\*\*\* (?:(?:Update|Add|Delete) File|Move to): (.+)$", command, re.M)
 
 
-def _overlap(path: str, scope: str, root: Path, *, descendants: bool = False) -> bool:
-    declared = Path(scope)
-    declared = declared if declared.is_absolute() else root / declared
-    try:
-        scope = declared.resolve().relative_to(root.resolve()).as_posix()
-    except ValueError:
-        return False
-    if scope == '.' or (descendants and path == '.'):
-        return True
-    if scope.endswith("*"):
-        return (path.startswith(scope[:-1])
-                or (descendants and scope[:-1].startswith(path.rstrip("/") + "/")))
-    return (path == scope or path.startswith(scope.rstrip("/") + "/")
-            or (descendants and scope.startswith(path.rstrip("/") + "/")))
+def _declared_scopes(root: Path, deliverable: dict) -> list[str]:
+    """Canonical project-relative scopes; external scopes never grant authority."""
+    found = []
+    for raw in deliverable.get("scope", []):
+        canonical = scope_matching.canonical(root, raw)
+        if canonical is not None:
+            found.append(canonical)
+    return found
 
 
 def _mutation(payload: dict) -> tuple[bool, list[str]]:
@@ -187,7 +181,8 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
             + settings.final_reporting_guidance()
         )
         return _context(text, event)
-    task = coordination.latest_task(root, session)
+    task = (coordination.active_task(root, session)
+            or coordination.latest_task(root, session))
     if event == "SessionStart":
         policy = settings.resolve(root)
         base = (
@@ -199,6 +194,11 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
         )
         if task:
             base += coordination.summary(task)
+            others = [row["id"] for row in coordination.unfinished_tasks(root, session)
+                      if row.get("id") != task.get("id")]
+            if others:
+                base += (" Other unfinished coordination tasks remain in this session: "
+                         + ", ".join(others) + ".")
         else:
             base += "No active coordination task is recorded for this session."
         if payload.get("source") == "compact":
@@ -248,57 +248,68 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
             return _deny(
                 "Unscoped mutating Bash cannot be mapped to the registered Auto/75 full-access "
                 "distribution. Revise the plan or use a file edit whose scope can be checked.")
+        scope_tasks = coordination.unfinished_tasks(root, session) or [task]
         normalized_paths = []
-        for path in paths:
+        for raw in paths:
             # Claude Edit/Write normally provide absolute paths. Resolve from
             # the hook cwd, then compare project-relative scopes. Symlinks may
             # not turn a planned project file into a write outside the project.
-            candidate = Path(path)
-            candidate = candidate if candidate.is_absolute() else cwd / candidate
-            try:
-                path = candidate.resolve().relative_to(root.resolve()).as_posix()
-            except ValueError:
-                return _deny('Mutation scope is outside the attached project: ' + path)
+            path = scope_matching.canonical(root, raw, cwd=cwd)
+            if path is None:
+                return _deny('Mutation scope is outside the attached project: ' + raw)
             normalized_paths.append(path)
             matching = [
                 deliverable for deliverable in task.get("deliverables", [])
-                if any(_overlap(path, scope, root) for scope in deliverable.get("scope", []))
+                if any(scope_matching.contained(path, scope)
+                       for scope in _declared_scopes(root, deliverable))
             ]
             if not matching:
                 return _deny(
                     f"Unplanned mutation scope {path}. Revisit the distribution before "
                     "starting a new block of work.")
-            # A directory write also conflicts with worker-owned descendants.
-            for deliverable in task.get("deliverables", []):
-                if not any(_overlap(path, scope, root, descendants=True)
-                           for scope in deliverable.get("scope", [])):
-                    continue
-                assignment = next((row for row in task.get("assignments", [])
-                                   if row.get("deliverable_id") == deliverable.get("id")), None)
-                if assignment and assignment.get("status") in ("planned", "running"):
-                    return _deny(
-                        f"Path {path} belongs to pending worker assignment {assignment['id']}; "
-                        "wait for/review that result before duplicating implementation.")
-        coordination.record_coordinator_event(root, task["id"], "mutation_requested", normalized_paths)
+            # A directory mutation also conflicts with worker-owned descendants.
+            for owner in scope_tasks:
+                for deliverable in owner.get("deliverables", []):
+                    if not any(scope_matching.mutation_overlaps(root, path, scope)
+                               for scope in _declared_scopes(root, deliverable)):
+                        continue
+                    assignment = next((row for row in owner.get("assignments", [])
+                                       if row.get("deliverable_id") == deliverable.get("id")), None)
+                    if assignment and assignment.get("status") in ("planned", "running"):
+                        return _deny(
+                            f"Path {path} belongs to pending worker assignment {assignment['id']}; "
+                            "wait for/review that result before duplicating implementation.")
+        for affected in scope_tasks:
+            if affected['id'] == task['id'] or any(
+                    coordination._mutation_touches_scope(root, normalized_paths, item.get('scope', []))
+                    for item in affected.get('deliverables', [])):
+                coordination.record_coordinator_event(
+                    root, affected['id'], 'mutation_requested', normalized_paths)
         return {}
     if event == "Stop":
-        # A conversational/read-only turn need not invent implementation work.
-        # The ledger guard refuses closure if a plan or work already exists.
-        if coordination.close_unstarted_task(root, task["id"]):
-            return {"continue": True}
-        issues = coordination.validate_task(root, task["id"])
-        pending = [a["id"] for a in task.get("assignments", [])
-                   if a.get("status") in ("planned", "running")]
-        undisposed = [a["id"] for a in task.get("assignments", [])
-                      if a.get("status") in ("succeeded", "failed") and not a.get("disposition")]
         reasons = []
-        if issues:
-            reasons.append("Distribution remains noncompliant: " + "; ".join(issues))
-        if pending:
-            reasons.append("Worker assignments are still pending: " + ", ".join(pending))
-        if undisposed:
-            reasons.append("Completed worker results require a recorded disposition: " + ", ".join(undisposed))
-        reasons.extend(coordination.completion_issues(task))
+        for unfinished in coordination.unfinished_tasks(root, session):
+            # Closing a newer draft or completed plan must not hide older work.
+            if coordination.close_unstarted_task(root, unfinished['id']):
+                continue
+            issues = coordination.validate_task(root, unfinished['id'])
+            pending = [a['id'] for a in unfinished.get('assignments', [])
+                       if a.get('status') in ('planned', 'running')]
+            undisposed = [a['id'] for a in unfinished.get('assignments', [])
+                          if a.get('status') in ('succeeded', 'failed') and not a.get('disposition')]
+            task_reasons = []
+            if issues:
+                task_reasons.append('Distribution remains noncompliant: ' + '; '.join(issues))
+            if pending:
+                task_reasons.append('Worker assignments are still pending: ' + ', '.join(pending))
+            if undisposed:
+                task_reasons.append('Completed worker results require a recorded disposition: '
+                                    + ', '.join(undisposed))
+            task_reasons.extend(coordination.completion_issues(unfinished))
+            if task_reasons:
+                reasons.append(unfinished['id'] + ': ' + ' '.join(task_reasons))
+            else:
+                coordination.complete_task(root, unfinished['id'])
         if reasons:
             reason = " ".join(reasons)
             if not payload.get("stop_hook_active"):
@@ -306,7 +317,6 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
             # Bound our own retry without vetoing another hook's continuation.
             # The ledger stays unfinished and the runtime receives a warning.
             return {"systemMessage": "DeepSeek Team task remains unfinished. " + reason}
-        coordination.complete_task(root, task["id"])
         return {"continue": True}
     return {}
 

@@ -1,7 +1,7 @@
 """Owned independent Git copies: no cleaning/adoption of the user's checkout."""
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import fcntl
 import hashlib
 import json
@@ -307,37 +307,115 @@ def _credential_like(name: Path) -> bool:
             or any(part.lower() in {'.ssh', '.aws', '.azure', '.kube', '.gnupg'} for part in name.parts))
 
 
+@contextmanager
+def _import_parent(root_fd: int, parts: tuple[str, ...], *, create: bool = False):
+    """Pin each directory without following source- or worker-controlled links."""
+    current = os.dup(root_fd)
+    try:
+        for part in parts:
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+            try:
+                child = os.open(part, flags, dir_fd=current)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(part, mode=0o755, dir_fd=current)
+                except FileExistsError:
+                    pass  # The no-follow open still checks a concurrent replacement.
+                child = os.open(part, flags, dir_fd=current)
+            os.close(current)
+            current = child
+        yield current
+    finally:
+        os.close(current)
+
+
+def _import_destination(parent: int, name: str):
+    try:
+        info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise WorkspaceError('Imported destination must be an ordinary file without links.')
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _import_file(source_root: int, work_root: int, rel: Path, imported: list[str]) -> None:
+    with _import_parent(source_root, rel.parts[:-1]) as source_parent:
+        fd = os.open(rel.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                     dir_fd=source_parent)
+        with os.fdopen(fd, 'rb') as source:
+            info = os.fstat(source.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                raise WorkspaceError('Selected source must be an ordinary non-symlink file.')
+            with _import_parent(work_root, rel.parts[:-1], create=True) as parent:
+                before = _import_destination(parent, rel.name)
+                temporary = '.deepseek-import-' + uuid.uuid4().hex + '.tmp'
+                fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o600, dir_fd=parent)
+                try:
+                    with os.fdopen(fd, 'wb') as target:
+                        shutil.copyfileobj(source, target)
+                        target.flush()
+                        os.fchmod(target.fileno(), stat.S_IMODE(info.st_mode))
+                        os.fsync(target.fileno())
+                    if _import_destination(parent, rel.name) != before:
+                        raise WorkspaceError('Imported destination changed concurrently; retry.')
+                    # Replacing the directory entry never opens or chmods its target.
+                    os.replace(temporary, rel.name, src_dir_fd=parent, dst_dir_fd=parent)
+                    # Record the publication even if the following durability sync fails.
+                    imported.append(rel.as_posix())
+                    os.fsync(parent)
+                finally:
+                    try:
+                        os.unlink(temporary, dir_fd=parent)
+                    except FileNotFoundError:
+                        pass
+
+
 def import_paths(copy: Workspace, paths: list[str]) -> list[str]:
     """Explicitly copy selected source files into an owned workspace as coordinator preparation."""
     if not paths:
         raise WorkspaceError('workspace import requires at least one --include FILE.', 64)
     imported = []
-    with copy.lock():
-        source_root = copy.source.resolve()
-        work_root = copy.path.resolve()
+    with copy.lock(), ExitStack() as stack:
+        selected = []
         for value in paths:
             rel = Path(value)
-            if rel.is_absolute() or '..' in rel.parts or not rel.parts:
+            if '\0' in value or rel.is_absolute() or '..' in rel.parts or not rel.parts:
                 raise WorkspaceError('Imported paths must be repository-relative ordinary files.', 64)
-            if _credential_like(rel):
-                raise WorkspaceError(f'Refusing credential-like source path: {rel}.', 78)
-            source = source_root / rel
-            try:
-                info = source.lstat()
-            except FileNotFoundError:
-                raise WorkspaceError(f'Selected source path does not exist: {rel}.', 66) from None
-            if source.is_symlink() or not stat.S_ISREG(info.st_mode):
-                raise WorkspaceError(f'Selected source path must be an ordinary non-symlink file: {rel}.', 78)
-            destination = work_root / rel
-            parent = destination.parent
-            parent.mkdir(parents=True, exist_ok=True)
-            if not parent.resolve().is_relative_to(work_root):
-                raise WorkspaceError('Imported path escaped the owned workspace.', 78)
-            shutil.copyfile(source, destination)
-            os.chmod(destination, stat.S_IMODE(info.st_mode))
-            imported.append(rel.as_posix())
-        copy.metadata['prepared_paths'] = sorted(set(copy.metadata.get('prepared_paths', [])) | set(imported))
-        copy.save()
+            if '.git' in rel.parts or _credential_like(rel):
+                raise WorkspaceError(f'Refusing protected source path: {rel}.', 78)
+            selected.append(rel)
+        try:
+            roots = []
+            for root in (copy.source, copy.path):
+                fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+                stack.callback(os.close, fd)
+                roots.append(fd)
+            if os.fstat(roots[1]).st_ino != copy.metadata['work_inode']:
+                raise WorkspaceError('Workspace directory was replaced; import refused.', 73)
+            for rel in selected:
+                try:
+                    _import_file(*roots, rel, imported)
+                except FileNotFoundError:
+                    raise WorkspaceError(f'Selected source path does not exist: {rel}.', 66) from None
+        except OSError:
+            raise WorkspaceError('Import requires ordinary files and directories without symlinks; '
+                                 'copying or atomic replacement failed.', 78) from None
+        finally:
+            # Imports publish one file at a time. A later rejection must not leave
+            # already published coordinator input attributed to a worker.
+            if imported:
+                copy.metadata['prepared_paths'] = sorted(
+                    set(copy.metadata.get('prepared_paths', [])) | set(imported))
+                try:
+                    copy.save()
+                except OSError:
+                    raise WorkspaceError('Imported files are retained, but preparation metadata '
+                                         'could not be saved; inspect the copy before use.', 78) from None
     return sorted(imported)
 
 

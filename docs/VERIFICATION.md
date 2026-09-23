@@ -1,3 +1,53 @@
+# Version 0.8.4 verification
+
+Date: 2026-09-23. Scope: consolidate pending lifecycle, configuration and selected
+source-import fixes, retain 0.8.3 native routing, and prevent source branch clutter.
+
+The final local suite ran **769 tests, all passing without skips**, with Codex
+**0.153.2** and Claude Code **2.1.278** available, using
+`PYTHONPATH=src python3 -m unittest discover -s tests -v` with the isolated Claude
+installation on PATH. The source snapshot remained unchanged throughout this run.
+The exact wheel passed install/replacement/uninstall checks with **pip, pipx and
+uv**; external configuration was preserved. Wheel and sdist passed
+`twine check --strict`; archive contents matched the code/tests and contained no
+local configuration, credentials or raw logs.
+
+Real Git regression tests verify that repeated worker-copy creation and completion
+preserve source refs, HEAD, index entries, registered worktrees, dirty tracked and
+untracked files, and a foreign worktree. Internal `deepseek/<id>` refs exist only in
+independent private repositories. The coordinator cleanup rule is instruction
+based: prefer existing isolation or a detached worktree and remove only owned,
+clean, accepted work after checking commit reachability. No automatic deletion
+engine or broad prune command was added.
+
+Adversarial review identified quoted assignment prefixes and partial-import
+accounting. Imports now retain preparation records for files already published
+when a later file or directory sync fails; NUL paths are rejected before copying.
+Transaction tests cover ordinary write failures and concurrent edits. Neither
+multi-file settings updates nor multi-file imports claim crash-atomic behavior.
+
+Real Bubblewrap tests cover a virtualenv interpreter symlink chain without exposing
+the surrounding private prefix and reject a missing bridge interpreter during
+preflight. Initial paid review launches encountered this interpreter-startup
+failure before model execution; retained copies were inspected before explicit
+continuation. The successful reviews used the installed package with the system
+interpreter. Worker-internal broad suites encountered nested-namespace ENOSPC;
+these environmental failures are not represented as passing worker checks.
+
+A separate paid `doctor --runtime codex --live --access full-access --effort low`
+passed runtime/preflight checks, provider streaming metadata and a synthetic
+read-only worker. The live smoke remains read-only by design; full-access
+capabilities are checked locally. Primary Codex configuration/authentication were
+unchanged, and `kernel.apparmor_restrict_unprivileged_userns` remained `1`.
+
+DeepSeek performed two read-only reviews and implemented hygiene guidance/tests
+and the bounded command-parser correction. That correction required coordinator
+rework for empty quoted fragments inside an assignment-like prefix. The coordinator reviewed actual diffs,
+handled integration, lifecycle/native conflicts, import accounting, interpreter
+startup and final verification. No native subagent was used.
+
+---
+
 # Version 0.8.3 verification
 
 Date: 2026-09-23. Scope: route every delegated subtask before native dispatch,

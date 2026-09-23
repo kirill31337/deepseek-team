@@ -162,14 +162,15 @@ class RoutingService:
     def validate_plan_decision(self, decision_id, features, binding, *, executor=None):
         try:
             decision = self.decision(decision_id)
+            card = validate_features(features)
             valid = (decision['mode'] == 'auto' and decision['binding'] == binding
-                     and decision['features'] == validate_features(features))
+                     and decision['features'] == card)
             if executor is not None:
                 valid = valid and executor == ('worker' if decision['action'] == 'worker' else 'coordinator')
                 if executor == 'worker':
                     from .routing_models import PROTECTED_KINDS, WRITE_KINDS
-                    valid = (valid and decision['enabled'] and features['kind'] not in PROTECTED_KINDS
-                             and (features['kind'] not in WRITE_KINDS or decision['access'] == 'full-access'))
+                    valid = (valid and decision['enabled'] and card['kind'] not in PROTECTED_KINDS
+                             and (card['kind'] not in WRITE_KINDS or decision['access'] == 'full-access'))
             return valid
         except RoutingError:
             return False

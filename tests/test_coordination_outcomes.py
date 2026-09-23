@@ -163,6 +163,9 @@ class DeliverableOutcomeTests(OutcomeCase):
 
     def test_resolving_directory_alias_preserves_wildcard_scope_matching(self):
         (self.repo / 'src').mkdir()
+        # A known ordinary file has no descendants; nonexistent paths must be
+        # treated conservatively because they may name directories.
+        (self.repo / 'src/README.md').write_text('notes\n')
         (self.repo / 'aliasdir').symlink_to('src', target_is_directory=True)
         for scope in ('aliasdir/*.py', 'aliasdir/core?.py', 'aliasdir/[c]*.py'):
             with self.subTest(scope=scope):

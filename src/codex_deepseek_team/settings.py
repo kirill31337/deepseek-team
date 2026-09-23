@@ -1,6 +1,7 @@
 """Credential-free delegation policy; one resolver for every public entry point."""
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 import fcntl
 import json
@@ -28,6 +29,10 @@ DEFAULTS = {'delegation_level': 'auto', 'access': 'auto', 'effort': 'auto',
 
 class SettingsError(Exception):
     """Invalid or unsafe settings; never silently escalate permissions."""
+
+
+class SettingsPublishedError(SettingsError):
+    """Settings were published, but their directory durability is unconfirmed."""
 
 
 def parse_level(value):
@@ -137,7 +142,8 @@ def _canonicalize_effort(values: dict) -> dict:
     return values
 
 
-def _read(path: Path) -> bytes | None:
+def read_bytes(path: Path) -> bytes | None:
+    """Raw settings bytes; symlinks and hardlinks are refused."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
@@ -154,14 +160,29 @@ def _read(path: Path) -> bytes | None:
     return raw
 
 
+_read = read_bytes  # internal alias kept for callers in sibling modules
+
+
 def read_values(path: Path) -> dict:
-    raw = _read(Path(path))
+    raw = read_bytes(Path(path))
     try:
         values = tomllib.loads((raw or b'').decode('utf-8'))
     except (ValueError, UnicodeError):
         raise SettingsError(f'Invalid delegation TOML: {path}; file preserved.') from None
     _validate(values)
     return _canonicalize_effort(values)
+
+
+def _merge_into(values: dict, sources: dict, label: str, path: Path, layer: dict) -> None:
+    for key, value in layer.items():
+        values[key], sources[key] = value, f'{label}:{path}'
+
+
+def _snapshot(project: Path | None, values: dict, sources: dict) -> Policy:
+    from . import activation
+    active = activation.resolve(project)
+    return Policy(values['delegation_level'], values['access'], MappingProxyType(dict(sources)),
+                  values['effort'], active.enabled, active.source, values['max_workers'])
 
 
 def resolve(root: Path | None = None, *, delegation_level: str | int | None = None,
@@ -177,8 +198,7 @@ def resolve(root: Path | None = None, *, delegation_level: str | int | None = No
     if project is not None:
         layers.append(('project', project / PROJECT_FILE))
     for label, path in layers:
-        for key, value in read_values(path).items():
-            values[key], sources[key] = value, f'{label}:{path}'
+        _merge_into(values, sources, label, path, read_values(path))
     overrides = {k: v for k, v in {
         'delegation_level': delegation_level, 'access': access, 'effort': effort, 'max_workers': max_workers,
     }.items() if v is not None}
@@ -186,16 +206,30 @@ def resolve(root: Path | None = None, *, delegation_level: str | int | None = No
     _canonicalize_effort(overrides)
     for key, value in overrides.items():
         values[key], sources[key] = value, 'cli'
-    from . import activation
-    active = activation.resolve(project)
-    return Policy(values['delegation_level'], values['access'], MappingProxyType(sources),
-                  values['effort'], active.enabled, active.source, values['max_workers'])
+    return _snapshot(project, values, sources)
 
 
-def set_values(path: Path, *, delegation_level: str | int | None = None,
-               access: str | None = None, effort: str | None = None,
-               max_workers: int | None = None) -> bool:
-    """Atomic partial update: changing a level never implicitly resets access."""
+def candidate_policy(root: Path | None, project_path: Path, project_values: dict, *,
+                     global_path: Path | None = None) -> Policy:
+    """Freeze the policy a project layer will have once project_values is published.
+
+    The project layer comes from the caller; global settings and activation are
+    still resolved from disk. Instructions can be rendered before publication.
+    """
+    _validate(project_values)
+    project_values = _canonicalize_effort(dict(project_values))
+    values = dict(DEFAULTS)
+    sources = {name: 'default' for name in DEFAULTS}
+    global_path = global_file() if global_path is None else Path(global_path)
+    _merge_into(values, sources, 'global', global_path, read_values(global_path))
+    _merge_into(values, sources, 'project', Path(project_path), dict(project_values))
+    return _snapshot(project_root(root), values, sources)
+
+
+def collect_changes(*, delegation_level: str | int | None = None,
+                    access: str | None = None, effort: str | None = None,
+                    max_workers: int | None = None) -> dict:
+    """Validated partial update; at least one field is required, others stay saved."""
     changes = {k: v for k, v in {
         'delegation_level': delegation_level, 'access': access, 'effort': effort, 'max_workers': max_workers,
     }.items() if v is not None}
@@ -203,6 +237,23 @@ def set_values(path: Path, *, delegation_level: str | int | None = None,
     _canonicalize_effort(changes)
     if not changes:
         raise SettingsError('Specify --delegation-level, --access, --effort and/or --max-workers.')
+    return changes
+
+
+def merged_values(values: dict, changes: dict) -> dict:
+    """Pure merge of a validated change set over currently saved values."""
+    updated = dict(values)
+    updated.update(changes)
+    return updated
+
+
+@contextmanager
+def settings_lock(path: Path):
+    """Hold the exclusive settings lock while a caller prepares related files.
+
+    The lock serializes cooperating writers of the same settings file, so a caller may render
+    dependent artifacts from a candidate policy and publish the file last.
+    """
     path = Path(path)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     parent = path.parent.lstat()
@@ -210,40 +261,65 @@ def set_values(path: Path, *, delegation_level: str | int | None = None,
         raise SettingsError('Settings directory must be an owned ordinary directory.')
     lock = os.open(path.with_name(path.name + '.lock'),
                    os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
-    temporary = None
     try:
         info = os.fstat(lock)
         if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or
                 info.st_uid != os.geteuid() or info.st_mode & 0o077):
             raise SettingsError('Unsafe settings lock; no settings changed.')
         fcntl.flock(lock, fcntl.LOCK_EX)
-        previous = _read(path)
-        values = read_values(path)
-        if all(values.get(k) == v for k, v in changes.items()):
-            return False
-        values.update(changes)
-        raw = ''.join(f'{key} = {json.dumps(values[key])}\n'
-                      for key in DEFAULTS if key in values).encode()
-        mode = stat.S_IMODE(path.stat().st_mode) if previous is not None else 0o600
+        yield path
+    finally:
+        os.close(lock)
+
+
+def publish_values(path: Path, previous: bytes | None, values: dict) -> None:
+    """Atomic commit of a fully-formed settings file; refuses concurrent writers."""
+    path = Path(path)
+    raw = ''.join(f'{key} = {json.dumps(values[key])}\n'
+                  for key in DEFAULTS if key in values).encode()
+    mode = stat.S_IMODE(path.stat().st_mode) if previous is not None else 0o600
+    temporary = None
+    try:
         with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as stream:
             temporary = Path(stream.name)
             os.fchmod(stream.fileno(), mode)
             stream.write(raw)
             stream.flush()
             os.fsync(stream.fileno())
-        if _read(path) != previous:
+        if read_bytes(path) != previous:
             raise SettingsError('Settings changed concurrently; retry the update.')
         os.replace(temporary, path)
-        fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        temporary = None
         try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        return True
+            fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except BaseException as error:
+            # os.replace is the commit point. Callers must retain dependent
+            # artifacts even when durability confirmation fails afterwards.
+            raise SettingsPublishedError(
+                'Settings were published, but directory durability could not be confirmed.') from error
     finally:
-        os.close(lock)
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+
+
+def set_values(path: Path, *, delegation_level: str | int | None = None,
+               access: str | None = None, effort: str | None = None,
+               max_workers: int | None = None) -> bool:
+    """Atomic partial update: changing a level never implicitly resets access."""
+    changes = collect_changes(delegation_level=delegation_level, access=access,
+                              effort=effort, max_workers=max_workers)
+    path = Path(path)
+    with settings_lock(path):
+        previous = read_bytes(path)
+        values = read_values(path)
+        if all(values.get(key) == value for key, value in changes.items()):
+            return False
+        publish_values(path, previous, merged_values(values, changes))
+        return True
 
 
 def describe(policy: Policy) -> str:
@@ -393,6 +469,25 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
                if policy.adaptive else '\n')
         )
 
+    hygiene = (
+        '### Workspace and branch hygiene\n'
+        'Coordinator process guidance, separate from the worker OS sandbox. Each write-capable '
+        'worker already runs in a fully independent Git repository created under the private state '
+        'directory by workspace.create; its internal deepseek/<id> ref lives only in that private '
+        'copy and is never a branch or worktree of the source project. Reuse that existing '
+        'isolation instead of building isolation in the project. Create no synthetic branch, '
+        'worktree or commit merely to invoke DeepSeek: a worker launch needs no project branch. '
+        'When new coordinator isolation is genuinely required, prefer a detached worktree '
+        '(git worktree add --detach) over a named task branch, and record which temporary branch '
+        'or worktree the coordinator created and why. After accepted integration, verify a clean '
+        'status and commit reachability before removing only the coordinator\'s own temporary '
+        'worktree and its fully merged branch. Preserve active, failed, unaccepted and foreign '
+        'work: never bulk-prune, force-delete or rewrite work you do not own. This is not worker '
+        'OS enforcement, there is no automatic cleanup engine and no broad cleanup command; worker '
+        'copies remain retained outside the project for review and recovery and are never deleted '
+        'automatically.\n'
+    )
+
     guidance = (
         full_profiles if policy.effective_access == 'full-access' else read_only_profiles
     )[policy.delegation_level]
@@ -472,7 +567,7 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
     return (
         f'### Effective delegation profile: {label} / {policy.effective_access}; '
         f'effort={policy.effort}\n'
-        + common + guidance + '\n' + adaptive + access + process
+        + common + guidance + '\n' + adaptive + access + hygiene + process
         + f'Execution capacity is {policy.max_workers}; configure max_workers independently of access. '
           'Plan all eligible deliverables; launch independent jobs concurrently and let excess jobs wait '
           'in FIFO order. Capacity is not a reason to retain their implementation with the coordinator. '

@@ -202,6 +202,24 @@ Use `config set --project --max-workers N` or `--global` to save a limit, or
 Default queue and total timeout are unlimited; explicit `--timeout` includes queue time.
 Before secrets or provider launch, queued work rechecks off/access/routing/HEAD.
 
+### Workspace and branch hygiene
+
+This is coordinator process guidance, separate from the worker OS sandbox. Each write-capable
+worker already runs in a fully independent Git repository created under the private state
+directory by `workspace.create`; its internal `deepseek/<id>` ref lives only in that private
+copy and is never a branch or worktree of the source project. Reuse that existing isolation
+instead of building isolation in the project. Do not create a synthetic branch, worktree or
+commit merely to invoke DeepSeek: a worker launch needs no project branch.
+
+When new coordinator isolation is genuinely required, prefer a detached worktree
+(`git worktree add --detach`) over a named task branch, and record which temporary branch or
+worktree the coordinator created and why. After accepted integration, verify a clean status
+and commit reachability before removing only the coordinator's own temporary worktree and its
+fully merged branch. Preserve active, failed, unaccepted and foreign work: never bulk-prune,
+force-delete or rewrite work you do not own. There is no automatic cleanup engine and no broad
+cleanup command; worker copies remain retained outside the project for review and recovery and
+are never deleted automatically.
+
 ### Integration boundary
 
 Codex: distribution/source-mutation gates use supported lifecycle hooks, but native

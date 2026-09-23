@@ -160,6 +160,22 @@ Workers require the Linux OS sandbox. Full-access work runs in an owned developm
 
 Read-only and full-access workers have different isolation boundaries; see [Hardening](https://github.com/kirill31337/deepseek-team/blob/main/docs/HARDENING.md) for the exact filesystem, credential and network rules.
 
+### Workspace and branch hygiene
+
+Each write-capable worker runs in a fully independent Git repository created under the private
+state directory (`workspace.create`). Its internal `deepseek/<id>` ref exists only inside that
+private copy, so it is never a branch or worktree of your project and never clutters your
+source history. Reuse that existing isolation instead of building isolation in the project.
+
+The coordinator creates no synthetic branch just to invoke DeepSeek. When it genuinely needs
+separate isolation, it prefers a detached worktree (`git worktree add --detach`) over a named
+task branch, records which temporary branch or worktree it created, and after accepted
+integration verifies a clean status and commit reachability before removing only its own
+temporary worktree and fully merged branch. It preserves active, failed, unaccepted and foreign
+work: it never bulk-prunes or force-deletes work it does not own. This is coordinator process
+guidance, not worker OS enforcement, and there is no automatic cleanup engine. Worker copies
+stay outside the project for review and recovery and are never deleted automatically.
+
 ## Diagnostics
 
 ```bash

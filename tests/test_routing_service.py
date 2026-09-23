@@ -8,6 +8,7 @@ import time
 import unittest
 from unittest.mock import patch
 
+from codex_deepseek_team import settings
 from codex_deepseek_team.routing import RoutingService
 from codex_deepseek_team.routing_models import RoutingError, validate_features, validate_observation
 
@@ -30,6 +31,40 @@ class ServiceTests(unittest.TestCase):
     def observation(self, **changes):
         return dict(dict(id='o1', case_id='c1', origin='local', features=self.features,
                          action='worker', outcome='accepted', observed_at=100.), **changes)
+
+    def worker_decision(self, features=None):
+        """Record an eligible, full-access worker decision bound to task-123."""
+        settings.set_values(self.root / settings.PROJECT_FILE,
+                            delegation_level=75, access='full-access')
+        binding = {'task_id': 'task-123', 'deliverable_id': 'implementation', 'plan_hash': 'a' * 64}
+        card = self.features if features is None else features
+        decision = self.service.predict(card, access='full-access', binding=binding,
+                                        verification_ready=True)
+        self.assertEqual(decision['action'], 'worker')
+        return binding, decision
+
+    def test_partial_feature_card_omitting_kind_matches_worker_decision(self):
+        binding, decision = self.worker_decision()
+        self.assertTrue(self.service.validate_plan_decision(
+            decision['id'], self.features, binding, executor='worker'))
+        partial = {key: value for key, value in self.features.items() if key != 'kind'}
+        self.assertNotIn('kind', partial)
+        self.assertTrue(self.service.validate_plan_decision(
+            decision['id'], partial, binding, executor='worker'))
+
+    def test_validate_plan_decision_rejects_invalid_or_unknown_cards(self):
+        binding, decision = self.worker_decision()
+        partial = {key: value for key, value in self.features.items() if key != 'kind'}
+        self.assertFalse(self.service.validate_plan_decision(
+            decision['id'], {**partial, 'kind': 'bogus'}, binding, executor='worker'))
+        self.assertFalse(self.service.validate_plan_decision(
+            decision['id'], {**partial, 'prompt': 'secret'}, binding, executor='worker'))
+        self.assertFalse(self.service.validate_plan_decision(
+            decision['id'], partial, {**binding, 'plan_hash': 'b' * 64}, executor='worker'))
+        self.assertFalse(self.service.validate_plan_decision(
+            decision['id'], partial, binding, executor='coordinator'))
+        self.assertFalse(self.service.validate_plan_decision(
+            'decision-' + '0' * 32, partial, binding, executor='worker'))
 
     def test_config_persists_and_rejects_unknowns(self):
         self.assertEqual(self.service.config()['mode'], 'auto')

@@ -14,7 +14,7 @@ import subprocess
 import sys
 import time
 
-from . import relay, sandbox
+from . import relay, sandbox, verification
 
 FULL_INSTRUCTIONS = '''You are an independent implementation worker in an assigned development copy.
 Implement the assigned goal and acceptance criteria. You may create, edit and delete
@@ -168,7 +168,8 @@ def layout(backend: sandbox.SandboxBackend, work: Path, home: Path, control: Pat
 
 def probe(args: list[str], env: dict[str, str]) -> None:
     try:
-        result = subprocess.run([*args, '--', '/usr/bin/true'], env=env,
+        result = subprocess.run([*args, '--', str(Path(sys.executable).resolve()),
+                                 '-I', '-c', 'import http.server, json, socket, threading'], env=env,
                                 text=True, capture_output=True, timeout=15, check=False)
     except (OSError, subprocess.SubprocessError):
         raise DevelopmentError('Preparation: development OS sandbox probe could not run.') from None
@@ -198,16 +199,15 @@ def missing_requirements(args: list[str], env: dict[str, str], item: dict) -> li
             if Path(value).is_absolute() or '..' in Path(value).parts:
                 checks.append(('path:' + value, 'false'))
             else:
-                checks.append(('path:' + value, 'test -e -- ' + shlex.quote(value)))
+                checks.append(('path:' + value, 'test -e ' + shlex.quote(value)))
     for command in item.get('checks', []):
         try:
-            parts = shlex.split(command)
-        except ValueError:
-            return ['check-command:invalid']
-        if not parts:
-            return ['check-command:empty']
-        checks.append(('check-command:' + parts[0],
-                       'command -v -- ' + shlex.quote(parts[0]) + ' >/dev/null 2>&1'))
+            executable = verification.first_executable(command)
+        except verification.CheckCommandError as error:
+            return ['check-command:empty' if error.reason in ('empty', 'assignment-only')
+                    else 'check-command:invalid']
+        checks.append(('check-command:' + executable,
+                       'command -v -- ' + shlex.quote(executable) + ' >/dev/null 2>&1'))
     missing = []
     for label, script in checks:
         try:
@@ -244,5 +244,7 @@ def run_checks(args: list[str], env: dict[str, str], commands: list[str],
 
 
 def bridge_command(args: list[str]) -> list[str]:
-    return [*args, '--', sys.executable, '-I', '/run/deepseek-team/bridge.py', '--bridge',
+    # A venv launcher may be a relative symlink to another unmounted launcher.
+    # The bridge uses only stdlib; its resolved interpreter is already mounted.
+    return [*args, '--', str(Path(sys.executable).resolve()), '-I', '/run/deepseek-team/bridge.py', '--bridge',
             '/run/deepseek-team/launch.json', '/run/deepseek-team/provider.sock']

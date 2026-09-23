@@ -8,21 +8,21 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import fcntl
-import fnmatch
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
 import stat
 import subprocess
 import shutil
-import shlex
 import tempfile
 import time
 from typing import Any
 
-from . import settings
+from . import scope_matching, settings
+from . import verification
 from .config import sync_directory
 from .effort import DEFAULT_EFFORT, normalize_effort, normalize_policy_effort
 from .native_delegation import validate_native_exception
@@ -182,10 +182,23 @@ def load_task(root: Path, task_id: str) -> dict:
     return _read(_task_path(root, task_id))
 
 
-def latest_task(root: Path, session_id: str) -> dict | None:
+def _created_at(task: dict) -> float:
+    """Finite numeric creation time; missing or invalid values sort as 0."""
+    value = task.get("created_at")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    return value if isinstance(value, int) or math.isfinite(value) else 0.0
+
+
+def _creation_order(task: dict):
+    """Stable selection key: creation order, then the task id as a tie-break."""
+    return (_created_at(task), str(task.get("id") or ""))
+
+
+def _session_tasks(root: Path, session_id: str) -> list[dict]:
     directory = _project_dir(root) / "tasks"
     if not directory.exists():
-        return None
+        return []
     rows = []
     for path in directory.glob("task-*.json"):
         try:
@@ -194,14 +207,28 @@ def latest_task(root: Path, session_id: str) -> dict | None:
             continue
         if value.get("session_id") == session_id:
             rows.append(value)
-    return max(rows, key=lambda x: x.get("updated_at", 0), default=None)
+    return rows
+
+
+def unfinished_tasks(root: Path, session_id: str) -> list[dict]:
+    """Every non completed/closed task for a session, newest creation first.
+
+    Selection is independent of updated_at so a later cost/evidence update on an
+    older task cannot hide newer or older unfinished work.
+    """
+    rows = [task for task in _session_tasks(root, session_id)
+            if task.get("status") not in ("completed", "closed")]
+    rows.sort(key=_creation_order, reverse=True)
+    return rows
+
+
+def latest_task(root: Path, session_id: str) -> dict | None:
+    return max(_session_tasks(root, session_id), key=_creation_order, default=None)
 
 
 def active_task(root: Path, session_id: str) -> dict | None:
-    task = latest_task(root, session_id)
-    if task is not None and task.get('status') not in ('completed', 'closed'):
-        return task
-    return None
+    rows = unfinished_tasks(root, session_id)
+    return rows[0] if rows else None
 
 
 def _unstarted_task(task):
@@ -250,17 +277,16 @@ def _mutation_touches_scope(root, paths, scopes):
     if not paths or not scopes:
         return True
     root = _project_root(root)
-
-    def relative(value):
-        # Match the hook's canonical paths, including symlinked scope prefixes.
-        # resolve() preserves glob characters; fnmatch below still interprets them.
-        return os.path.relpath((root / value).resolve(), root.resolve())
-
-    for path in map(relative, paths):
-        for scope in map(relative, scopes):
-            if (path == '.' or scope == '.' or fnmatch.fnmatchcase(path, scope)
-                    or path.startswith(scope.rstrip('/') + '/')
-                    or scope.startswith(path.rstrip('/') + '/')):
+    # Reuse the hook's canonicalization and intersection so acceptance can never
+    # be invalidated by a different algorithm than the one that authorized it.
+    for path in paths:
+        canonical_path = scope_matching.canonical(root, path)
+        if canonical_path is None:
+            continue
+        for scope in scopes:
+            canonical_scope = scope_matching.canonical(root, scope)
+            if (canonical_scope is not None
+                    and scope_matching.mutation_overlaps(root, canonical_path, canonical_scope)):
                 return True
     return False
 
@@ -939,19 +965,22 @@ def _foreign_dispatch_binding(root: Path, task_id: str, tool_use_id: str) -> dic
 
 
 def _conflicting_worker(root: Path, task: dict, item: dict) -> dict | None:
-    for row in task.get('assignments', []):
-        if row.get('status') in ('succeeded', 'failed', 'cancelled'):
-            continue
-        if row.get('deliverable_id') == item['id']:
-            return row
-        other = _deliverable(task, row.get('deliverable_id'))
-        if other is None:
-            continue
-        if (item.get('kind') in WORKER_WRITE_KINDS
-                and other.get('kind') in WORKER_WRITE_KINDS
-                and _mutation_touches_scope(root, item.get('scope', []),
-                                            other.get('scope', []))):
-            return row
+    owners = [task, *(row for row in unfinished_tasks(root, task['session_id'])
+                      if row['id'] != task['id'])]
+    for owner in owners:
+        for row in owner.get('assignments', []):
+            if row.get('status') in ('succeeded', 'failed', 'cancelled'):
+                continue
+            if owner['id'] == task['id'] and row.get('deliverable_id') == item['id']:
+                return row
+            other = _deliverable(owner, row.get('deliverable_id'))
+            if other is None:
+                continue
+            if (item.get('kind') in WORKER_WRITE_KINDS
+                    and other.get('kind') in WORKER_WRITE_KINDS
+                    and _mutation_touches_scope(root, item.get('scope', []),
+                                                other.get('scope', []))):
+                return row
     return None
 
 
@@ -1091,13 +1120,14 @@ def ensure_assignment_ready(root: Path, task_id: str, assignment_id: str, copy) 
                 missing.append('path:' + value)
     for command in item.get('checks', []):
         try:
-            parts = shlex.split(command)
-        except ValueError:
-            raise CoordinationError('Invalid declared verification command.', 64) from None
-        if not parts:
-            raise CoordinationError('Empty declared verification command.', 64)
-        if not _command_available(copy, parts[0]):
-            missing.append('check-command:' + parts[0])
+            executable = verification.first_executable(command)
+        except verification.CheckCommandError as error:
+            raise CoordinationError(
+                'Empty declared verification command.'
+                if error.reason in ('empty', 'assignment-only')
+                else 'Invalid declared verification command.', 64) from None
+        if not _command_available(copy, executable):
+            missing.append('check-command:' + executable)
     if missing:
         evidence = 'missing declared dependencies/check runtime: ' + ', '.join(sorted(set(missing)))
         record_constraint(root, task_id, item['id'], 'dependency_unavailable', evidence)

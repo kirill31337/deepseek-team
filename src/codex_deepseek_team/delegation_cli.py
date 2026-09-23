@@ -25,6 +25,39 @@ def _record(copy):
     return dict(copy.metadata, id=copy.id, path=str(copy.path))
 
 
+def _set_project(root, target, **options):
+    """Publish project settings and the owned instruction blocks as one transaction.
+
+    The settings lock is held across candidate-policy computation, preparation and
+    validation of every existing managed block, the instruction writes and the final
+    settings publication. Instructions are updated first and settings published last
+    as the commit point; any earlier failure restores the managed files this call
+    already wrote and leaves the saved policy untouched.
+    """
+    changes = settings.collect_changes(**options)
+    with settings.settings_lock(target):
+        previous = settings.read_bytes(target)
+        values = settings.read_values(target)
+        candidate = settings.merged_values(values, changes)
+        changed = candidate != values
+        policy = settings.candidate_policy(root, target, candidate)
+        prepared = project.prepare_refresh(root, policy)
+        written = project.apply_refresh(prepared)
+        if not changed:
+            return False
+        try:
+            settings.publish_values(target, previous, candidate)
+        except settings.SettingsPublishedError:
+            # The new policy is visible; keep instructions consistent with it.
+            raise
+        except BaseException as error:
+            blocked = project.rollback_refresh(written)
+            if not blocked:
+                raise
+            raise project.ProjectError(f'{error}; could not roll back: ' + ', '.join(blocked)) from error
+        return True
+
+
 def main(argv):
     parser = argparse.ArgumentParser(prog='deepseek-team ' + argv[0])
     subs = parser.add_subparsers(dest='command', required=True)
@@ -33,11 +66,11 @@ def main(argv):
         scope = setter.add_mutually_exclusive_group(required=True)
         scope.add_argument('--project', action='store_true')
         scope.add_argument('--global', dest='global_scope', action='store_true')
-        setter.add_argument('--path', type=Path, default=Path.cwd())
+        setter.add_argument('--path', type=Path)
         policy_options(setter)
         show = subs.add_parser('show', help='Resolve effective policy and report each source.')
         show.add_argument('--effective', action='store_true')
-        show.add_argument('--path', type=Path, default=Path.cwd())
+        show.add_argument('--path', type=Path)
         show.add_argument('--json', action='store_true')
         show.add_argument('--instructions', action='store_true')
         show.add_argument('--runtime', choices=('codex', 'claude'), default='codex')
@@ -66,19 +99,25 @@ def main(argv):
     args = parser.parse_args(inputs)
     try:
         if argv[0] == 'config':
-            root = settings.project_root(args.path, required=getattr(args, 'project', False))
+            explicit_path = args.path is not None
+            location = Path.cwd() if args.path is None else args.path
+            root = settings.project_root(location, required=getattr(args, 'project', False))
+            if args.command == 'show' and explicit_path and root is None:
+                # An explicit path names the project to inspect; never fall back to CWD.
+                raise settings.SettingsError(
+                    '--path must name an existing Git working copy; omit --path to use the current directory.')
             if args.command == 'set':
                 target = root / settings.PROJECT_FILE if args.project else settings.global_file()
-                changed = settings.set_values(target, delegation_level=args.delegation_level,
-                                              access=args.access, effort=args.effort, max_workers=args.max_workers)
                 if args.project:
                     # Refresh only blocks this package already owns. Never add
                     # unsolicited instruction files and never alter user suffixes.
-                    for runtime, filename in project.TARGETS.items():
-                        file = root / filename
-                        content, _ = project._read_agents(file)
-                        if content and project.START_MARKER in content:
-                            project.attach(root, coordinator=runtime)
+                    changed = _set_project(root, target, delegation_level=args.delegation_level,
+                                           access=args.access, effort=args.effort,
+                                           max_workers=args.max_workers)
+                else:
+                    changed = settings.set_values(target, delegation_level=args.delegation_level,
+                                                  access=args.access, effort=args.effort,
+                                                  max_workers=args.max_workers)
                 print('Settings file: ' + str(target))
                 print('Configuration updated.' if changed else 'Configuration already matches.')
                 print('Applies to new jobs only; running processes are unchanged.')
