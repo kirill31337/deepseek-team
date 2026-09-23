@@ -113,7 +113,8 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
             "Record worker acceptance/rework via coordination use and verified coordinator/native-agent "
             "outcomes via coordination result before completion. An unplanned turn with no work closes "
             "without a distribution plan; an existing unfinished task remains open. "
-            "Supply measured total --cost-usd only when known; never invent subscription costs."
+            "Supply measured total --cost-usd only when known; never invent subscription costs.\n"
+            + settings.final_reporting_guidance()
         )
         return _context(text, event)
     task = coordination.latest_task(root, session)
@@ -133,7 +134,11 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
         if payload.get("source") == "compact":
             base += " This state is restored from the persistent ledger after compaction."
         if runtime == 'claude':
+            # Claude SessionStart already appends settings.instructions, which now
+            # includes the shared reporting contract; do not duplicate the full text.
             base += '\n' + settings.instructions(policy, runtime)
+        else:
+            base += '\n' + settings.final_reporting_guidance()
         return _context(base, event)
     if task is None:
         return {}

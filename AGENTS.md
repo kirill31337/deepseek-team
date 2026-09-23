@@ -54,6 +54,29 @@ deepseek-team config set --project --access full-access
 
 The coordinator decomposes meaningful independent slices, reviews actual diffs and declared checks, and reports accepted work and rework without repeating the worker's investigation or inventing percentage savings. Architecture, security, integration, final verification, commits and production remain coordinator-owned. Saved manual profiles, explicit permissions and `off` retain priority.
 
+### Final reporting
+
+Enabled final summaries of performed work add short bullets, in the user's language, that
+separate work the coordinator completed personally from work actually delegated to DeepSeek,
+and name accepted results plus any rework, rejection or failure. Cover the reported task,
+including work and assignments from earlier turns. Planned, running, failed and
+rejected work is never described as completed, and when nothing was delegated the summary
+says so explicitly. After the bullets the coordinator states a coarse approximate
+coordinator/DeepSeek split of ACCEPTED WORK as two whole-number percentages totaling 100 percent, in the
+user's language and labelled exactly "subjective estimate, not measured" (translated). It is
+judged qualitatively from accepted scope and complexity and from coordinator review and rework;
+it is never derived from counts of calls, tasks, deliverables, files, lines, tokens, time or
+bullets, never copied from a configured Auto/25/50/75 profile, and never presented as measured
+productivity or money/time/token savings. If even a rough estimate lacks supporting evidence the
+summary reports the estimate as unavailable instead of inventing numbers; with no accepted
+worker contribution it uses 100/0 for accepted work while still disclosing failed or rejected
+attempts. Coordinator-native subagent work is credited separately, never as the coordinator's
+own personal work and never as DeepSeek work, and if it is included on the coordinator side it
+is labelled as such. This is a reporting instruction only: it calculates no ratio, records no
+telemetry, adds no flag and changes no ledger schema, and counting-derived percentage metrics
+remain banned. Disabled delegation, status-only turns and turns without performed work need no
+performed-work report.
+
 Every worker requires the Linux OS sandbox. Do not weaken Ubuntu AppArmor
 user-namespace restrictions to make delegation pass.
 
@@ -223,5 +246,7 @@ Full-access is development inside an owned isolated copy, not host access. Allow
 Codex process integration: after project init and enabling hooks in the runtime, SessionStart/UserPromptSubmit provide the current coordination task id. For every substantial task, before coordinator source edits, submit a concrete JSON distribution with deepseek-team coordination plan --task TASK_ID; include deliverable id/kind/scope, executor, acceptance criteria, dependencies and checks. Run each worker assignment with deepseek-team worker --runtime codex --effort medium --coord-task TASK_ID --coord-assignment ASSIGNMENT_ID. Because effort policy is auto, replace medium with low or high when the assigned task warrants it. The runner records start/result/workspace/checks automatically. After reviewing a result, record its use with deepseek-team coordination use. Record verified coordinator and native-agent outcomes with deepseek-team coordination result; accepted or explicitly cancelled outcomes are required for completion. Later recognized scope mutations require fresh acceptance. New substantial scope requires a revised plan. Codex PreToolUse blocks recognized source edits while the distribution is missing/noncompliant, blocks unplanned scope, and blocks duplicate work owned by a pending worker assignment. Hook coverage depends on the tools and native runtime settings; it does not replace the worker OS sandbox. An unplanned turn without recorded work closes without a distribution plan; status prompts retain existing unfinished tasks. Stop requests continuation for unfinished assignments/results, including coordinator and native-agent outcomes. On repeated Stop it warns and keeps the ledger unfinished without vetoing another hook continuation. Native hook trust is controlled by Codex and is not inferred by this package.
 Execution capacity is 8; configure max_workers independently of access. Plan all eligible deliverables; launch independent jobs concurrently and let excess jobs wait in FIFO order. Capacity is not a reason to retain their implementation with the coordinator. Report accepted work, verification results and any rework; only report money savings when measured.
 While a worker runs, work only on independent scope. Review the actual diff and recorded checks without repeating the whole investigation or rewriting correct code. DeepSeek workers never stage, commit, push, publish, deploy, access production services or delegate.
+### Final reporting of performed work
+For final summaries of performed work while delegation is enabled, end with short bullets in the user's language that separate work the coordinator completed personally from work actually delegated to DeepSeek, and name accepted worker results plus any rework, rejection or failure. Cover the reported task, including work and assignments from earlier turns. Never describe planned, running, failed or rejected work as completed. If nothing was delegated for the reported task, say so explicitly. After the bullets, give a coarse approximate coordinator/DeepSeek split of ACCEPTED WORK as two whole-number percentages totaling 100 percent, in the user's language, and label it exactly "subjective estimate, not measured" (translated into that language). Judge that split qualitatively from accepted scope and complexity and from coordinator review and rework. Never derive it from counts of calls, tasks, deliverables, files, lines, tokens, time or bullets; never reuse a configured Auto/25/50/75 profile; and never claim measured productivity or money, time or token savings. If even a rough estimate lacks supporting evidence, report the estimate as unavailable instead of inventing numbers. With no accepted worker contribution, use 100/0 for accepted work while still disclosing any failed or rejected attempts. Credit coordinator-native subagent work separately, never as the coordinator's own personal work and never as DeepSeek work; if it is included on the coordinator side of the split, say so explicitly. This is a reporting instruction only: it calculates no ratio, records no telemetry, adds no flag and changes no ledger schema, and the existing ban on percentages calculated from counts still stands. Disabled delegation, status-only turns and turns without performed work need no performed-work report.
 
 <!-- codex-deepseek-team:managed-block:end -->

@@ -38,6 +38,29 @@ deepseek-team config set --project --access full-access
 
 The coordinator decomposes meaningful independent slices, reviews actual diffs and declared checks, and reports accepted work and rework without repeating the worker's investigation or inventing percentage savings. Architecture, security, integration, final verification, commits and production remain coordinator-owned. Saved manual profiles, explicit permissions and `off` retain priority.
 
+### Final reporting
+
+Enabled final summaries of performed work add short bullets, in the user's language, that
+separate work the coordinator completed personally from work actually delegated to DeepSeek,
+and name accepted results plus any rework, rejection or failure. Cover the reported task,
+including work and assignments from earlier turns. Planned, running, failed and
+rejected work is never described as completed, and when nothing was delegated the summary
+says so explicitly. After the bullets the coordinator states a coarse approximate
+coordinator/DeepSeek split of ACCEPTED WORK as two whole-number percentages totaling 100 percent, in the
+user's language and labelled exactly "subjective estimate, not measured" (translated). It is
+judged qualitatively from accepted scope and complexity and from coordinator review and rework;
+it is never derived from counts of calls, tasks, deliverables, files, lines, tokens, time or
+bullets, never copied from a configured Auto/25/50/75 profile, and never presented as measured
+productivity or money/time/token savings. If even a rough estimate lacks supporting evidence the
+summary reports the estimate as unavailable instead of inventing numbers; with no accepted
+worker contribution it uses 100/0 for accepted work while still disclosing failed or rejected
+attempts. Coordinator-native subagent work is credited separately, never as the coordinator's
+own personal work and never as DeepSeek work, and if it is included on the coordinator side it
+is labelled as such. This is a reporting instruction only: it calculates no ratio, records no
+telemetry, adds no flag and changes no ledger schema, and counting-derived percentage metrics
+remain banned. Disabled delegation, status-only turns and turns without performed work need no
+performed-work report.
+
 Every worker requires the Linux OS sandbox. Do not weaken Ubuntu AppArmor
 user-namespace restrictions to make delegation pass.
 

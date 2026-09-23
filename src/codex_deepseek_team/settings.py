@@ -253,6 +253,36 @@ def describe(policy: Policy) -> str:
     ))
 
 
+FINAL_REPORTING_GUIDANCE = (
+    '### Final reporting of performed work\n'
+    'For final summaries of performed work while delegation is enabled, end with short bullets '
+    'in the user\'s language that separate work the coordinator completed personally from work '
+    'actually delegated to DeepSeek, and name accepted worker results plus any rework, rejection '
+    'or failure. Cover the reported task, including work and assignments from earlier turns. '
+    'Never describe planned, running, failed or rejected work as completed. If nothing '
+    'was delegated for the reported task, say so explicitly. After the bullets, give a coarse approximate '
+    'coordinator/DeepSeek split of ACCEPTED WORK as two whole-number percentages totaling 100 percent, in the '
+    'user\'s language, and label it exactly "subjective estimate, not measured" (translated into '
+    'that language). Judge that split qualitatively from accepted scope and complexity and from '
+    'coordinator review and rework. Never derive it from counts of calls, tasks, deliverables, '
+    'files, lines, tokens, time or bullets; never reuse a configured Auto/25/50/75 profile; and '
+    'never claim measured productivity or money, time or token savings. If even a rough estimate '
+    'lacks supporting evidence, report the estimate as unavailable instead of inventing numbers. '
+    'With no accepted worker contribution, use 100/0 for accepted work while still disclosing any '
+    'failed or rejected attempts. Credit coordinator-native subagent work separately, never as the '
+    'coordinator\'s own personal work and never as DeepSeek work; if it is included on the '
+    'coordinator side of the split, say so explicitly. This is a reporting instruction only: it '
+    'calculates no ratio, records no telemetry, adds no flag and changes no ledger schema, and the '
+    'existing ban on percentages calculated from counts still stands. Disabled delegation, '
+    'status-only turns and turns without performed work need no performed-work report.\n'
+)
+
+
+def final_reporting_guidance() -> str:
+    """Shared coordinator final-summary contract for both runtimes."""
+    return FINAL_REPORTING_GUIDANCE
+
+
 def instructions(policy: Policy, runtime: str = 'codex') -> str:
     if runtime not in ('codex', 'claude'):
         raise SettingsError('Instruction runtime must be codex or claude.')
@@ -416,4 +446,5 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
         + 'While a worker runs, work only on independent scope. Review the actual diff and recorded '
           'checks without repeating the whole investigation or rewriting correct code. DeepSeek workers never '
           'stage, commit, push, publish, deploy, access production services or delegate.\n'
+        + final_reporting_guidance()
     )

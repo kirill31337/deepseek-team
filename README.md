@@ -107,6 +107,10 @@ Once setup and attachment are done, you do not run workers by hand. Ask in your 
 
 The coordinator splits that into bounded assignments, runs them through the worker queue and reports the accepted work.
 
+Final-summary guidance ships with the package for both Codex and Claude Code. While DeepSeek Team is enabled, summaries of performed work include short bullets separating the coordinator's personal work from accepted DeepSeek results, including any rework or failed attempts. They cover the reported task across turns; native subagents are credited separately, and no delegation is stated explicitly.
+
+After the list comes an approximate coordinator/DeepSeek split in whole-number percentages totaling 100, labelled **“subjective estimate, not measured.”** It reflects accepted scope, complexity, review and rework, never counts of calls, tasks, files, lines, tokens, time or bullets, and never the configured 25/50/75 target or claimed savings. Without accepted worker work the split is 100/0; if evidence is insufficient, the estimate is unavailable. Status-only and no-work replies need no report, and `off` disables the requirement. Updating the package refreshes hook guidance; refresh existing project instructions with `deepseek-team init --coordinator both /path/to/project` (use `codex` or `claude` for a single coordinator).
+
 ## Current defaults
 
 | Setting | Current default | Notes |
