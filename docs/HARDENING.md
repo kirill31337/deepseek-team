@@ -1,5 +1,7 @@
 # Current coordinator and worker boundaries
 
+**English** | [Русский](https://github.com/kirill31337/deepseek-team/blob/main/docs/HARDENING.ru.md)
+
 DeepSeek Team separates coordinator process enforcement from worker isolation. The coordinator owns architecture, security decisions, final verification, integration, secrets/signing, commits, publishing and production actions. DeepSeek workers use `deepseek-flash`, remain leaf workers, and cannot delegate or publish.
 
 ## Coordinator lifecycle

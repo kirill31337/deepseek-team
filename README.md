@@ -18,7 +18,7 @@ Requires Linux, Python 3.11+ and [pipx](https://pipx.pypa.io/latest/how-to/insta
 
 [Install](#install) · [Quick start](#quick-start) · [How delegation works](#what-gets-delegated) · [Docs](#further-reading) · [PyPI](https://pypi.org/project/deepseek-team/)
 
-![Workflow diagram: a user request, the Codex or Claude coordinator, DeepSeek Flash workers, then review and integration](https://raw.githubusercontent.com/kirill31337/deepseek-team/main/assets/deepseek-team-demo.gif)
+![Workflow diagram: a user request, the Codex or Claude coordinator, DeepSeek Flash workers, then review and integration](https://raw.githubusercontent.com/kirill31337/deepseek-team/main/assets/deepseek-team-demo.gif?v=fc55527882e4)
 
 *Workflow illustration with `full-access` enabled.*
 

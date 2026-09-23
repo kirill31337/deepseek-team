@@ -1,5 +1,7 @@
 # Publishing DeepSeek Team
 
+**English** | [Русский](https://github.com/kirill31337/deepseek-team/blob/main/docs/PUBLISHING.ru.md)
+
 The distribution is **deepseek-team**. It installs the `deepseek-team` command. Version **0.8.1** is the first PyPI release under this name. Only the coordinator publishes releases; workers may prepare changes and checks. Never include API keys, credentials, local configuration or raw model logs in the repository, issues, logs or CI output.
 
 There are two supported publication routes:

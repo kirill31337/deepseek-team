@@ -21,8 +21,10 @@ from PIL import Image, ImageDraw, ImageFont
 
 
 WIDTH, HEIGHT = 1000, 560
-FRAME_MS = 350
-FRAMES_PER_STAGE = 10
+FRAME_MS = 400
+HOLD_FRAMES = 20
+TRANSITION_FRAMES = 3
+FRAMES_PER_STAGE = HOLD_FRAMES + TRANSITION_FRAMES
 STAGE_COUNT = 4
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -231,8 +233,9 @@ def render_frames() -> list[Image.Image]:
     for index, current in enumerate(stages):
         following = stages[(index + 1) % len(stages)]
         for frame_index in range(FRAMES_PER_STAGE):
-            if frame_index >= 7:
-                alpha = ease((frame_index - 6) / 3)
+            if frame_index >= HOLD_FRAMES:
+                transition_frame = frame_index - HOLD_FRAMES + 1
+                alpha = ease(transition_frame / TRANSITION_FRAMES)
                 frame = Image.blend(current, following, alpha)
             else:
                 frame = current.copy()

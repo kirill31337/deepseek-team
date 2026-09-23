@@ -1,5 +1,7 @@
 # Hybrid delegation routing
 
+**English** | [Русский](https://github.com/kirill31337/deepseek-team/blob/main/docs/ROUTING.ru.md)
+
 DeepSeek Team can combine a bounded prior from imported public results with outcomes observed in the current project. Auto immediately admits eligible work while keeping statistical uncertainty visible. It stores routing state privately for each project and records explainable decisions. It does not fine-tune a model, promise a benchmark score, or treat a public leaderboard percentage as the probability of success on your code.
 
 Every command takes `--path PROJECT`. Commands return JSON so results can be inspected or passed to other tools. `status` reports the current state; `config --json` prints the effective routing configuration.
