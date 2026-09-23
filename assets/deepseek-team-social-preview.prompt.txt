@@ -1,0 +1,26 @@
+Built-in imagegen prompt
+========================
+
+Use case: ads-marketing
+Asset type: GitHub repository social preview card, exactly 2:1 landscape composition intended for 1280x640 display
+Primary request: Create a sharp, polished companion social card for the DeepSeek Team open-source developer tool, visually coordinated with the provided banner but newly composed for a 2:1 thumbnail. Make it feel technical, precise, trustworthy, and modern.
+Input images: Image 1 is a style reference only for palette, atmosphere, typography character, and luminous geometric treatment; do not stretch, crop, trace, or reproduce its layout.
+Scene/backdrop: deep near-black navy background with very subtle technical grid or particles, generous clean negative space, restrained glow
+Subject: large product title and subtitle on the left; on the right, a simple abstract network of one coordinator hub connected to three or four small distinct worker nodes, expressed as polished geometric cubes/hexagons and fine luminous connection lines, no mascots required
+Style/medium: premium cinematic 3D technical illustration blended with crisp editorial typography; simplified and uncluttered for excellent thumbnail legibility
+Composition/framing: wide 2:1 frame. Keep all content well inside generous safe margins. Left 58% is typography with clear hierarchy. Right 42% is the network graphic. Title must dominate. Subtitle must be clearly readable at reduced size.
+Lighting/mood: controlled electric cyan rim light with restrained violet/indigo accents, crisp contrast, subtle depth, no excessive bloom
+Color palette: near-black #050A10, dark navy, electric cyan, small restrained violet accents, white/light-gray typography
+Text (verbatim): "DeepSeek Team"
+Text (verbatim): "DeepSeek Flash subagents for Codex and Claude Code"
+Typography: render exactly these two lines of copy only. Large bold modern sans-serif title, with "DeepSeek" in white and "Team" in a cyan-to-violet accent if helpful. Subtitle in clean light gray, medium weight. Preserve exact capitalization and spelling.
+Constraints: exact title and subtitle wording; only two textual elements; simple visual hierarchy; ample safe margins; strong at small preview sizes; no logos; no brand marks; no badges; no extra labels
+Avoid: invented logos, tiny text, terminal windows, code snippets, simulated logs, marketing claims, savings claims, shields, locks, busy dashboards, robot mascots, illegible micro-detail, watermarks, signatures, duplicated words, misspelled text
+
+Generation and normalization
+============================
+
+- Generated with the built-in imagegen tool using assets/deepseek-team-banner-4b37ec05.jpg as a style reference only.
+- Built-in output: 1536x768 PNG.
+- Normalized with Pillow 12.3.0: Lanczos resize to exactly 1280x640, RGB conversion, optimized progressive JPEG encoding at quality 88 with 4:4:4 chroma sampling.
+- Final output: assets/deepseek-team-social-preview.jpg.

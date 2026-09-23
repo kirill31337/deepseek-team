@@ -4,11 +4,29 @@
 
 [English](https://github.com/kirill31337/deepseek-team/blob/main/README.md) | **Русский**
 
-DeepSeek Team — пакет для Linux, который подключает координаторов **Codex и/или Claude Code** к изолированным воркерам DeepSeek. Координатор распределяет работу, проверяет результат и вносит принятые изменения в основной проект. Воркеры DeepSeek выполняют отдельные порученные задачи: исследование, ревью, а в режиме записи — реализацию, локальные тесты и документацию. Дистрибутив называется `deepseek-team`, единственная запускаемая команда — `deepseek-team`.
+[![Версия в PyPI](https://img.shields.io/pypi/v/deepseek-team)](https://pypi.org/project/deepseek-team/) [![Тесты в main](https://img.shields.io/github/actions/workflow/status/kirill31337/deepseek-team/test.yml?branch=main&label=tests)](https://github.com/kirill31337/deepseek-team/actions/workflows/test.yml) [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](#требования) [![Linux](https://img.shields.io/badge/platform-Linux-lightgrey)](#требования) [![Лицензия MIT](https://img.shields.io/badge/license-MIT-green)](https://github.com/kirill31337/deepseek-team/blob/main/LICENSE)
 
-Это руководство для версии **0.8.1**. Воркеры используют модель `deepseek-flash`; глубину рассуждений (`effort`) выбирает координатор. Для работы нужен отдельный ключ DeepSeek API.
+**Субагенты DeepSeek Flash в вашей сессии Codex или Claude Code.**
 
-Права воркеров выбираются отдельно. Свежая установка работает в профиле Auto с доступом **только для чтения**: воркер исследует и проверяет код, но не изменяет файлы. Чтобы разрешить реализацию в отдельной копии проекта, нужно явно выбрать `full-access` (см. ниже). Установка сама по себе права записи не даёт.
+Координатор распределяет задачи между изолированными воркерами, проверяет результат и вносит принятые изменения в проект.
+
+```bash
+pipx install deepseek-team
+```
+
+Нужны Linux, Python 3.11+ и [pipx](https://pipx.pypa.io/latest/how-to/install-pipx.html). Затем [настройте API-ключ, хуки и подключите проект](#подготовка-и-подключение-проекта).
+
+[Установка](#установка-и-первый-запуск) · [Быстрый старт](#подготовка-и-подключение-проекта) · [Как работает делегирование](#делегирование-и-текущие-настройки) · [Документация](#дополнительная-документация) · [PyPI](https://pypi.org/project/deepseek-team/)
+
+![Схема процесса: запрос пользователя, координатор Codex или Claude, воркеры DeepSeek Flash, затем проверка и интеграция результата](https://raw.githubusercontent.com/kirill31337/deepseek-team/main/assets/deepseek-team-demo.gif)
+
+*Схема работы с включённым `full-access`.*
+
+Это руководство для версии **0.8.1** пакета `deepseek-team`.
+
+Воркеры используют модель `deepseek-flash` и отдельный **ключ DeepSeek API**. По умолчанию координатор выбирает глубину рассуждений (`low`, `medium` или `high`) для каждого задания. При желании можно сохранить фиксированный уровень.
+
+После установки воркерам доступно **только чтение**: они изучают проект и сообщают о результатах. Чтобы разрешить изменения в изолированных копиях проекта, нужно явно включить `full-access`.
 
 ## Требования
 

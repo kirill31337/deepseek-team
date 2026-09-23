@@ -4,11 +4,29 @@
 
 **English** | [Русский](https://github.com/kirill31337/deepseek-team/blob/main/README.ru.md)
 
-DeepSeek Team lets **Codex and Claude Code** delegate implementation, tests, documentation and research to isolated **DeepSeek workers**. The coordinator plans the work, reviews the results and integrates accepted changes. Workers handle independent tasks; full-access jobs use their own development copies.
+[![PyPI version](https://img.shields.io/pypi/v/deepseek-team)](https://pypi.org/project/deepseek-team/) [![Tests on main](https://img.shields.io/github/actions/workflow/status/kirill31337/deepseek-team/test.yml?branch=main&label=tests)](https://github.com/kirill31337/deepseek-team/actions/workflows/test.yml) [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](#prerequisites) [![Linux](https://img.shields.io/badge/platform-Linux-lightgrey)](#prerequisites) [![MIT license](https://img.shields.io/badge/license-MIT-green)](https://github.com/kirill31337/deepseek-team/blob/main/LICENSE)
 
-Workers always run the `deepseek-flash` model. Effort policy is `auto`, so the coordinator chooses `low`, `medium` or `high` for each assignment unless you save a fixed level. Live delegation needs its own **DeepSeek API key**; DeepSeek Team does not reuse the credentials your coordinator already has.
+**DeepSeek Flash subagents inside your Codex or Claude Code session.**
+
+Your coordinator plans the work, delegates bounded tasks to isolated workers, then reviews and integrates the results.
+
+```bash
+pipx install deepseek-team
+```
+
+Requires Linux, Python 3.11+ and [pipx](https://pipx.pypa.io/latest/how-to/install-pipx.html). Then [set up your API key, hooks and project](#quick-start).
+
+[Install](#install) · [Quick start](#quick-start) · [How delegation works](#what-gets-delegated) · [Docs](#further-reading) · [PyPI](https://pypi.org/project/deepseek-team/)
+
+![Workflow diagram: a user request, the Codex or Claude coordinator, DeepSeek Flash workers, then review and integration](https://raw.githubusercontent.com/kirill31337/deepseek-team/main/assets/deepseek-team-demo.gif)
+
+*Workflow illustration with `full-access` enabled.*
 
 This README describes version **0.8.1** of the `deepseek-team` package, which installs the single `deepseek-team` executable.
+
+Workers use the `deepseek-flash` model and a separate **DeepSeek API key**. By default, the coordinator chooses the reasoning effort (`low`, `medium` or `high`) for each assignment; you can also save a fixed level.
+
+Fresh installations use **read-only** access: workers inspect the project and report their findings. To let them make changes in isolated development copies, explicitly enable `full-access`.
 
 ## Prerequisites
 
