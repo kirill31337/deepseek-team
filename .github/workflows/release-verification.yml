@@ -19,14 +19,29 @@ jobs:
           node-version: '22'
       - name: Install current Codex
         run: npm install -g @openai/codex@0.155.1
+      - name: Resolve candidate version
+        id: package
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import tomllib
+          version = tomllib.loads(Path('pyproject.toml').read_text())['project']['version']
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write('version=' + version + '\n')
+          PY
       - name: Build release candidate
+        env:
+          PACKAGE_VERSION: ${{ steps.package.outputs.version }}
         run: |
           python -m pip install build
           python -m build
           python -m venv "$RUNNER_TEMP/clean"
-          "$RUNNER_TEMP/clean/bin/pip" install dist/codex_deepseek_team-0.7.1-py3-none-any.whl
-          test "$("$RUNNER_TEMP/clean/bin/deepseek-team" --version)" = "deepseek-team 0.7.1"
-      - name: Verify 0.5 to 0.7 standard installer upgrade
+          "$RUNNER_TEMP/clean/bin/pip" install "dist/codex_deepseek_team-$PACKAGE_VERSION-py3-none-any.whl"
+          test "$("$RUNNER_TEMP/clean/bin/deepseek-team" --version)" = "deepseek-team $PACKAGE_VERSION"
+      - name: Verify standard installer upgrade from 0.5
+        env:
+          PACKAGE_VERSION: ${{ steps.package.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
@@ -51,7 +66,7 @@ jobs:
           BEFORE_SETTINGS="$(cat "$PROJECT/.deepseek-team.toml")"
           BEFORE_KEY="$(sha256sum "$HOME/.config/codex-deepseek/api-key" | awk '{print $1}')"
           python install.py --prefix "$PREFIX" --bin-dir "$BIN"
-          test "$("$BIN/deepseek-team" --version)" = "deepseek-team 0.7.1"
+          test "$("$BIN/deepseek-team" --version)" = "deepseek-team $PACKAGE_VERSION"
           "$BIN/deepseek-team" hooks status
           "$BIN/deepseek-team" auth status
           "$BIN/deepseek-team" config show --effective --path "$PROJECT" --json | grep -q '"effort": "auto"'
@@ -67,5 +82,5 @@ jobs:
       - name: Upload release candidate artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: deepseek-team-0.7.1-dist
+          name: deepseek-team-${{ steps.package.outputs.version }}-dist
           path: dist/*

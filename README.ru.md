@@ -1,8 +1,8 @@
-![DeepSeek Team banner](assets/deepseek-team-banner-4b37ec05.jpg)
+![DeepSeek Team banner](https://raw.githubusercontent.com/kirill31337/deepseek-team/main/assets/deepseek-team-banner-4b37ec05.jpg)
 
 # DeepSeek Team
 
-[English](README.md) | **Русский**
+[English](https://github.com/kirill31337/deepseek-team/blob/main/README.md) | **Русский**
 
 DeepSeek Team позволяет **запускать субагентов DeepSeek Flash из сессий Codex и Claude Code в Linux**. Эти субагенты называются воркерами. Codex или Claude Code выступает координатором: распределяет работу и проверяет результат. В **автоматическом режиме** пакет решает, кому поручить очередную задачу, с учётом результатов предыдущих заданий. Можно также вручную выбрать **профиль 25%, 50% или 75%**. Права воркеров на чтение и запись задаются отдельно (`read-only` или `full-access`). Воркеры с правом записи работают в изолированных копиях проекта; одну копию можно использовать для нескольких заданий подряд.
 
@@ -14,11 +14,55 @@ Codex и Claude Code могут подключать и собственных �
 
 Проценты задают **ориентир для распределения работы**. Это не квоты на токены, время или строки кода: пакет не гарантирует, что воркеры выполнят ровно указанную долю задачи. В небольших задачах или там, где работу трудно разделить, делегировать получится меньше. После установки по умолчанию включён **автоматический режим с доступом только для чтения**: access=auto → read-only. При выборе исполнителя учитываются результаты предыдущих задач и внешние данные, которые вы импортировали. Если у вас уже сохранён ручной профиль 25/50/75%, он имеет приоритет. Результаты продолжают накапливаться и при ручном выборе профиля.
 
-Автоматический выбор исполнителя появился в версии **0.7.0**. Качество рекомендаций можно проверить по истории задач: при оценке каждой задачи учитываются только результаты, которые были известны до её выполнения. Для экспериментов, запускаемых отдельно от обычной работы, предусмотрен учёт бюджета. При повторении одного и того же запроса средства не резервируются дважды. Подробнее — в [руководстве](docs/ROUTING.ru.md).
+Версия **0.8.0** готовит новый путь установки и сохраняет автоматический выбор исполнителя. Качество рекомендаций можно проверить по истории задач: при оценке каждой задачи учитываются только результаты, которые были известны до её выполнения. Для экспериментов, запускаемых отдельно от обычной работы, предусмотрен учёт бюджета. При повторении одного и того же запроса средства не резервируются дважды. Подробнее — в [руководстве](https://github.com/kirill31337/deepseek-team/blob/main/docs/ROUTING.ru.md).
 
 Хуки Codex и Claude Code следят за соблюдением правил делегирования. Оба координатора используют общий журнал заданий и один переключатель `on/off` для проекта. Его состояние сохраняется между сессиями.
 
 Для работы нужны **Linux, Python 3.11+, Git, Bubblewrap и Codex CLI или Claude Code CLI**. Можно использовать оба CLI. Для Ubuntu пакет предлагает отдельную настройку AppArmor, которая позволяет запускать воркеров в изолированном окружении без отключения системных ограничений на пользовательские пространства имён. Для обращений к модели нужен API-ключ DeepSeek. Дополнительные Python-библиотеки не требуются; Bubblewrap и AppArmor устанавливаются как системные компоненты.
+
+## Быстрый старт
+
+Установите CLI один раз для своего пользователя. Публикация в PyPI ещё не завершена, поэтому используйте проверенную установку из Git:
+
+~~~bash
+# Ubuntu 23.04+: установите pipx один раз.
+sudo apt-get install pipx
+pipx ensurepath
+
+# Откройте новый терминал и установите DeepSeek Team.
+pipx install 'git+https://github.com/kirill31337/deepseek-team.git'
+# Или после клонирования репозитория: pipx install .
+~~~
+
+`pipx ensurepath` меняет настройку оболочки, поэтому перед `pipx install` откройте новый терминал. Для других дистрибутивов обратитесь к [инструкции pipx](https://pipx.pypa.io/latest/how-to/install-pipx.html). После первой публикации в PyPI эквивалентной командой будет `pipx install codex-deepseek-team`. С [uv](https://docs.astral.sh/uv/getting-started/installation/) используйте сейчас `uv tool install 'git+https://github.com/kirill31337/deepseek-team.git'`, а после публикации — `uv tool install codex-deepseek-team`.
+
+Установка в виртуальное окружение вместо pipx:
+
+~~~bash
+python3 -m venv ~/venvs/deepseek-team
+. ~/venvs/deepseek-team/bin/activate
+python -m pip install 'git+https://github.com/kirill31337/deepseek-team.git'
+~~~
+
+Используйте `pip` только внутри виртуального окружения; не применяйте `sudo pip` или `--break-system-packages`.
+
+Настройте пользовательскую интеграцию и затем подключайте каждый проект по явному пути:
+
+~~~bash
+# Ubuntu: явно разрешает установку и проверку Bubblewrap/AppArmor.
+deepseek-team setup --with-sandbox
+
+# Подключите проект. Замените пример путём к нужному проекту.
+deepseek-team init --coordinator codex /path/to/project
+cd /path/to/project
+deepseek-team doctor --runtime auto --offline
+~~~
+
+В другой системе или если требования к изоляции уже установлены, замените `setup --with-sandbox` на `setup`. `setup` по умолчанию использует `--runtime auto` и находит Codex и Claude Code в `PATH`; для явного выбора укажите `--runtime codex`, `claude` или `both`. Только `setup --with-sandbox` разрешает в Ubuntu установить пакеты и профиль Bubblewrap/AppArmor и проверить изоляцию. Обычный `setup` никогда не вызывает `sudo`: он сообщит о недостающих требованиях и нужном действии. `setup --no-key` не читает ключ и не запрашивает его. Команда выводит инструкции по готовности и нативному доверию к хукам, но не подключает проекты. В Codex проверьте хук пакета через `/hooks`; для Claude откройте новую сессию и проверьте `/hooks`.
+
+Для Claude Code укажите `--coordinator claude`, а для обоих координаторов — `--coordinator both`. `setup --configure-only` сохраняет прежний режим настройки для автоматизации: он меняет конфигурацию, но не проверяет готовность. Храните ключ DeepSeek приватно и задайте его отдельно командой `deepseek-team auth set`, когда потребуется работа с моделью.
+
+Шаги владельца релиза описаны в [PUBLISHING.md](https://github.com/kirill31337/deepseek-team/blob/main/docs/PUBLISHING.md).
 
 ## Как работают классификатор, оценщик и роутер
 
@@ -38,9 +82,9 @@ Codex и Claude Code могут подключать и собственных �
 
 Одновременно в проекте может быть **не более трёх пробных заданий**, включая те, которые ещё ожидают запуска. В этот лимит входят задания для накопления первых результатов, измерения затрат и восстановления после ошибок. Среди них может быть **не более одного задания для восстановления**. Сбои провайдера, проблемы с окружением и отмена задания не считаются ошибками DeepSeek. Влияние старых ошибок уменьшается со временем так же, как влияние успешных результатов. Даже если повторная попытка удалась, первоначальная ошибка продолжает учитываться. Этапы меняются автоматически и не влияют на права доступа. По умолчанию воркерам разрешено только чтение; право записи нужно предоставить отдельно.
 
-Схема, подробности расчёта и команды — в [руководстве по маршрутизации](docs/ROUTING.ru.md).
+Схема, подробности расчёта и команды — в [руководстве по маршрутизации](https://github.com/kirill31337/deepseek-team/blob/main/docs/ROUTING.ru.md).
 
-## Установка в Ubuntu — рекомендуемый вариант
+## Установщик из исходного кода и ручная настройка изоляции
 
 Установите CLI нужного координатора — Codex, Claude Code или оба — и выполните:
 
@@ -54,37 +98,30 @@ deepseek-team sandbox status
 
 Параметр `--with-sandbox` **разрешает установщику настроить системную изоляцию с правами администратора**. В Ubuntu он устанавливает пакеты `bubblewrap` и `apparmor`, устанавливает или перезагружает профиль `deepseek-team-bwrap`, а затем проверяет работу изоляции. AppArmor остаётся включённым, значение `kernel.apparmor_restrict_unprivileged_userns` не меняется.
 
-Далее настройте нужного координатора:
+Установщик из исходного кода остаётся необязательным запасным вариантом. Он создаёт виртуальное окружение в `~/.local/share/codex-deepseek-team/venv` и публикует команды `deepseek-team` и прежнюю `codex-deepseek-team`. После него используйте команды быстрого старта выше и всегда указывайте путь проекта в `init`.
+
+Для справки доступны явные команды настройки координаторов:
 
 ~~~bash
 # Только Codex
 deepseek-team setup --runtime codex
 deepseek-team hooks status
 deepseek-team doctor --runtime codex --offline
-deepseek-team init --coordinator codex
+deepseek-team init --coordinator codex /path/to/project
 # В Codex откройте /hooks, проверьте хук DeepSeek Team и подтвердите доверие к нему.
 
 # Только Claude Code
 deepseek-team setup --runtime claude
 deepseek-team hooks status --runtime claude
 deepseek-team doctor --runtime claude --offline
-deepseek-team init --coordinator claude
+deepseek-team init --coordinator claude /path/to/project
 # Откройте новую сессию Claude и проверьте хуки через /hooks.
 
 # Оба координатора
 deepseek-team setup --runtime both
 deepseek-team doctor --runtime both --offline
-deepseek-team init --coordinator both
+deepseek-team init --coordinator both /path/to/project
 ~~~
-
-Установщик создаёт виртуальное окружение Python в `~/.local/share/codex-deepseek-team/venv`. Запускать пакет можно любой из двух команд:
-
-~~~text
-deepseek-team
-codex-deepseek-team   # прежнее имя команды, сохранённое для совместимости
-~~~
-
-Имя Python-пакета и имена его модулей остались прежними, чтобы существующие установки и скрипты продолжали работать.
 
 ### Обработчики событий Codex (хуки)
 
@@ -110,7 +147,7 @@ deepseek-team init --coordinator codex /path/to/project
 
 ### Обработчики событий Claude Code
 
-Стандартный установщик также проверяет наличие Claude Code в `PATH` и добавляет хуки DeepSeek Team в `~/.claude/settings.json`. Если задана переменная `CLAUDE_CONFIG_DIR`, используется файл `settings.json` из этого каталога. Команда `setup --runtime claude` устанавливает те же хуки. Выбранная модель, разрешения, данные входа и чужие обработчики сохраняются. Хуки начинают действовать в проекте после `deepseek-team init --coordinator claude`.
+Стандартный установщик также проверяет наличие Claude Code в `PATH` и добавляет хуки DeepSeek Team в `~/.claude/settings.json`. Если задана переменная `CLAUDE_CONFIG_DIR`, используется файл `settings.json` из этого каталога. Команда `setup --runtime claude` устанавливает те же хуки. Выбранная модель, разрешения, данные входа и чужие обработчики сохраняются. Хуки начинают действовать в проекте после `deepseek-team init --coordinator claude /path/to/project`.
 
 ~~~bash
 deepseek-team hooks install --runtime claude
@@ -131,7 +168,7 @@ deepseek-team hooks remove --runtime claude
 > Инструкция оставлена на английском, чтобы в обеих версиях README агент получал одинаковое задание.
 
 ~~~text
-Install or update DeepSeek Team in this Linux project from https://github.com/kirill31337/deepseek-team. Use the repository's standard install.py; on Ubuntu use --with-sandbox unless a working DeepSeek Team sandbox is already configured. Preserve my existing Codex model/auth, DeepSeek Team settings, and credential. Configure Codex support without asking me to paste secrets into this prompt; if no DeepSeek key exists, leave secret entry to "deepseek-team auth set". Ensure the stable Codex lifecycle hooks are installed and healthy with "deepseek-team hooks install" and "deepseek-team hooks status". If this repository does not already contain the DeepSeek Team managed block in AGENTS.md, attach it with "deepseek-team init --coordinator codex ."; if it is already attached, do not re-run init just because the package was updated. Verify "deepseek-team --version", "deepseek-team sandbox status", "deepseek-team hooks status", and "deepseek-team doctor --runtime codex --offline". Do not use --os-sandbox off and do not weaken AppArmor/Bubblewrap. If the hooks require native Codex trust/review, use the Codex "/hooks" interface and approve/trust the DeepSeek Team package-owned hooks yourself when the current Codex environment permits it. Do not bypass Codex hook trust or modify trust state outside the native Codex mechanism. Afterwards verify with "deepseek-team hooks status". Only ask me to approve the hooks manually if native approval cannot be completed from the current Codex session.
+Install or update DeepSeek Team for /path/to/project from https://github.com/kirill31337/deepseek-team. Install it with pipx from the Git source; on Ubuntu run "deepseek-team setup --with-sandbox --no-key", otherwise run "deepseek-team setup --no-key" after the sandbox prerequisites are installed. Preserve my existing Codex model/auth, DeepSeek Team settings, and credential. Do not ask me to paste secrets into this prompt; if no DeepSeek key exists, leave secret entry to a human using "deepseek-team auth set". Attach this project with "deepseek-team init --coordinator codex /path/to/project" only if it is not already attached. Verify "deepseek-team --version", "deepseek-team sandbox status", "deepseek-team hooks status", and, from /path/to/project, "deepseek-team doctor --runtime codex --offline". Do not use --os-sandbox off or weaken AppArmor/Bubblewrap. Review/trust the package-owned hook only through Codex "/hooks"; do not bypass its native trust process.
 ~~~
 
 Инструкция **не содержит API-ключа** и предписывает сохранить ваши настройки делегирования, доступа и `effort`. Ключ можно ввести отдельно командой `deepseek-team auth set`. Чтобы изменить остальные настройки, задайте нужные значения `delegation_level`, `access` и `effort`.
@@ -318,7 +355,7 @@ deepseek-team worker --runtime codex --delegation-level 75 --access full-access 
 
 Начиная с версии 0.5.0, DeepSeek Team ведёт журнал координации вне репозитория. В нём записываются сессии, задачи и рабочие копии, задания воркеров, ожидаемые результаты, необходимые зависимости и проверки. Отдельно учитываются изменения, которые внёс сам воркер, результаты его работы, решения координатора и технические ограничения. Это журнал выполнения работы; функций планировщика заданий или системы управления проектами в нём нет.
 
-Стандартный установщик и команда `deepseek-team setup --runtime codex` добавляют хуки DeepSeek Team в пользовательский файл `$CODEX_HOME/hooks.json`. Они начинают действовать только после подключения репозитория командой `deepseek-team init --coordinator codex`. Для разрешения их запуска откройте `/hooks` в Codex, проверьте хук и подтвердите доверие к нему. DeepSeek Team не обходит эту проверку и не принимает решение за Codex.
+Стандартный установщик и команда `deepseek-team setup --runtime codex` добавляют хуки DeepSeek Team в пользовательский файл `$CODEX_HOME/hooks.json`. Они начинают действовать только после подключения репозитория командой `deepseek-team init --coordinator codex /path/to/project`. Для разрешения их запуска откройте `/hooks` в Codex, проверьте хук и подтвердите доверие к нему. DeepSeek Team не обходит эту проверку и не принимает решение за Codex.
 
 Claude использует тот же журнал через свои пользовательские хуки. Для их работы проект должен быть подключён командой `init --coordinator claude`. В обоих случаях обрабатываются следующие события:
 
@@ -534,7 +571,7 @@ deepseek-team doctor --runtime auto --offline
 
 Если проект уже подключён, повторный запуск `init` после обновления **не нужен**. Новый репозиторий подключается один раз командой `deepseek-team init --coordinator codex /path/to/project`. Если нужны инструкции для обоих координаторов, укажите `--coordinator both`. В Codex откройте `/hooks`, проверьте хук DeepSeek Team и подтвердите доверие к нему.
 
-Если вы используете pipx, выполните `pipx upgrade codex-deepseek-team`, затем `deepseek-team hooks install --runtime auto`, `deepseek-team hooks status --runtime auto` и `deepseek-team sandbox status`.
+Для установки pipx из Git выполните `pipx upgrade codex-deepseek-team`: pipx сохраняет исходный источник установки. Для локального клона выполните `pipx install --force .` из этого клона. С uv используйте `uv tool install --force --refresh 'git+https://github.com/kirill31337/deepseek-team.git'`, чтобы обновить данные Git и заменить установленный инструмент. После публикации в PyPI для установки из реестра доступны `pipx upgrade codex-deepseek-team` и `uv tool upgrade codex-deepseek-team`. Затем выполните `deepseek-team hooks install --runtime auto`, `deepseek-team hooks status --runtime auto` и `deepseek-team sandbox status`.
 
 Чтобы убрать из проекта инструкции DeepSeek Team и удалить настройки координаторов, добавленные пакетом:
 
@@ -552,7 +589,7 @@ deepseek-team sandbox remove-apparmor
 
 `reset --runtime codex` удаляет неизменённый блок настроек провайдера DeepSeek и хуки Codex, добавленные пакетом. `reset --runtime claude` удаляет только обработчики DeepSeek Team из настроек Claude. Основная модель, данные входа, разрешения и чужие настройки сохраняются в обоих случаях. Ключи в переменных окружения и приватные резервные копии конфигурации Codex также сохраняются.
 
-После отключения проектов удалите Python-пакет через менеджер пакетов, которым его устанавливали. Если использовали установщик, можно вручную удалить созданные им символические ссылки `~/.local/bin/deepseek-team` и `~/.local/bin/codex-deepseek-team`, а также каталог `~/.local/share/codex-deepseek-team`.
+Перед удалением выполните показанные выше `detach` и `reset`. Затем используйте `pipx uninstall codex-deepseek-team`, `uv tool uninstall codex-deepseek-team` или удалите созданные установщиком символические ссылки `~/.local/bin/deepseek-team` и `~/.local/bin/codex-deepseek-team`, а также каталог `~/.local/share/codex-deepseek-team`. Для виртуального окружения выйдите из него и удалите его каталог.
 
 ## Поддерживаемые платформы
 
@@ -560,4 +597,4 @@ deepseek-team sandbox remove-apparmor
 
 ## Лицензия
 
-[MIT](LICENSE). Авторские права: kirill31337, 2026.
+[MIT](https://github.com/kirill31337/deepseek-team/blob/main/LICENSE). Авторские права: kirill31337, 2026.

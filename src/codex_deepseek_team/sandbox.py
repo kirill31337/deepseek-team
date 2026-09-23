@@ -77,7 +77,7 @@ def probe_backend(*, which=shutil.which, runner=subprocess.run,
         raise SandboxError(
             78,
             'Bubblewrap worker isolation is required but bwrap is unavailable. '
-            'Install bubblewrap; on Ubuntu use `python3 install.py --with-sandbox`.'
+            'Install bubblewrap; on Ubuntu use `deepseek-team setup --with-sandbox`.'
         )
     help_result = _run_probe(runner, [bwrap, '--help'], timeout=5)
     if help_result is None or help_result.returncode != 0:

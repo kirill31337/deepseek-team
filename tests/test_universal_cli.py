@@ -43,7 +43,7 @@ class UniversalCliTests(unittest.TestCase):
         return repo
 
     def test_claude_only_setup_does_not_create_or_edit_codex_config(self):
-        result = self.cli('setup', '--runtime', 'claude', '--no-key')
+        result = self.cli('setup', '--configure-only', '--runtime', 'claude', '--no-key')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.home / 'codex/config.toml').exists())
         self.assertIn('Claude', result.stdout)
@@ -53,7 +53,7 @@ class UniversalCliTests(unittest.TestCase):
         codex_home.mkdir()
         config = codex_home / 'config.toml'
         config.write_text('model="primary"\nmodel_provider="openai"\n')
-        result = self.cli('setup', '--runtime', 'both', '--no-key')
+        result = self.cli('setup', '--configure-only', '--runtime', 'both', '--no-key')
         self.assertEqual(result.returncode, 0, result.stderr)
         parsed = tomllib.loads(config.read_text())
         self.assertEqual(parsed['model'], 'primary')
@@ -79,7 +79,7 @@ class UniversalCliTests(unittest.TestCase):
 
     def test_claude_doctor_reports_installed_hooks_and_project_binding(self):
         repo = self.git_repo()
-        self.assertEqual(self.cli('setup', '--runtime', 'claude', '--no-key').returncode, 0)
+        self.assertEqual(self.cli('setup', '--configure-only', '--runtime', 'claude', '--no-key').returncode, 0)
         self.assertEqual(self.cli('init', '--coordinator', 'claude', str(repo)).returncode, 0)
         result = self.cli('doctor', '--runtime', 'claude', '--offline', '--os-sandbox', 'off', cwd=repo)
         self.assertEqual(result.returncode, 0, result.stderr)

@@ -148,7 +148,7 @@ class ClaudeHooksTests(unittest.TestCase):
         self.assertEqual(target.read_bytes(), b'{}')
 
     def test_setup_and_reset_manage_only_claude_hooks(self):
-        result = self.cli('setup', '--runtime', 'claude', '--no-key')
+        result = self.cli('setup', '--configure-only', '--runtime', 'claude', '--no-key')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.cli('hooks', 'status', '--runtime', 'claude').returncode, 0)
         self.assertEqual(self.cli('reset', '--runtime', 'claude').returncode, 0)

@@ -18,7 +18,8 @@ def _runtimes(value):
         found = tuple(name for name in ('codex', 'claude') if shutil.which(name))
         if found:
             return found
-        raise ValueError('Neither Codex nor Claude Code is available for --runtime auto.')
+        raise ValueError('Neither Codex CLI nor Claude Code CLI is on PATH. Install a coordinator, '
+                         'restart your terminal, and rerun with --runtime auto.')
     raise ValueError('runtime must be codex, claude, both or auto')
 
 
@@ -71,10 +72,15 @@ def main(argv=None):
         toggle = commands.add_parser(name, help='Save or show local project activation for both coordinators.')
         toggle.add_argument('path', nargs='?', type=Path, default=Path.cwd())
         toggle.add_argument('--json', action='store_true', help='Print effective and saved activation as JSON.')
-    setup = commands.add_parser('setup', help='Configure DeepSeek without changing coordinator auth or primary model.')
-    setup.add_argument('--runtime', choices=['codex', 'claude', 'both', 'auto'], default='codex',
-                       help='Coordinator runtime(s) to prepare; default codex preserves legacy behavior.')
-    setup.add_argument('--no-key', action='store_true', help='Do not prompt for the shared DeepSeek credential.')
+    setup = commands.add_parser('setup', help='Configure DeepSeek and check local readiness; preserve primary auth/model.')
+    setup.add_argument('--runtime', choices=['codex', 'claude', 'both', 'auto'], default='auto',
+                       help='Coordinator runtime(s) to prepare; default auto detects installed CLIs.')
+    setup.add_argument('--no-key', action='store_true', help='Defer authentication without reading or prompting for a key.')
+    setup_mode = setup.add_mutually_exclusive_group()
+    setup_mode.add_argument('--with-sandbox', action='store_true',
+                            help='Explicitly allow Ubuntu package/AppArmor setup with administrator privileges.')
+    setup_mode.add_argument('--configure-only', action='store_true',
+                            help='Only save configuration (legacy behavior); do not verify runtime/sandbox readiness.')
     reset = commands.add_parser('reset', help='Remove only package-owned coordinator configuration; retain keys and primary auth.')
     reset.add_argument('--runtime', choices=['codex', 'claude', 'both', 'auto'], default='codex')
     for name, help_text in [('init', 'Attach delegation instructions to a Git repository.'),
@@ -121,25 +127,9 @@ def main(argv=None):
                 if value.source.startswith('environment:'):
                     print('Remove the environment disable switch to use the saved project state.')
         elif args.command == 'setup':
-            runtimes = _runtimes(args.runtime)
-            if 'codex' in runtimes:
-                changed = config.configure(worker.codex_home())
-                hooks_changed = config.install_codex_hooks(worker.codex_home())
-                print('DeepSeek Codex provider configured.' if changed else 'Compatible DeepSeek Codex provider already configured.')
-                print('Codex coordination hooks installed.' if hooks_changed else 'Codex coordination hooks already installed.')
-                print('Codex primary model and OpenAI authentication were preserved.')
-                print('Codex requires one native hook review/trust via /hooks; the stable definition persists across package updates.')
-            if 'claude' in runtimes:
-                changed = claude_config.install()
-                print('Claude coordination hooks installed.' if changed else 'Claude coordination hooks already installed.')
-                print('Claude model, permissions, authentication and unrelated hooks were preserved.')
-                print('Start a new Claude session and check /hooks. Native settings may disable hooks.')
-            if not args.no_key and not worker.load_api_key().strip():
-                if sys.stdin.isatty():
-                    config.save_key(getpass.getpass('DeepSeek API key (hidden): '))
-                    print('Key stored privately.')
-                else:
-                    print('Set your key with: deepseek-team auth set')
+            from . import onboarding
+            return onboarding.run(_runtimes(args.runtime), no_key=args.no_key,
+                                  with_sandbox=args.with_sandbox, configure_only=args.configure_only)
         elif args.command == 'reset':
             runtimes = _runtimes(args.runtime)
             if 'codex' in runtimes:

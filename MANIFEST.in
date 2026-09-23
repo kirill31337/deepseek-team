@@ -1,5 +1,8 @@
 include LICENSE README.md install.py
 include README.ru.md docs/ROUTING.md docs/ROUTING.ru.md
+include docs/PUBLISHING.md
+recursive-include docs/releases *.md
+include scripts/check_installation.py
 recursive-include tests *.py
 recursive-include src/codex_deepseek_team/data *.md
 recursive-include src/codex_deepseek_team/data/apparmor *
