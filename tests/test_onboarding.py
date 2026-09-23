@@ -173,15 +173,22 @@ class SetupTests(unittest.TestCase):
         self.assertTrue((self.codex / 'config.toml').exists())
 
     def test_newly_installed_bubblewrap_can_work_without_loading_apparmor(self):
-        self.available.add('apt-get')
+        self.available.update(('apt-get', 'sudo'))
         backend = sandbox.SandboxBackend(('/test/bwrap',), '/test/bwrap', 'direct')
-        self.probe.side_effect = [sandbox.SandboxError(78, 'missing'), backend, backend]
-        with mock.patch.object(onboarding.platform, 'freedesktop_os_release', return_value={'ID': 'ubuntu'}), \
-             mock.patch('subprocess.run'), \
-             mock.patch.object(sandbox, 'install_apparmor', side_effect=AssertionError('unnecessary profile load')):
-            code, output = self.call('--with-sandbox', '--no-key')
-        self.assertEqual(code, 0, output)
-        self.assertIn('Local setup checks passed', output)
+        for uid, prefix in ((0, []), (1000, ['/test/bin/sudo'])):
+            self.probe.side_effect = [sandbox.SandboxError(78, 'missing'), backend, backend]
+            with self.subTest(uid=uid), \
+                 mock.patch.object(onboarding.platform, 'freedesktop_os_release', return_value={'ID': 'ubuntu'}), \
+                 mock.patch.object(onboarding.os, 'geteuid', return_value=uid), \
+                 mock.patch('subprocess.run') as run, \
+                 mock.patch.object(sandbox, 'install_apparmor', side_effect=AssertionError('unnecessary profile load')):
+                code, output = self.call('--with-sandbox', '--no-key')
+                self.assertEqual(code, 0, output)
+                self.assertIn('Local setup checks passed', output)
+                self.assertEqual(run.call_args_list, [
+                    mock.call([*prefix, '/test/bin/apt-get', 'update'], check=True),
+                    mock.call([*prefix, '/test/bin/apt-get', 'install', '-y', 'bubblewrap', 'apparmor'], check=True),
+                ])
 
     def test_unsupported_system_cannot_trigger_privileged_setup(self):
         with mock.patch.object(onboarding.platform, 'freedesktop_os_release', return_value={'ID': 'fedora'}), \
