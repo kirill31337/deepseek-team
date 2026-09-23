@@ -8,7 +8,7 @@ import io
 import time
 import uuid
 
-from . import routing_bootstrap, routing_estimator, routing_recovery, settings
+from . import routing_bootstrap, routing_estimator, routing_immediate, routing_recovery, settings
 from .routing_models import (RoutingError, canonical, fingerprint, identifier, read_json,
                              number, validate_config, validate_features, validate_observation)
 from .routing_store import RoutingStore, evidence_key
@@ -100,9 +100,15 @@ class RoutingService:
             self.store.put(db, 'observations', row['id'], row)
             routing_recovery.initialize(db)
             if row['action'] == 'worker' and row['outcome'] in ('rework', 'rejected'):
-                routing_recovery.record_failure(db, row['features'], self._config(db), now=row['observed_at'])
+                config = self._config(db)
+                if (config['admission_policy'] == 'evidence'
+                        or routing_immediate.should_pause(row, self.store.all(db, 'observations'), config)):
+                    routing_recovery.record_failure(db, row['features'], config, now=row['observed_at'])
             if row['decision_id'] and (decision.get('recovery') or {}).get('selected'):
-                routing_recovery.finish(db, decision['recovery']['ticket_id'], row['outcome'], now=row['observed_at'])
+                # Immediate admission owns its proportional failure policy,
+                # including feedback from trials admitted before an upgrade.
+                routing_recovery.finish(db, decision['recovery']['ticket_id'], row['outcome'],
+                    now=row['observed_at'], start_cooldown=self._config(db)['admission_policy'] == 'evidence')
         return row
 
     def predict(self, features, access=None, record=True, *, binding=None, recovery=False):
@@ -140,6 +146,15 @@ class RoutingService:
             assessment = routing_bootstrap.assess(decision, config)
             decision['phase'] = assessment['phase']
             decision['phase_evidence'] = assessment
+            immediate = automatic and config['admission_policy'] == 'immediate'
+            if immediate:
+                reason = routing_immediate.ineligible_reason(features, access)
+                if binding is not None and not recovery:
+                    reason = reason or 'declared_verification_required'
+                decision['evidence_reason_codes'] = decision['reason_codes']
+                decision['phase'] = 'immediate'
+                decision['action'] = 'coordinator' if reason else 'worker'
+                decision['reason_codes'] = [reason or 'immediate_eligible']
             if automatic:
                 if routing_recovery.cooling(db, features, now=now):
                     decision['phase'] = 'recovery'
@@ -150,7 +165,7 @@ class RoutingService:
                     decision['action'] = 'coordinator'
                     decision['reason_codes'] = ['insufficient_measured_savings',
                         *(r for r in decision['reason_codes'] if r != 'insufficient_measured_savings')]
-            if (recovery and record and binding is not None and automatic
+            if (recovery and record and binding is not None and automatic and not immediate
                     and decision['action'] != 'worker'
                     and not assessment['economic_veto']
                     and (features['kind'] not in WRITE_KINDS or access == 'full-access')):
@@ -229,7 +244,7 @@ class RoutingService:
             routing_recovery.initialize(db)
             return routing_recovery.status(db, self._config(db))
 
-    def start_recovery(self, decision_id, *, already_running=False):
+    def start_recovery(self, decision_id, *, already_running=False, validate_only=False, access=None):
         from . import routing_recovery
         with self._transaction() as db:
             decision = self.store.get(db, 'decisions', decision_id)
@@ -248,7 +263,25 @@ class RoutingService:
                 raise RoutingError('Current routing mode does not permit a new automatic worker start.', 78)
             if not running and not reconciling_ordinary and routing_recovery.cooling(db, decision['features']):
                 raise RoutingError('Task family is in a quality failure cooldown; inspect and replan later.', 78)
-            if info.get('selected'):
+            if not running and not reconciling_ordinary:
+                current = settings.resolve(self.root)
+                current_access = access or current.effective_access
+                if not current.enabled:
+                    raise RoutingError('Delegation was disabled while the assignment waited.', 69)
+                if decision['features']['kind'] in routing_immediate.WRITE_KINDS and current_access != 'full-access':
+                    raise RoutingError('Current access does not permit this queued writing assignment.', 78)
+                forecast = routing_estimator.recommend(decision['features'], self.store.all(db, 'observations'),
+                                                       self._config(db), access=current_access)
+                if routing_bootstrap.assess(forecast, self._config(db))['economic_veto']:
+                    raise RoutingError('Measured economics no longer support this queued assignment.', 78)
+            if info.get('selected') and validate_only:
+                ticket = db.execute(
+                    'SELECT status, expires_at FROM routing_recovery_tickets WHERE ticket_id=?',
+                    (info['ticket_id'],)).fetchone()
+                if (ticket is None or ticket[0] not in ('pending', 'running')
+                        or (ticket[0] == 'pending' and ticket[1] <= time.time())):
+                    raise RoutingError('Recovery ticket is no longer available; use a new reviewed task plan.', 78)
+            elif info.get('selected'):
                 result = routing_recovery.mark_started(db, info['ticket_id'])
                 if not result['started']:
                     raise RoutingError('Recovery ticket is no longer available; use a new reviewed task plan.', 78)

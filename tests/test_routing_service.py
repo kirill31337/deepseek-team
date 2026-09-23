@@ -24,6 +24,7 @@ class ServiceTests(unittest.TestCase):
         self.env.start()
         self.addCleanup(self.env.stop)
         self.service = RoutingService(self.root)
+        self.service.configure({'admission_policy': 'evidence', 'recovery_cooldown_seconds': 3600})
         self.features = validate_features(dict(kind='implementation', domain='python', operation='fix',
             localization='known', coupling='local', verification='tests', clarity='clear', risk='low', scope_size='small'))
 

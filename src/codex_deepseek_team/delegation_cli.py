@@ -15,6 +15,8 @@ def policy_options(parser):
     parser.add_argument('--access', choices=settings.ACCESS)
     parser.add_argument('--effort', choices=settings.EFFORT,
                         help='auto lets the frontier coordinator choose per DeepSeek assignment; low/medium/high force a level.')
+    parser.add_argument('--max-workers', type=int,
+                        help='Maximum concurrently running workers (1..64, default 8); extra jobs queue.')
 
 
 def _record(copy):
@@ -66,7 +68,7 @@ def main(argv):
             if args.command == 'set':
                 target = root / settings.PROJECT_FILE if args.project else settings.global_file()
                 changed = settings.set_values(target, delegation_level=args.delegation_level,
-                                              access=args.access, effort=args.effort)
+                                              access=args.access, effort=args.effort, max_workers=args.max_workers)
                 if args.project:
                     # Refresh only blocks this package already owns. Never add
                     # unsolicited instruction files and never alter user suffixes.
@@ -82,7 +84,7 @@ def main(argv):
                 policy = settings.resolve(root)
             else:
                 policy = settings.resolve(root, delegation_level=args.delegation_level,
-                                          access=args.access, effort=args.effort)
+                                          access=args.access, effort=args.effort, max_workers=args.max_workers)
             if getattr(args, 'json', False):
                 print(json.dumps(policy.as_dict(), indent=2))
             else:

@@ -121,40 +121,18 @@ def redact(value, key):
     return re.sub(r'(?i)(Bearer\s+)[^\s"\']+', r'\1[REDACTED]', value)
 
 
-def acquire_slot(state):
-    directory, fd = None, None
-    unsafe = ('Worker state requires a private user-owned directory (700) and '
-              'regular lock files (600), without symlinks or hard links.')
+def acquire_slot(state, **options):
+    from codex_deepseek_team import worker_slots
     try:
-        state.mkdir(mode=0o700, parents=True, exist_ok=True)
-        directory = os.open(state, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        info = os.fstat(directory)
-        if info.st_uid != os.geteuid() or info.st_mode & 0o077:
-            raise WorkerError(78, unsafe)
-        for number in range(3):
-            fd = os.open(f'worker-{number}.lock',
-                         os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK,
-                         0o600, dir_fd=directory)
-            info = os.fstat(fd)
-            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or
-                    info.st_uid != os.geteuid() or info.st_mode & 0o077):
-                raise WorkerError(78, unsafe)
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                os.close(fd)
-                fd = None
-                continue
-            acquired, fd = fd, None
-            return acquired
-        raise WorkerError(75, 'Three DeepSeek workers are already running; the coordinator should continue locally.')
-    except OSError:
-        raise WorkerError(78, unsafe) from None
-    finally:
-        if fd is not None:
-            os.close(fd)
-        if directory is not None:
-            os.close(directory)
+        return worker_slots.acquire(state, **options)
+    except worker_slots.SlotError as error:
+        raise WorkerError(error.code, error.message) from None
+
+
+def acquire_job_slot(args, *, policy=None, root=None):
+    from codex_deepseek_team import worker_admission
+    return worker_admission.acquire(args, sys.modules.get(__name__) or _worker_api(),
+                                    policy=policy, root=root)
 
 
 def child_environment(home, key, runtime='codex', effort=DEFAULT_EFFORT):
@@ -409,10 +387,14 @@ def run(args):
                 delegation_level=getattr(args, 'delegation_level', None),
                 access=getattr(args, 'access', None),
                 effort=getattr(args, 'effort', None),
+                max_workers=getattr(args, 'max_workers', None),
             )
         except (settings.SettingsError, workspace.WorkspaceError) as error:
             raise WorkerError(getattr(error, 'code', 78), str(error)) from None
         print(settings.describe(policy), file=sys.stderr)
+        args.max_workers = policy.max_workers
+        args.resolved_policy = policy
+        args.policy_root = root
         if policy.effort == 'auto':
             args.effort = DEFAULT_EFFORT
             print('DeepSeek effort auto: no concrete frontier selection reached the runner; using medium fallback.', file=sys.stderr)
@@ -435,12 +417,14 @@ def run_worker(args):
     task = args.task if args.task is not None else sys.stdin.read()
     if not task.strip():
         raise WorkerError(64, 'Pass a task on stdin or as one argument.')
-    key = load_api_key()
-    if not key.strip():
-        raise WorkerError(78, 'DEEPSEEK_API_KEY and saved credential are absent or empty; configure locally, never in chat or project files.')
-    slot = acquire_slot(args.state_dir)
-    deadline = time.monotonic() + args.timeout if args.timeout else None
+    slot = acquire_job_slot(args, policy=getattr(args, 'resolved_policy', None),
+                            root=getattr(args, 'policy_root', None))
+    deadline = args.job_deadline
     try:
+        args.validate_admission()
+        key = load_api_key()
+        if not key.strip():
+            raise WorkerError(78, 'DEEPSEEK_API_KEY and saved credential are absent or empty; configure locally, never in chat or project files.')
         with tempfile.TemporaryDirectory(prefix='session-', dir=args.state_dir) as directory:
             home = Path(directory)
             if runtime == 'codex':
@@ -461,6 +445,7 @@ def run_worker(args):
                 except sandbox.SandboxError as error:
                     raise WorkerError(error.code, error.message) from None
             for attempt in range(args.attempts):
+                args.validate_admission()
                 remaining = deadline - time.monotonic() if deadline is not None else None
                 if remaining is not None and remaining <= 0:
                     raise WorkerError(124, 'DeepSeek worker exceeded its total timeout.')
@@ -514,13 +499,17 @@ def parse_args():
     parser.add_argument('--effort', choices=EFFORT_LEVELS,
                         help='One-job DeepSeek Flash effort override. Omit to use saved policy; policy default is auto.')
     parser.add_argument('--timeout', type=float, default=0,
-                        help='0: wait without a total deadline (default); 1..900: explicit total limit in seconds, including retries.')
+                        help='0: wait without a total deadline (default); 1..900: total seconds including queue and retries.')
     parser.add_argument('--attempts', type=int, choices=[1, 2, 3],
                         help='Read-only: 2 by default. Managed full-access uses one attempt and explicit resume.')
     level_type, level_choices = _delegation_level_options()
     parser.add_argument('--delegation-level', type=level_type, choices=level_choices,
                         help='auto adapts per task; 25/50/75 force a fixed profile.')
     parser.add_argument('--access', choices=['auto', 'read-only', 'full-access'])
+    parser.add_argument('--max-workers', type=int, choices=range(1, 65), metavar='1..64',
+                        help='Concurrent worker limit; saved policy or 8 by default. Additional jobs wait.')
+    parser.add_argument('--no-wait', action='store_true',
+                        help='Return capacity exhaustion immediately instead of waiting in the FIFO queue.')
     parser.add_argument('--workspace', help='Reuse an owned workspace ID; never adopts foreign directories.')
     parser.add_argument('--coord-task', help='Persistent coordination task id for automatic runner accounting.')
     parser.add_argument('--coord-assignment', help='Planned coordination assignment id; must be used with --coord-task.')

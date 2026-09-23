@@ -26,20 +26,17 @@ outcomes continue to teach the router. Match its runtime/model/effort/context to
 actual assignment, and keep unknown task attributes unknown. Protected coordinator
 responsibilities keep an explicit coordinator executor.
 
-Auto automatically selects **bootstrap**, **adaptive**, or **recovery** for each
-comparable task category; there is no manual stage switch. Missing data is not a
-quality failure. Bootstrap actively admits small, low-risk, known/local tasks with
-concrete checks, without the recovery spacing, until quality is supported. Up to
-three bootstrap/recovery trials may be pending or running across the project. Every
-tenth eligible bootstrap or cost-learning opportunity in a category stays with the
-coordinator for comparison. Unknown prices permit bounded cost learning, never
-invented savings; sufficiently supported poor economics veto all trials.
+**Auto delegates useful bounded work immediately by default** (`admission_policy=immediate`). Small or medium tasks with low or medium risk, known or partial localization, local or component coupling, clear requirements and declared tests or a reproducer can be assigned from the first session. Manual verification is allowed for read, review, research, diagnostic, test-plan and documentation tasks with explicit acceptance criteria. Implementation requires executable checks and `full-access`.
 
-Actual quality failures pause that family for one hour by default. Unsupported
-quality then uses controlled recovery: at most one active recovery trial within
-the shared cap, with at least ten distinct eligible recovery opportunities between
-selections by default. Old evidence loses weight; successful retries never erase
-first-pass failures. No stage grants access or automatically retries implementation.
+There is no cold-start history wait, three-assignment cap, periodic coordinator holdout or recovery stride. Unknown costs stay unknown and do not block eligible work; supported poor measured economics still veto delegation. One rework is recorded without a family pause. A rejection or three distinct rework cases within the cooldown window pause the family, by default for 300 seconds; saved cooldown values are respected. Immediate admission resumes after the pause without a trial quota. Failed implementation never retries automatically.
+
+Fresh Auto access remains **read-only**. To delegate implementation, explicitly opt in:
+
+```bash
+deepseek-team config set --project --access full-access
+```
+
+The coordinator decomposes meaningful independent slices, reviews actual diffs and declared checks, and reports accepted work and rework without repeating the worker's investigation or inventing percentage savings. Architecture, security, integration, final verification, commits and production remain coordinator-owned. Saved manual profiles, explicit permissions and `off` retain priority. The previous bootstrap/adaptive/recovery policy is opt-in through `deepseek-team routing configure --admission-policy evidence`.
 
 Keep the required Linux OS sandbox enabled for managed workers. Never add `--os-sandbox off`
 to ordinary coordination flows and do not weaken Ubuntu AppArmor
@@ -162,7 +159,12 @@ as equivalent verification.
 
 A failed or interrupted workspace is retained. Inspect it before explicit
 `--resume-after-failure`; do not automatically repeat implementation over unknown
-state. At most three workers may run and the default total timeout remains unlimited.
+state. The default concurrency limit is eight workers (`max_workers`, configurable 1–64).
+Eligible assignments remain worker-owned when slots are busy; launches wait FIFO.
+Use `config set --project --max-workers N` or `--global` to save a limit, or
+`worker --max-workers N` for one launch. `--no-wait` returns capacity code 75.
+Default queue and total timeout are unlimited; explicit `--timeout` includes queue time.
+Before secrets or provider launch, queued work rechecks off/access/routing/HEAD.
 
 ### Integration boundary
 

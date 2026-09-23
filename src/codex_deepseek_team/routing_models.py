@@ -35,12 +35,12 @@ FEATURE_DEFAULTS = dict.fromkeys(FEATURE_VALUES, 'unknown')
 FEATURE_DEFAULTS.update(kind='implementation', runtime='codex', effort='medium',
                         model='deepseek-flash', context_version='default')
 DEFAULT_CONFIG = {
-    'mode': 'auto', 'confidence': .95, 'min_success_probability': .8,
+    'mode': 'auto', 'admission_policy': 'immediate', 'confidence': .95, 'min_success_probability': .8,
     'min_local_evidence': 5., 'external_weight_cap': 5., 'source_weight_cap': 2.,
     'half_life_days': 90., 'max_evidence_age_days': 365., 'min_similarity': .6,
     'minimum_savings_fraction': .1, 'require_cost_evidence': True,
     'monthly_experiment_budget_usd': 0., 'per_experiment_limit_usd': 0.,
-    'recovery_rate': .1, 'recovery_cooldown_seconds': 3600.,
+    'recovery_rate': .1, 'recovery_cooldown_seconds': 300.,
 }
 MAX_JSON_BYTES = 8 * 1024 * 1024
 MAX_OBSERVATIONS = 50000
@@ -79,9 +79,11 @@ def validate_config(value: dict, base=None) -> dict:
     result.update(value)
     if result['mode'] not in ('off', 'shadow', 'advisory', 'auto'):
         raise RoutingError('Routing mode must be off, shadow, advisory or auto.')
+    if result['admission_policy'] not in ('immediate', 'evidence'):
+        raise RoutingError('Admission policy must be immediate or evidence.')
     if type(result['require_cost_evidence']) is not bool:
         raise RoutingError('require_cost_evidence must be boolean.')
-    for key in set(DEFAULT_CONFIG) - {'mode', 'require_cost_evidence'}:
+    for key in set(DEFAULT_CONFIG) - {'mode', 'admission_policy', 'require_cost_evidence'}:
         result[key] = number(result[key], key)
     for key in ('confidence', 'min_success_probability'):
         if not 0 < result[key] < 1:

@@ -28,6 +28,8 @@ class AutomaticStageTests(unittest.TestCase):
         self.addCleanup(env.stop)
         settings.set_values(self.root / '.deepseek-team.toml', delegation_level='auto', access='full-access')
         self.service = RoutingService(self.root)
+        # These contracts cover the explicitly selected evidence admission path.
+        self.service.configure({'admission_policy': 'evidence', 'recovery_cooldown_seconds': 3600})
         self.features = validate_features(dict(kind='implementation', domain='python', operation='fix',
             localization='known', coupling='local', verification='tests', clarity='clear', risk='low',
             scope_size='small', context_version='test-v1'))

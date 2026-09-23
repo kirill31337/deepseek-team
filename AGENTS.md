@@ -42,12 +42,17 @@ outcomes continue to teach the router. Match its runtime/model/effort/context to
 actual assignment, and keep unknown task attributes unknown. Protected coordinator
 responsibilities keep an explicit coordinator executor.
 
-Auto uses capped public evidence and comparable local outcomes, with uncertainty and
-measured total cost. Controlled recovery admits only small, low-risk, local tasks with
-known scope and concrete checks: one pending/running recovery assignment project-wide,
-then at least ten distinct eligible opportunities between selections by default.
-Quality failures pause that task family for one hour; old evidence loses weight.
-Recovery never grants access or automatically retries a failed implementation.
+**Auto delegates useful bounded work immediately by default** (`admission_policy=immediate`). Small or medium tasks with low or medium risk, known or partial localization, local or component coupling, clear requirements and declared tests or a reproducer can be assigned from the first session. Manual verification is allowed for read, review, research, diagnostic, test-plan and documentation tasks with explicit acceptance criteria. Implementation requires executable checks and `full-access`.
+
+There is no cold-start history wait, three-assignment cap, periodic coordinator holdout or recovery stride. Unknown costs stay unknown and do not block eligible work; supported poor measured economics still veto delegation. One rework is recorded without a family pause. A rejection or three distinct rework cases within the cooldown window pause the family, by default for 300 seconds; saved cooldown values are respected. Immediate admission resumes after the pause without a trial quota. Failed implementation never retries automatically.
+
+Fresh Auto access remains **read-only**. To delegate implementation, explicitly opt in:
+
+```bash
+deepseek-team config set --project --access full-access
+```
+
+The coordinator decomposes meaningful independent slices, reviews actual diffs and declared checks, and reports accepted work and rework without repeating the worker's investigation or inventing percentage savings. Architecture, security, integration, final verification, commits and production remain coordinator-owned. Saved manual profiles, explicit permissions and `off` retain priority. The previous bootstrap/adaptive/recovery policy is opt-in through `deepseek-team routing configure --admission-policy evidence`.
 
 Keep the required Linux OS sandbox enabled for managed workers. Never add `--os-sandbox off`
 to ordinary coordination flows and do not weaken Ubuntu AppArmor
@@ -143,8 +148,11 @@ deepseek-team coordination use --task TASK_ID --assignment ASSIGNMENT_ID \
 --disposition incorporated --evidence "reviewed diff and accepted result"
 ```
 
-Record verified coordinator outcomes with `coordination result --task TASK_ID
+Record verified coordinator and native-agent outcomes with `coordination result --task TASK_ID
 --deliverable DELIVERABLE_ID --outcome accepted --evidence "checks passed"`.
+Every such deliverable needs an accepted or explicitly cancelled outcome before
+completion. A later recognized mutation in its scope requires fresh acceptance.
+Native-agent outcomes do not train the coordinator routing estimates.
 Both result commands accept `--cost-usd` for the measured total, including review
 and rework; omit unknown costs rather than inventing a subscription dollar value.
 Use `needs-rework` when the worker result needed fixes. Repeated attempts remain one
@@ -167,7 +175,12 @@ as equivalent verification.
 
 A failed or interrupted workspace is retained. Inspect it before explicit
 `--resume-after-failure`; do not automatically repeat implementation over unknown
-state. At most three workers may run and the default total timeout remains unlimited.
+state. The default concurrency limit is eight workers (`max_workers`, configurable 1–64).
+Eligible assignments remain worker-owned when slots are busy; launches wait FIFO.
+Use `config set --project --max-workers N` or `--global` to save a limit, or
+`worker --max-workers N` for one launch. `--no-wait` returns capacity code 75.
+Default queue and total timeout are unlimited; explicit `--timeout` includes queue time.
+Before secrets or provider launch, queued work rechecks off/access/routing/HEAD.
 
 ### Integration boundary
 
@@ -175,6 +188,12 @@ Codex: distribution/source-mutation gates use supported lifecycle hooks, but nat
 hook trust is owned by Codex and must be reviewed there once; DeepSeek Team does not
 bypass or infer it. Hooks are a coordinator-process guardrail, not a replacement for
 the worker Bubblewrap/AppArmor security boundary.
+
+For both runtimes, an unplanned turn with no recorded work closes without requiring
+a distribution plan or claiming implementation completion. Status prompts retain
+existing unfinished tasks. Stop requests continuation for unfinished assignments,
+undisposed worker results and missing coordinator/native outcomes. A repeated Stop
+warns and keeps the ledger unfinished without vetoing another hook's continuation.
 
 Claude Code: after `setup --runtime claude` and project attachment, user-level hooks
 inject the current policy and enforce the same ledger distribution through PreToolUse.
@@ -199,10 +218,11 @@ reads coordinator secrets, or delegates to another agent.
 Percentages are target profiles of useful work, not call/token/line quotas. Do not manufacture tasks to reach a percentage. For a genuinely small single-output task, record the small classification and concrete scope instead of creating a fake worker. The coordinator owns architecture, security decisions, final verification, integration, secrets/signing, commit/push and production actions. These responsibilities do not by themselves reserve ordinary implementation, tests, fixtures, documentation or non-secret metadata from workers. Do not calculate an actual useful-work percentage from calls, deliverable counts, lines or files.
 DeepSeek Team workers always use deepseek-flash. Effort policy is auto, so before each DeepSeek assignment the frontier coordinator must choose --effort low, --effort medium or --effort high from the assigned task without asking the user: low for bounded/mechanical work, medium for the normal case, and high for difficult debugging, cross-file reasoning or adversarial review. If a DeepSeek worker is launched directly without a frontier-selected effort, the runner uses medium as an execution fallback only.
 Coordinator-native subagents remain available. Use them only when parallelism, isolated context or a native capability materially helps. Represent that choice in the plan with executor: "native-agent" plus a concrete delegation_reason. Native agents complement DeepSeek workers and do not satisfy DeepSeek worker assignments required by the effective profile. Protected coordinator responsibilities remain with the coordinator. DeepSeek workers themselves remain leaf workers and must never delegate.
-Delegation depth is adaptive (auto), not a fixed target: delegate a separable implementation, test, fixture, documentation or review slice when the captured task features show it is worthwhile, and leave the task with the coordinator on cold start or when it is not separable.
-Delegation level is auto: the profile is adaptive per task, chosen from local outcomes and bounded external evidence instead of a fixed percentage. New auto plans must record executor: "auto" together with a "features" card capturing the task before execution: kind, domain, operation, localization, coupling, verification, clarity, risk, scope_size, runtime, model, effort and context_version. The coordinator classifies the task; the router resolves its saved feature card. Workers must not self-select a profile. Cold start may abstain and return the task to the coordinator. A bounded share of safe, small, locally verifiable regular tasks can be delegated for recovery, with one such assignment in flight and a finite cooldown after failures. There is no automatic paid exploration outside the normal task stream and no automatic permission widening; keep the resolved access and explicit executor choices. Inspect adaptive routing state with deepseek-team routing status and adjust it with deepseek-team routing configure.
+Auto delegates suitable work immediately by default. Actively split substantial work into meaningful independent implementation, test, fixture, documentation and review deliverables with executor:auto. Prepare interfaces and acceptance criteria before assigning; do not retain eligible work merely because history is missing or worker slots are busy.
+Delegation level is auto: the profile is adaptive per task, chosen from local outcomes and bounded external evidence instead of a fixed percentage. New auto plans must record executor: "auto" together with a "features" card capturing the task before execution: kind, domain, operation, localization, coupling, verification, clarity, risk, scope_size, runtime, model, effort and context_version. The coordinator classifies the task; the router resolves its saved feature card. Workers must not self-select a profile or stage. The default admission_policy is immediate: suitable small/medium low/medium-risk local/component tasks with clear requirements, known/partial localization and declared tests or a reproducer can start without prior evidence. Read-only deliverables and documentation may use explicit manual acceptance criteria. High/protected/unknown-risk, unbounded or unverifiable work stays with the coordinator. There is no initial trial quota or periodic coordinator holdout. Missing data and unknown prices do not block suitable work and never imply measured savings; supported poor economics still veto delegation. A rejected result or three distinct recent rework cases pause only that family for the configured cooldown (300 seconds by default). One rework is recorded without pausing the family; after a pause immediate admission resumes. Explicit admission_policy=evidence retains bootstrap/adaptive/recovery compatibility. There is no automatic paid exploration outside the normal task stream and no automatic permission widening; keep the resolved access and explicit executor choices. Inspect adaptive routing state with deepseek-team routing status and adjust it with deepseek-team routing configure.
 Full-access is development inside an owned isolated copy, not host access. Allow the worker to create/edit/delete project files in its assigned copy and run declared local checks. Prepare missing dependencies with workspace prepare. If selected uncommitted source is required, import only those files with workspace import; it is recorded as coordinator-prepared source, not worker output. Host SDK/JDK/tools are not assumed to exist inside the sandbox.
-Codex process integration: after project init and enabling hooks in the runtime, SessionStart/UserPromptSubmit provide the current coordination task id. For every substantial task, before coordinator source edits, submit a concrete JSON distribution with deepseek-team coordination plan --task TASK_ID; include deliverable id/kind/scope, executor, acceptance criteria, dependencies and checks. Run each worker assignment with deepseek-team worker --runtime codex --effort medium --coord-task TASK_ID --coord-assignment ASSIGNMENT_ID. Because effort policy is auto, replace medium with low or high when the assigned task warrants it. The runner records start/result/workspace/checks automatically. After reviewing a result, record its use with deepseek-team coordination use. New substantial scope requires a revised plan. Codex PreToolUse blocks recognized source edits while the distribution is missing/noncompliant, blocks unplanned scope, and blocks duplicate work owned by a pending worker assignment. Hook coverage depends on the tools and native runtime settings; it does not replace the worker OS sandbox. Stop prevents silent completion with pending/undispositioned worker results. Native hook trust is controlled by Codex and is not inferred by this package.
+Codex process integration: after project init and enabling hooks in the runtime, SessionStart/UserPromptSubmit provide the current coordination task id. For every substantial task, before coordinator source edits, submit a concrete JSON distribution with deepseek-team coordination plan --task TASK_ID; include deliverable id/kind/scope, executor, acceptance criteria, dependencies and checks. Run each worker assignment with deepseek-team worker --runtime codex --effort medium --coord-task TASK_ID --coord-assignment ASSIGNMENT_ID. Because effort policy is auto, replace medium with low or high when the assigned task warrants it. The runner records start/result/workspace/checks automatically. After reviewing a result, record its use with deepseek-team coordination use. Record verified coordinator and native-agent outcomes with deepseek-team coordination result; accepted or explicitly cancelled outcomes are required for completion. Later recognized scope mutations require fresh acceptance. New substantial scope requires a revised plan. Codex PreToolUse blocks recognized source edits while the distribution is missing/noncompliant, blocks unplanned scope, and blocks duplicate work owned by a pending worker assignment. Hook coverage depends on the tools and native runtime settings; it does not replace the worker OS sandbox. An unplanned turn without recorded work closes without a distribution plan; status prompts retain existing unfinished tasks. Stop requests continuation for unfinished assignments/results, including coordinator and native-agent outcomes. On repeated Stop it warns and keeps the ledger unfinished without vetoing another hook continuation. Native hook trust is controlled by Codex and is not inferred by this package.
+Execution capacity is 8; configure max_workers independently of access. Plan all eligible deliverables; launch independent jobs concurrently and let excess jobs wait in FIFO order. Capacity is not a reason to retain their implementation with the coordinator. Report accepted work, verification results and any rework; only report money savings when measured.
 While a worker runs, work only on independent scope. Review the actual diff and recorded checks without repeating the whole investigation or rewriting correct code. DeepSeek workers never stage, commit, push, publish, deploy, access production services or delegate.
 
 <!-- codex-deepseek-team:managed-block:end -->

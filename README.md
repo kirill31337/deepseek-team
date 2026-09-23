@@ -8,9 +8,9 @@ One Linux package for **Codex and/or Claude Code coordinators** delegating bound
 
 **The coordinator owns:** scope, architecture, security decisions, final diff review, integration, commits and production actions. **DeepSeek contributes:** focused research/review and, when full-access is selected, independent implementation, local tests/builds and documentation inside a dedicated copy. DeepSeek workers stay on `deepseek-flash`; effort defaults to `auto`, so the frontier coordinator chooses `low`/`medium`/`high` per assignment unless a persistent forced effort is configured. Codex/Claude may also use their own native subagents when they can state a concrete reason for doing so; native subagents complement rather than replace required DeepSeek assignments. The coordinator should verify useful evidence instead of automatically repeating the whole delegated investigation or rewriting correct code.
 
-The percentages are **target work-distribution profiles**, not measured token/time/line quotas and not promises of exact useful contribution. Small or inseparable tasks may delegate less. Fresh installs default to **Auto + access=auto → read-only**. Auto chooses an executor per task from bounded public evidence and local outcomes. Saved manual 25/50/75 preferences retain priority and continue collecting outcomes.
+The percentages are **target work-distribution profiles**, not measured token/time/line quotas and not promises of exact useful contribution. Small or inseparable tasks may delegate less. Fresh installs default to **Auto + access=auto → read-only**. Auto immediately admits eligible bounded work and learns from recorded outcomes. Saved manual 25/50/75 preferences retain priority and continue collecting outcomes.
 
-Version **0.8.0** prepares the product installation flow and keeps hybrid routing, persistent learning, chronological evaluation and transactional experiment budgets; see [the routing guide](https://github.com/kirill31337/deepseek-team/blob/main/docs/ROUTING.md). It retains frontier-selected DeepSeek effort with persistent `auto|low|medium|high` policy, preserves justified native Codex/Claude subagents alongside DeepSeek workers, and keeps DeepSeek workers fixed on `deepseek-flash` as isolated leaf workers. Version 0.5.0 introduced persistent coordination state and Codex lifecycle enforcement. The release supports **Linux, Python 3.11+, Git, Bubblewrap, and Codex CLI and/or Claude Code CLI**. Ubuntu has first-class AppArmor setup for its restricted unprivileged-user-namespace policy. A DeepSeek API key is required for live work. There are no Python runtime dependencies; Bubblewrap/AppArmor are system components.
+Version **0.8.0** adds immediate useful delegation and a FIFO worker queue alongside the product installation flow, and keeps hybrid routing, persistent learning, chronological evaluation and transactional experiment budgets; see [the routing guide](https://github.com/kirill31337/deepseek-team/blob/main/docs/ROUTING.md). It retains frontier-selected DeepSeek effort with persistent `auto|low|medium|high` policy, preserves justified native Codex/Claude subagents alongside DeepSeek workers, and keeps DeepSeek workers fixed on `deepseek-flash` as isolated leaf workers. Version 0.5.0 introduced persistent coordination state and Codex lifecycle enforcement. The release supports **Linux, Python 3.11+, Git, Bubblewrap, and Codex CLI and/or Claude Code CLI**. Ubuntu has first-class AppArmor setup for its restricted unprivileged-user-namespace policy. A DeepSeek API key is required for live work. There are no Python runtime dependencies; Bubblewrap/AppArmor are system components.
 
 The current source also supports Claude Code coordination hooks: both coordinators use the persistent task ledger and the saved project `on/off` switch.
 
@@ -52,7 +52,7 @@ cd /path/to/project
 deepseek-team doctor --runtime auto --offline
 ```
 
-On a non-Ubuntu system, or when the sandbox prerequisites are already installed, replace `setup --with-sandbox` with `setup`. `setup` defaults to `--runtime auto` and detects Codex and Claude Code on `PATH`; use `--runtime codex`, `claude`, or `both` to choose explicitly. `setup --with-sandbox` is the only setup path that authorizes Ubuntu package/profile installation and a sandbox probe. Ordinary `setup` never uses `sudo`: it reports missing prerequisites and the action needed. `setup --no-key` skips credential access and prompting. It prints readiness and native hook-trust instructions, but does not attach projects. In Codex, review the package hook through `/hooks`; for Claude, start a new session and check `/hooks`.
+On a non-Ubuntu system, or when the sandbox prerequisites are already installed, replace `setup --with-sandbox` with `setup`. `setup` defaults to `--runtime auto` and detects Codex and Claude Code on `PATH`; use `--runtime codex`, `claude`, or `both` to choose explicitly. `setup --with-sandbox` authorizes privileged Ubuntu package/profile installation. Both ordinary setup and `setup --with-sandbox` probe the sandbox. Ordinary `setup` never uses `sudo`: it reports missing prerequisites and the action needed. `setup --no-key` skips credential access and prompting. It prints readiness and native hook-trust instructions, but does not attach projects. In Codex, review the package hook through `/hooks`; for Claude, start a new session and check `/hooks`.
 
 Use `--coordinator claude` for Claude Code or `--coordinator both` when the project will use both coordinators. `setup --configure-only` preserves the earlier configure-only automation behavior; it changes configuration without readiness verification. Keep the DeepSeek credential private and set it separately with `deepseek-team auth set` when live work is needed.
 
@@ -64,17 +64,21 @@ The system answers three questions in order: **what is this task, how likely is 
 
 1. **The classifier describes the task.** Before execution, the Codex or Claude coordinator records what needs changing, where the code is, how many components are involved, the risk, and how the result will be checked. It also records the worker's model, runtime and reasoning effort. Unknown task details stay unknown. This feature card is filled by the coordinator; the package does not train a separate classifier.
 2. **The estimator learns from comparable results.** It estimates the chance that a DeepSeek result will be accepted without rework and shows how uncertain that estimate is. A Python bug fix is compared with the same kind of operation under matching execution conditions. Old results gradually lose weight. Explicitly imported public benchmarks can help, but their contribution is capped so that enough local experience can outweigh them.
-3. **The router chooses an executor.** It first checks permissions and which responsibilities belong to the coordinator. Auto gathers evidence through bounded assignments of safe tasks, then uses the quality estimate and measured total cost, including review and rework, to choose an executor. The decision and its reasons are saved; the coordinator launches any assigned worker and reviews its work.
+3. **The router chooses an executor.** It first checks permissions and which responsibilities belong to the coordinator. Auto immediately admits eligible bounded tasks while learning from quality and measured total cost, including review and rework. The decision and its reasons are saved; the coordinator launches any assigned worker and reviews its work.
 
 **Example:** for “add a `--quiet` flag to `status` and a unit test,” the coordinator can record a small, localized Python change with a clear check. After execution it records whether the result was accepted, needed rework, or was rejected, plus the total cost when known. This updates the statistics for later comparable tasks. Learning needs no model fine-tuning or separate paid training runs; saved manual `25`/`50`/`75` profiles collect the same feedback.
 
-**Auto selects its learning stage automatically for each task family and execution context:**
+**Auto delegates useful bounded work immediately by default** (`admission_policy=immediate`). Small or medium tasks with low or medium risk, known or partial localization, local or component coupling, clear requirements and declared tests or a reproducer can be assigned from the first session. Manual verification is allowed for read, review, research, diagnostic, test-plan and documentation tasks with explicit acceptance criteria. Implementation requires executable checks and `full-access`.
 
-- **Bootstrap:** small, low-risk tasks with a known scope, clear requirements and concrete checks can go to DeepSeek immediately. Every tenth eligible opportunity in that family stays with the coordinator for a measured cost comparison. Bootstrap continues until both the minimum local evidence and the conservative quality threshold are met; five successes alone do not trigger a switch.
-- **Adaptive:** supported quality and measured savings guide delegation. Missing cost data still permits bounded assignments of the same safe tasks to collect it. Sufficient evidence of poor economics blocks these trials; missing costs never count as savings.
-- **Recovery:** when comparable quality failures leave quality unsupported, trials become less frequent: the first eligible recovery case, then one per ten distinct eligible recovery opportunities across the project by default. A quality failure pauses the affected family for one hour.
+There is no cold-start history wait, three-assignment cap, periodic coordinator holdout or recovery stride. Unknown costs stay unknown and do not block eligible work; supported poor measured economics still veto delegation. One rework is recorded without a family pause. A rejection or three distinct rework cases within the cooldown window pause the family, by default for 300 seconds; saved cooldown values are respected. Immediate admission resumes after the pause without a trial quota. Failed implementation never retries automatically.
 
-Bootstrap and recovery share a limit of **three pending or running trials per project**, with at most **one recovery trial** among them. Provider or infrastructure failures and cancellations do not lower the quality estimate. Old failures lose weight at the same rate as successes; retrying a failed case does not erase its first failure. These stages need no manual switch and never widen access. Fresh Auto settings remain read-only until write access is explicitly allowed.
+Fresh Auto access remains **read-only**. To delegate implementation, explicitly opt in:
+
+```bash
+deepseek-team config set --project --access full-access
+```
+
+The coordinator decomposes meaningful independent slices, reviews actual diffs and declared checks, and reports accepted work and rework without repeating the worker's investigation or inventing percentage savings. Architecture, security, integration, final verification, commits and production remain coordinator-owned. Saved manual profiles, explicit permissions and `off` retain priority. The previous bootstrap/adaptive/recovery policy is opt-in through `deepseek-team routing configure --admission-policy evidence`.
 
 See [the routing guide](https://github.com/kirill31337/deepseek-team/blob/main/docs/ROUTING.md) for the diagram, scoring details and commands.
 
@@ -298,12 +302,26 @@ Settings are layered independently:
 
 | Profile | `access=auto` | Intended practice |
 | --- | --- | --- |
-| **Auto (default)** | `read-only` | Automatically bootstrap on safe tasks, use learned quality and measured costs, and recover cautiously after failures; access and task eligibility still govern delegation. |
+| **Auto (default)** | `read-only` | Immediately delegate eligible bounded tasks; learn from outcomes within configured access. |
 | **25%** | `read-only` | Bounded research, diagnosis and review; coordinator performs the main implementation. |
 | **50%** | `full-access` | Delegate independent implementation slices and their tests before doing the same work locally; coordinator owns architecture/interfaces and integration. |
-| **75%** | `full-access` | Delegate most separable implementation, tests, docs and independent review; use up to three workers only when assignments are genuinely independent. |
+| **75%** | `full-access` | Delegate most separable implementation, tests, docs and independent review; run independent assignments within the configured concurrency limit. |
 
 Access is independent of the target percentage. An explicit `read-only` remains read-only at 50/75, and an explicit `full-access` can be selected at 25. Changing the percentage does not overwrite an explicit access choice; return access to `auto` when you want profile defaults again.
+
+### Worker queue and parallel execution
+
+Eligible assignments remain assigned to workers when execution slots are busy. Assignment is separate from execution: launches wait FIFO, with **8 concurrent workers by default**, configurable from 1 to 64. Each managed assignment needs an owned isolated copy; parallel work must be independent.
+
+```bash
+deepseek-team config set --project --max-workers 8
+# Or save a user-wide limit:
+deepseek-team config set --global --max-workers 8
+# One-job override:
+deepseek-team worker --runtime codex --max-workers 4
+```
+
+Default waiting and total timeout are unlimited. `worker --no-wait` returns capacity exit code `75` when no slot is available; explicit `--timeout` includes queue time. Before provider launch or credential access, queued work rechecks `off`, access, routing authorization and project HEAD. Waiting never widens permissions. The required OS sandbox, private network and fixed relay for managed copies are unchanged.
 
 ### DeepSeek model, effort and coordinator-native subagents
 
@@ -494,7 +512,7 @@ deepseek-team workspace diff WORKSPACE_ID
 
 A successful modified workspace can be reused for another iteration. If execution fails after partial edits, files and a recorded diff are retained. A further implementation does **not** start automatically; inspect the workspace first, then continue explicitly with `--resume-after-failure --workspace WORKSPACE_ID`.
 
-Up to three workers may run concurrently. Each full-access assignment owns a separate copy and lock; one worker cannot see another worker's copy or the user's source checkout. The coordinator remains responsible for final review, integration, committing, pushing and deployment.
+By default, up to eight workers run concurrently; additional launches wait FIFO. Each full-access assignment owns a separate copy and lock; one worker cannot see another worker's copy or the user's source checkout. The coordinator remains responsible for final review, integration, committing, pushing and deployment.
 
 ## Sandbox commands
 
@@ -516,7 +534,7 @@ This prints a warning and deliberately bypasses the new OS-layer requirement. It
 
 ## Reliability and security boundaries
 
-- At most three workers share user-level locks; managed workspaces additionally use ownership locks.
+- The configurable concurrency limit defaults to eight workers with user-level locks; managed workspaces additionally use ownership locks.
 - Default total timeout is `0` (unlimited). A slow/silent worker is not treated as failed.
 - Read-only transient failures can retry within the configured bounded attempt count. Managed full-access uses one attempt; partial work is retained and continuation requires explicit `--resume-after-failure`.
 - Worker output must be a completed structured result. Malformed JSON, invalid UTF-8, terminal failure events and empty successful answers are rejected.

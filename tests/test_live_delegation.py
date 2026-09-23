@@ -18,11 +18,12 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from codex_deepseek_team import coordination, managed, relay, sandbox, settings, worker, workspace
+from codex_deepseek_team import activation, coordination, managed, relay, sandbox, settings, worker, workspace
 from codex_deepseek_team.routing import RoutingService
 
 DRIVER = r'''#!/usr/bin/env python3
@@ -133,13 +134,61 @@ class LiveBase(unittest.TestCase):
 
 
 class LiveDemoTests(LiveBase):
+    def test_declared_checks_share_the_total_job_deadline(self):
+        settings.set_values(self.source / settings.PROJECT_FILE, access='full-access')
+        policy = settings.resolve(self.source)
+        copy, sibling = [workspace.create(self.source, self.state) for _ in range(2)]
+        task = coordination.open_task(self.source, session_id='deadline', turn_id='1',
+            prompt='fix and verify', policy=policy, runtime='claude')
+        features = dict(kind='implementation', domain='python', operation='fix',
+            localization='known', coupling='local', verification='tests', clarity='clear',
+            risk='low', scope_size='small', runtime='claude', model='deepseek-flash',
+            effort='medium', context_version='deadline-v1')
+        plan = coordination.plan_task(self.source, task['id'], dict(classification='substantial',
+            deliverables=[dict(id='fix', kind='implementation', scope=['calc.py'],
+                executor='auto', acceptance=['checks pass within timeout'], dependencies=[],
+                checks=["python3 -c 'import time; time.sleep(3)'"], features=features)]))
+        aid = plan['assignments'][0]['id']
+        started = time.monotonic()
+        result = managed.run(self.args(self.task('fix', sibling), timeout=2,
+            coord_task=task['id'], coord_assignment=aid), policy, worker, copy)
+        self.assertEqual(result, 124)
+        self.assertLess(time.monotonic() - started, 4)
+        row = coordination.load_task(self.source, task['id'])['assignments'][0]
+        self.assertEqual(row['status'], 'failed')
+        self.assertEqual(row['error_kind'], 'environment')
+        self.assertEqual(row['checks'][0]['exit_code'], 124)
+
+    def test_preparation_revalidates_policy_and_head_before_credentials(self):
+        original_probe = managed.development.probe
+        for change in ('disabled', 'revoked', 'head'):
+            with self.subTest(change=change):
+                activation.set_enabled(self.source, True)
+                settings.set_values(self.source / settings.PROJECT_FILE, access='full-access')
+                policy = settings.resolve(self.source)
+                copy = workspace.create(self.source, self.state)
+                def probe(*args, **kwargs):
+                    original_probe(*args, **kwargs)
+                    if change == 'disabled':
+                        activation.set_enabled(self.source, False)
+                    elif change == 'revoked':
+                        settings.set_values(self.source / settings.PROJECT_FILE, access='read-only')
+                    else:
+                        subprocess.run(['git', '-C', str(self.source), '-c', 'user.name=Test',
+                            '-c', 'user.email=test@example.test', 'commit', '-qm', 'changed',
+                            '--allow-empty'], check=True, capture_output=True)
+                with patch.object(managed.development, 'probe', side_effect=probe), \
+                     patch.object(worker, 'load_api_key', side_effect=AssertionError('stale credential access')):
+                    with self.assertRaises(worker.WorkerError):
+                        managed.run(self.args('bounded work'), policy, worker, copy)
+
     def _assert_post_start_preparation_failure_is_reconciled(self, failure_point):
         settings.set_values(
             self.source / '.deepseek-team.toml',
             delegation_level='auto', access='full-access')
         policy = self.policy('auto', 'full-access')
         service = RoutingService(self.source)
-        service.configure({'recovery_rate': .25})
+        service.configure({'recovery_rate': .25, 'admission_policy': 'evidence'})
         copy, sibling = [workspace.create(self.source, self.state) for _ in range(2)]
         task = coordination.open_task(
             self.source, session_id='session-' + failure_point,

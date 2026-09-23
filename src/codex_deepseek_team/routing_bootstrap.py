@@ -45,7 +45,9 @@ def initialize(conn):
         config = validate_config(read_json(saved[0]) if saved else {})
         for (raw,) in conn.execute('SELECT value FROM observations'):
             row = read_json(raw)
-            if row['origin'] == 'local' and row['action'] == 'worker' and row['outcome'] in ('rework', 'rejected'):
+            if (row['origin'] == 'local' and row['action'] == 'worker'
+                    and (row['outcome'] == 'rejected'
+                         or (row['outcome'] == 'rework' and config['admission_policy'] == 'evidence'))):
                 routing_recovery.record_failure(conn, row['features'], config, now=row['observed_at'])
 
 

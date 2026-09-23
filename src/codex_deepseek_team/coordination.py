@@ -401,9 +401,11 @@ def _prepare_routing(root, task, items, service):
         requested = item['executor']
         if requested == 'auto' and service.config()['mode'] != 'auto':
             raise CoordinationError('executor:auto requires routing mode auto.', 64)
+        from .routing_immediate import manual_acceptance
         decision = service.predict(item['features'], access=task['policy']['effective_access'],
                                    binding=_binding(task['id'], item),
-                                   recovery=requested == 'auto' and task['policy']['delegation_level'] == 'auto' and bool(item['checks']))
+                                   recovery=requested == 'auto' and task['policy']['delegation_level'] == 'auto'
+                                   and (bool(item['checks']) or manual_acceptance(item)))
         if requested == 'auto':
             item['executor'] = 'worker' if decision['action'] == 'worker' else 'coordinator'
         item['routing'] = {'decision_id': decision['id'], 'requested_executor': requested,
@@ -618,6 +620,21 @@ def _check_assignment_access(root, task, item):
         raise CoordinationError('Current access does not permit this worker writing assignment; revise the plan.', 78)
 
 
+def assignment_queue_state(root: Path, task_id: str, assignment_id: str, state: str) -> None:
+    """Expose scheduling without changing executor, retry history or start state."""
+    if state not in ('waiting', 'ready', 'blocked', 'cancelled'):
+        raise CoordinationError('Invalid worker queue state.', 64)
+    with _lock(root):
+        task = load_task(root, task_id)
+        row = _assignment(task, assignment_id)
+        row['queue_state'] = state
+        row['queue_updated_at'] = time.time()
+        if state == 'waiting':
+            row.setdefault('queued_at', row['queue_updated_at'])
+        task['updated_at'] = row['queue_updated_at']
+        _atomic(_task_path(root, task_id), task)
+
+
 def assignment_started(root: Path, task_id: str, assignment_id: str,
                        workspace_id: str, runtime: str,
                        prepared_changes: list[str], effort: str | None = None) -> dict:
@@ -665,14 +682,16 @@ def assignment_started(root: Path, task_id: str, assignment_id: str,
                 decision = (service.decision(item['routing']['decision_id']) if auto else
                             service.predict(features, access=task['policy']['effective_access']))
                 if auto:
-                    service.start_recovery(decision['id'])
+                    service.start_recovery(decision['id'],
+                        access=_effective_task_access(task, settings.resolve(root)))
             except RoutingError as error:
                 raise CoordinationError(error.message, error.code) from None
             row['routing_features'] = features
             row['routing_decision_id'] = decision['id']
         row.update(status="running", workspace_id=workspace_id, runtime=runtime,
                    effort=effort, prepared_changes=sorted(set(prepared_changes)),
-                   started_at=time.time(), disposition=None, error_kind=None, exit_code=None)
+                   started_at=time.time(), disposition=None, error_kind=None, exit_code=None,
+                   queue_state='running')
         task.update(status="active", updated_at=time.time())
         _atomic(_task_path(root, task_id), task)
         return task
@@ -695,7 +714,8 @@ def assignment_finished(root: Path, task_id: str, assignment_id: str,
             raise CoordinationError('Unknown worker failure classification.', 64)
         row.update(status=status, result_summary=str(result_summary)[:4000],
                    worker_changes=sorted(set(worker_changes)), checks=list(checks),
-                   finished_at=time.time(), error_kind=error_kind, exit_code=exit_code)
+                   finished_at=time.time(), error_kind=error_kind, exit_code=exit_code,
+                   queue_state='finished')
         if status == 'failed' and row.get('routing_features'):
             outcome = {'verification': 'rejected', 'provider': 'infrastructure',
                        'environment': 'infrastructure', 'cancelled': 'cancelled'}.get(error_kind, 'unknown')
@@ -949,6 +969,13 @@ def summary(task: dict) -> str:
         text = f"- {row['id']} deliverable={row['deliverable_id']} status={row['status']}"
         if row.get("effort"):
             text += f"; effort={row['effort']}"
+        if row.get('queue_state'):
+            text += f"; queue={row['queue_state']}"
+        if row.get('checks'):
+            passed = sum(check.get('exit_code') == 0 for check in row['checks'])
+            text += f"; checks_passed={passed}; checks_failed={len(row['checks']) - passed}"
+        if row.get('worker_changes'):
+            text += '; files=' + ', '.join(row['worker_changes'][:10])
         if row.get("result_summary"):
             text += f"; result={row['result_summary'][:500]}"
         if row.get("disposition"):

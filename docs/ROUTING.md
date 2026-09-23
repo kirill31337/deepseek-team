@@ -1,6 +1,6 @@
 # Hybrid delegation routing
 
-DeepSeek Team can combine a bounded prior from imported public results with outcomes observed in the current project. Auto moves between bootstrap, adaptive selection and recovery as evidence changes for each task family and execution context. It stores routing state privately for each project and records explainable decisions. It does not fine-tune a model, promise a benchmark score, or treat a public leaderboard percentage as the probability of success on your code.
+DeepSeek Team can combine a bounded prior from imported public results with outcomes observed in the current project. Auto defaults to immediate admission of eligible work; the evidence-driven bootstrap/adaptive/recovery policy is opt-in. It stores routing state privately for each project and records explainable decisions. It does not fine-tune a model, promise a benchmark score, or treat a public leaderboard percentage as the probability of success on your code.
 
 Every command takes `--path PROJECT`. Commands return JSON so results can be inspected or passed to other tools. `status` reports the current state; `config --json` prints the effective routing configuration.
 
@@ -17,8 +17,8 @@ Routing is not a trained neural classifier and not a fixed delegation percentage
 flowchart TD
     T[Task] --> C["Classifier: the coordinator fills a feature card before execution"]
     C --> E["Estimator: probability of acceptance without rework, with uncertainty"]
-    E --> S["Auto stage: bootstrap, adaptive or recovery"]
-    S --> R["Router: worker, coordinator or abstain, within access and trial limits"]
+    E --> S["Admission policy: immediate by default, evidence opt-in"]
+    S --> R["Router: worker, coordinator or abstain, within access and admission rules"]
     R --> X["Execution, coordinator review and integration"]
     X --> O["Observed outcome and actual total cost"]
     O --> E
@@ -46,13 +46,13 @@ Public evidence enters only through explicit import: the operator supplies an HT
 
 ### Router — a conservative executor choice
 
-The router turns the estimate into an executor choice. Its learned recommendation applies these checks:
+The router turns the estimate into an executor choice. Its learned recommendation (separate from immediate assignment admission) applies these checks:
 
 1. Permissions and protected responsibilities. Protected work, write tasks without `full-access`, and disabled routing stay with the coordinator.
 2. A conservative quality bound: the lower end of the acceptance interval must clear `min_success_probability`, and there must be enough comparable local support.
 3. Measured cost: the full worker total (execution plus coordinator review and rework) is compared with comparable coordinator observations. Missing evidence prevents a learned recommendation of measured savings, unless the cost gate was explicitly disabled with `--no-require-cost-evidence`.
 
-The default quality threshold is 80% at the lower end of a 95% interval, with at least five effective local observations; similarity and age can make one observation count for less than one. The default cost gate requires at least 10% measured savings. These are configurable decision rules, not guarantees about the next task. Auto can also admit bounded bootstrap, cost-learning or recovery assignments of safe ordinary tasks, as described below. Sufficient comparable cost evidence showing savings below the threshold blocks all such trials.
+The default quality threshold is 80% at the lower end of a 95% interval, with at least five effective local observations; similarity and age can make one observation count for less than one. The default cost gate requires at least 10% measured savings. These are configurable decision rules, not guarantees about the next task. Under the opt-in `evidence` policy, Auto can also admit bounded bootstrap, cost-learning or recovery assignments of safe ordinary tasks, as described below. Sufficient comparable cost evidence showing savings below the threshold blocks all such trials.
 
 The ordinary recommendation is `worker`, `coordinator` or `abstain`. In `auto` mode a plan's `executor: auto` resolves to a concrete executor; an abstention leaves the task with the coordinator and records why. Explicit `worker` or `coordinator` choices are never overwritten, and saved manual `25`/`50`/`75` profiles keep priority while their outcomes keep feeding the same evidence. Fresh `delegation_level=auto, access=auto` settings resolve to `read-only`; worker writes require an explicit access grant.
 
@@ -60,7 +60,7 @@ The ordinary recommendation is `worker`, `coordinator` or `abstain`. In `auto` m
 
 After each assignment the coordinator records what actually happened: an observed outcome (`accepted` means accepted without rework; `rework` and `rejected` are quality failures; `infrastructure`, `cancelled` and `unknown` stay unlabelled) and the actual total cost. Those observed worker and coordinator results become the evidence for later estimates. The system compares real recorded outcomes; it does not estimate a counterfactual result for the executor that was not chosen.
 
-At a cold start, Auto can immediately assign eligible safe tasks through bootstrap. As evidence accumulates, the policy chooses its stage automatically: adaptive selection once quality is supported, or slower recovery when comparable local failures leave it unsupported. See [Automatic stages within Auto](#automatic-stages-within-auto). These assignments are regular reviewed tasks, not extra paid benchmarks, and never override explicit choices, manual profiles, access, safety or the disabled state.
+At a cold start, `immediate` admits eligible bounded work without waiting for history. Quality and cost estimates keep updating; unknown cost never becomes claimed savings.
 
 ### A small example: known before execution vs observed later
 
@@ -82,7 +82,7 @@ The feature card tells the estimator which cases are comparable before the task 
 
 ## Modes and executor selection
 
-Fresh installations default to automatic delegation level selection (`delegation_level = "auto"`) and routing mode `auto`, with effective access `read-only`. Bootstrap, adaptive selection and recovery are automatic stages within Auto; there is no stage flag to select manually. Bootstrap supplies initial evidence through bounded, verifiable low-risk tasks that fit the configured access. Public imports provide only a weak, capped prior and never start extra paid experiments automatically.
+Fresh installations use `delegation_level="auto"`, routing mode `auto`, `admission_policy="immediate"`, and effective access `read-only`. Explicitly select `deepseek-team config set --project --access full-access` for implementation. Public imports never launch extra paid experiments.
 
 An existing saved numeric delegation preference is not silently overwritten. The manual `25`, `50`, and `75` profiles remain available and their real worker outcomes continue to supply local evidence:
 
@@ -97,7 +97,7 @@ Routing modes are:
 - `advisory` returns a recommendation for the coordinator to review.
 - `auto` may resolve an explicitly requested `executor: auto`. Existing plans with an explicit worker or coordinator keep their executor. If the policy abstains, the coordinator retains the task and the reason is recorded.
 
-Automatic routing cannot widen the configured access level. Architecture, security, integration, final verification, commit/push, production, and secret-signing work remains coordinator-owned. Unknown or high risk and weak verification prevent automatic trial admission. Insufficient local or cost evidence leaves the task with the coordinator unless it qualifies for one of the bounded admissions below.
+Automatic routing cannot widen the configured access level. Architecture, security, integration, final verification, commit/push, production, and secret-signing work remains coordinator-owned. Unknown or high risk and weak verification prevent automatic trial admission. Missing local history or costs do not block eligible assignments under `immediate`.
 
 Configure only the values you want to change:
 
@@ -114,13 +114,44 @@ deepseek-team routing configure --path /path/to/repository \
   --min-similarity 0.60 \
   --minimum-savings-fraction 0.10 \
   --recovery-rate 0.10 \
-  --recovery-cooldown-seconds 3600 \
+  --recovery-cooldown-seconds 300 \
   --require-cost-evidence
 ```
 
 Use `--no-require-cost-evidence` only when you intentionally want learned recommendations without measured cost comparisons. Confidence bounds and minimum evidence rules still apply to those recommendations. This option is not needed to enable bootstrap or cost learning.
 
-## Automatic stages within Auto
+## Immediate admission by default
+
+**Auto delegates useful bounded work immediately by default** (`admission_policy=immediate`). Small or medium tasks with low or medium risk, known or partial localization, local or component coupling, clear requirements and declared tests or a reproducer can be assigned from the first session. Manual verification is allowed for read, review, research, diagnostic, test-plan and documentation tasks with explicit acceptance criteria. Implementation requires executable checks and `full-access`.
+
+There is no cold-start history wait, three-assignment cap, periodic coordinator holdout or recovery stride. Unknown costs stay unknown and do not block eligible work; supported poor measured economics still veto delegation. One rework is recorded without a family pause. A rejection or three distinct rework cases within the cooldown window pause the family, by default for 300 seconds; saved cooldown values are respected. Immediate admission resumes after the pause without a trial quota. Failed implementation never retries automatically.
+
+Fresh Auto access remains **read-only**. To delegate implementation, explicitly opt in:
+
+```bash
+deepseek-team config set --project --access full-access
+```
+
+The coordinator decomposes meaningful independent slices, reviews actual diffs and declared checks, and reports accepted work and rework without repeating the worker's investigation or inventing percentage savings. Architecture, security, integration, final verification, commits and production remain coordinator-owned. Saved manual profiles, explicit permissions and `off` retain priority. The previous bootstrap/adaptive/recovery policy is opt-in through `deepseek-team routing configure --admission-policy evidence`.
+
+### Worker queue and parallel execution
+
+Eligible assignments remain assigned to workers when execution slots are busy. Assignment is separate from execution: launches wait FIFO, with **8 concurrent workers by default**, configurable from 1 to 64. Each managed assignment needs an owned isolated copy; parallel work must be independent.
+
+```bash
+deepseek-team config set --project --max-workers 8
+# Or save a user-wide limit:
+deepseek-team config set --global --max-workers 8
+# One-job override:
+deepseek-team worker --runtime codex --max-workers 4
+```
+
+Default waiting and total timeout are unlimited. `worker --no-wait` returns capacity exit code `75` when no slot is available; explicit `--timeout` includes queue time. Before provider launch or credential access, queued work rechecks `off`, access, routing authorization and project HEAD. Waiting never widens permissions. The required OS sandbox, private network and fixed relay for managed copies are unchanged.
+
+
+## Automatic stages under the evidence policy
+
+This section applies only after explicitly choosing `deepseek-team routing configure --admission-policy evidence`. It retains the previous stages and trial limits; these do not apply to `immediate`.
 
 When both the delegation profile and routing mode are `auto`, a plan's `executor: auto` can receive a bounded worker trial. Trials require a complete feature card: low risk, small scope, local coupling, known localization, clear requirements, verification through `tests` or a `reproducer`, and concrete registered checks. The task must also fit the configured access and the worker must be available. A standalone recommendation does not reserve or launch a trial.
 
@@ -148,7 +179,7 @@ After the cooldown, the first eligible recovery case can be selected. Subsequent
 
 At most **three bootstrap or recovery tickets combined** may be pending or running across the project. At most **one** of those may be a recovery ticket. Cost-learning assignments use bootstrap admission and share these limits. This cap covers bounded trials; the worker runner separately enforces its concurrency limit.
 
-An unused pending ticket expires after one hour. Running tickets never expire automatically and are never automatically retried. A worker quality failure starts `recovery_cooldown_seconds` for the same family and execution context; the default is one hour and the allowed range is `0` through `2592000` seconds. A running assignment must be inspected and dispositioned through the normal coordination flow.
+An unused pending ticket expires after one hour. Running tickets never expire automatically and are never automatically retried. A worker quality failure starts `recovery_cooldown_seconds` for the same family and execution context; the saved setting is respected and the new default is 300 seconds and the allowed range is `0` through `2592000` seconds. A running assignment must be inspected and dispositioned through the normal coordination flow.
 
 The existing recovery status command covers both admission types. It reports each ticket's `admission` (`bootstrap` or `recovery`), bootstrap pending/running counts, the active recovery count, and the shared limit. A cost-learning decision in the adaptive stage has `phase: adaptive`; its ticket reports `admission: bootstrap`.
 

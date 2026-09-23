@@ -12,12 +12,14 @@ import tempfile
 import tomllib
 from types import MappingProxyType
 from typing import Mapping
+from .worker_slots import DEFAULT_MAX_WORKERS, MAX_MAX_WORKERS
 
 PROJECT_FILE = '.deepseek-team.toml'
 LEVELS = ('auto', 25, 50, 75)
 ACCESS = ('auto', 'read-only', 'full-access')
 EFFORT = ('auto', 'low', 'medium', 'high')
-DEFAULTS = {'delegation_level': 'auto', 'access': 'auto', 'effort': 'auto'}
+DEFAULTS = {'delegation_level': 'auto', 'access': 'auto', 'effort': 'auto',
+            'max_workers': DEFAULT_MAX_WORKERS}
 
 
 class SettingsError(Exception):
@@ -45,6 +47,7 @@ class Policy:
     effort: str = 'auto'
     enabled: bool = True
     enabled_source: str = 'default'
+    max_workers: int = DEFAULT_MAX_WORKERS
 
     @property
     def effective_access(self) -> str:
@@ -71,7 +74,7 @@ class Policy:
             'effective_access_source': (
                 f'profile:{self.delegation_level} (access=auto)' if self.access == 'auto'
                 else self.sources['access']),
-            'max_workers': 3,
+            'max_workers': self.max_workers,
             'percentage_is_target_not_measurement': True,
         }
 
@@ -107,7 +110,7 @@ def project_root(path: Path | None = None, *, required: bool = False) -> Path | 
 
 def _validate(values: dict) -> None:
     if set(values) - set(DEFAULTS):
-        raise SettingsError('Only delegation_level, access and effort are allowed in delegation settings.')
+        raise SettingsError('Only delegation_level, access, effort and max_workers are allowed in delegation settings.')
     if 'delegation_level' in values:
         level = values['delegation_level']
         valid = (type(level) is str and level == 'auto') or (
@@ -118,6 +121,9 @@ def _validate(values: dict) -> None:
         raise SettingsError('access must be auto, read-only or full-access.')
     if 'effort' in values and values['effort'] not in EFFORT:
         raise SettingsError('effort must be auto, low, medium or high.')
+    if 'max_workers' in values and (type(values['max_workers']) is not int
+                                  or not 1 <= values['max_workers'] <= MAX_MAX_WORKERS):
+        raise SettingsError('max_workers must be an integer from 1 through 64.')
 
 
 def _read(path: Path) -> bytes | None:
@@ -149,6 +155,7 @@ def read_values(path: Path) -> dict:
 
 def resolve(root: Path | None = None, *, delegation_level: str | int | None = None,
             access: str | None = None, effort: str | None = None,
+            max_workers: int | None = None,
             global_path: Path | None = None) -> Policy:
     """Resolve both fields independently and freeze a new-job policy snapshot."""
     values = dict(DEFAULTS)
@@ -162,7 +169,7 @@ def resolve(root: Path | None = None, *, delegation_level: str | int | None = No
         for key, value in read_values(path).items():
             values[key], sources[key] = value, f'{label}:{path}'
     overrides = {k: v for k, v in {
-        'delegation_level': delegation_level, 'access': access, 'effort': effort,
+        'delegation_level': delegation_level, 'access': access, 'effort': effort, 'max_workers': max_workers,
     }.items() if v is not None}
     _validate(overrides)
     for key, value in overrides.items():
@@ -170,18 +177,19 @@ def resolve(root: Path | None = None, *, delegation_level: str | int | None = No
     from . import activation
     active = activation.resolve(project)
     return Policy(values['delegation_level'], values['access'], MappingProxyType(sources),
-                  values['effort'], active.enabled, active.source)
+                  values['effort'], active.enabled, active.source, values['max_workers'])
 
 
 def set_values(path: Path, *, delegation_level: str | int | None = None,
-               access: str | None = None, effort: str | None = None) -> bool:
+               access: str | None = None, effort: str | None = None,
+               max_workers: int | None = None) -> bool:
     """Atomic partial update: changing a level never implicitly resets access."""
     changes = {k: v for k, v in {
-        'delegation_level': delegation_level, 'access': access, 'effort': effort,
+        'delegation_level': delegation_level, 'access': access, 'effort': effort, 'max_workers': max_workers,
     }.items() if v is not None}
     _validate(changes)
     if not changes:
-        raise SettingsError('Specify --delegation-level, --access and/or --effort.')
+        raise SettingsError('Specify --delegation-level, --access, --effort and/or --max-workers.')
     path = Path(path)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     parent = path.parent.lstat()
@@ -240,7 +248,8 @@ def describe(policy: Policy) -> str:
         f'effective_access: {policy.effective_access} (source={data["effective_access_source"]})',
         f'effort: {policy.effort} (source={policy.sources.get("effort", "default")}; '
         + ('frontier chooses low/medium/high per assignment' if policy.effort == 'auto' else 'forced for new DeepSeek jobs') + ')',
-        'max_workers: 3; total_timeout: unlimited by default',
+        f'max_workers: {policy.max_workers} (source={policy.sources.get("max_workers", "default")}); '
+        'additional workers wait in FIFO order; total_timeout: unlimited by default',
     ))
 
 
@@ -295,16 +304,16 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
     )
 
     full_profiles = {
-        'auto': 'Delegation depth is adaptive (auto), not a fixed target: register separable implementation, test, fixture, documentation or review slices with executor:auto. Safe small tasks actively gather evidence at cold start; the router automatically chooses bootstrap, adaptive or recovery for each comparable category.',
+        'auto': 'Auto delegates suitable work immediately by default. Actively split substantial work into meaningful independent implementation, test, fixture, documentation and review deliverables with executor:auto. Prepare interfaces and acceptance criteria before assigning; do not retain eligible work merely because history is missing or worker slots are busy.',
         25: 'Delegate bounded research, diagnosis and independent review. The coordinator performs the main implementation.',
         50: 'Delegate at least one separable implementation/test/docs slice when such work exists; coordinator defines architecture/interfaces and integrates.',
-        75: 'Delegate most separable implementation, tests, fixtures, documentation, non-secret metadata and independent review before doing that same work yourself. Use up to three workers only for genuinely independent assignments.',
+        75: 'Delegate most separable implementation, tests, fixtures, documentation, non-secret metadata and independent review before doing that same work yourself. Run independent assignments concurrently within the configured capacity; additional jobs queue.',
     }
     read_only_profiles = {
-        'auto': 'Delegation depth is adaptive (auto), not a fixed target: register bounded research, diagnosis, design validation and independent review with executor:auto. Safe small tasks actively gather evidence at cold start; stages change automatically. Read-only auto never delegates writing tasks.',
+        'auto': 'Auto delegates suitable bounded research, diagnosis, design validation and independent review immediately with executor:auto and explicit acceptance criteria. Read-only auto never delegates writing tasks.',
         25: 'Delegate bounded research, diagnosis and independent review. The coordinator performs the main implementation.',
         50: 'Delegate substantial investigation, design validation, test planning and independent review before the coordinator implements the corresponding changes.',
-        75: 'Delegate most separable analysis, diagnostics, design validation, test planning and independent review. Use up to three read-only workers only for genuinely independent assignments.',
+        75: 'Delegate most separable analysis, diagnostics, design validation, test planning and independent review. Run independent assignments concurrently within the configured capacity; additional jobs queue.',
     }
 
     if policy.effective_access == 'full-access':
@@ -336,16 +345,18 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
             'executor: "auto" together with a "features" card capturing the task before execution: '
             'kind, domain, operation, localization, coupling, verification, clarity, risk, scope_size, '
             'runtime, model, effort and context_version. The coordinator classifies the task; the router '
-            'resolves its saved feature card. Workers must not self-select a profile or stage. Auto '
-            'automatically selects bootstrap, adaptive or recovery per comparable task category. '
-            'Bootstrap admits safe, small, known/local tasks with concrete checks without a recovery '
-            'stride, up to three pending/running trials project-wide. Every tenth eligible bootstrap '
-            'or cost-learning opportunity in that category stays with the coordinator for comparison. '
-            'Missing data is not negative evidence: bootstrap continues until quality is supported; '
-            'unknown prices permit bounded cost learning, never invented savings. Supported poor '
-            'economics veto trials. Actual quality failures pause the affected family for one hour '
-            'by default; unsupported quality then uses recovery (one active trial and the configured '
-            'opportunity spacing within the shared three-slot cap). There is no manual stage switch. '
+            'resolves its saved feature card. Workers must not self-select a profile or stage. '
+            'The default admission_policy is immediate: suitable small/medium low/medium-risk '
+            'local/component tasks with clear requirements, known/partial localization and declared '
+            'tests or a reproducer can start without prior evidence. Read-only deliverables and '
+            'documentation may use explicit manual acceptance criteria. High/protected/unknown-risk, '
+            'unbounded or unverifiable work stays with the coordinator. There is no initial trial '
+            'quota or periodic coordinator holdout. Missing data and unknown prices do not block '
+            'suitable work and never imply measured savings; supported poor economics still veto '
+            'delegation. A rejected result or three distinct recent rework cases pause only that '
+            'family for the configured cooldown (300 seconds by default). One rework is recorded '
+            'without pausing the family; after a pause immediate admission resumes. '
+            'Explicit admission_policy=evidence retains bootstrap/adaptive/recovery compatibility. '
             'There is no automatic paid exploration outside the '
             'normal task stream and no automatic permission widening; keep the resolved access and explicit executor '
             'choices. Inspect adaptive routing state with deepseek-team routing status and adjust it '
@@ -399,6 +410,10 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
         f'### Effective delegation profile: {label} / {policy.effective_access}; '
         f'effort={policy.effort}\n'
         + common + guidance + '\n' + adaptive + access + process
+        + f'Execution capacity is {policy.max_workers}; configure max_workers independently of access. '
+          'Plan all eligible deliverables; launch independent jobs concurrently and let excess jobs wait '
+          'in FIFO order. Capacity is not a reason to retain their implementation with the coordinator. '
+          'Report accepted work, verification results and any rework; only report money savings when measured.\n'
         + 'While a worker runs, work only on independent scope. Review the actual diff and recorded '
           'checks without repeating the whole investigation or rewriting correct code. DeepSeek workers never '
           'stage, commit, push, publish, deploy, access production services or delegate.\n'

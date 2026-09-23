@@ -256,7 +256,7 @@ def mark_started(conn, ticket_id, *, now=None) -> dict:
             'reason': status}
 
 
-def finish(conn, ticket_id, outcome, *, now=None) -> dict:
+def finish(conn, ticket_id, outcome, *, now=None, start_cooldown=True) -> dict:
     """Resolve a selected ticket, allowing monotonic corrections to failures."""
     timestamp = _epoch(now)
     _require_transaction(conn)
@@ -281,7 +281,7 @@ def finish(conn, ticket_id, outcome, *, now=None) -> dict:
         if new_rank > old_rank:
             conn.execute('UPDATE routing_recovery_tickets SET outcome = ? WHERE ticket_id = ?',
                          (outcome, ticket_id))
-            if _is_failure(outcome):
+            if start_cooldown and _is_failure(outcome):
                 _start_cooldown(conn, bucket, cooldown_seconds, timestamp)
             return {'ticket_id': ticket_id, 'status': status, 'outcome': outcome,
                     'labelled': _is_failure(outcome), 'changed': True, 'reason': 'corrected'}
@@ -292,7 +292,7 @@ def finish(conn, ticket_id, outcome, *, now=None) -> dict:
     conn.execute(
         'UPDATE routing_recovery_tickets SET status = ?, outcome = ?, closed_at = ? '
         'WHERE ticket_id = ?', (STATUS_RESOLVED, outcome, timestamp, ticket_id))
-    if _is_failure(outcome):
+    if start_cooldown and _is_failure(outcome):
         _start_cooldown(conn, bucket, cooldown_seconds, timestamp)
     return {'ticket_id': ticket_id, 'status': STATUS_RESOLVED, 'outcome': outcome,
             'labelled': _is_failure(outcome), 'changed': True, 'reason': 'resolved'}

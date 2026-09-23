@@ -28,7 +28,8 @@ class IntegrationTests(unittest.TestCase):
         settings.set_values(self.root / '.deepseek-team.toml', delegation_level=75, access='full-access')
         self.policy = settings.Policy('auto', 'full-access', {'access': 'test', 'delegation_level': 'test'})
         self.service = RoutingService(self.root)
-        self.service.configure({'recovery_rate': 0})
+        self.service.configure({'recovery_rate': 0, 'admission_policy': 'evidence',
+                                'recovery_cooldown_seconds': 3600})
         self.features = dict(kind='implementation', domain='python', operation='fix', localization='known',
             coupling='local', verification='tests', clarity='clear', risk='low', scope_size='small',
             runtime='codex', model='deepseek-flash', effort='medium', context_version='default')

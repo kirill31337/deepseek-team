@@ -51,8 +51,10 @@ def _parser() -> argparse.ArgumentParser:
     configure = commands.add_parser('configure')
     _add_path(configure)
     configure.add_argument('--mode', choices=('off', 'shadow', 'advisory', 'auto'))
+    configure.add_argument('--admission-policy', choices=('immediate', 'evidence'),
+                           help='immediate delegates suitable tasks from first use (default).')
     for key in DEFAULT_CONFIG:
-        if key in ('mode', 'require_cost_evidence'):
+        if key in ('mode', 'admission_policy', 'require_cost_evidence'):
             continue
         configure.add_argument('--' + key.replace('_', '-'), dest=key, type=float)
     configure.add_argument('--require-cost-evidence', action=argparse.BooleanOptionalAction,

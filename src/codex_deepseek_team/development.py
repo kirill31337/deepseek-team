@@ -12,6 +12,7 @@ import shutil
 import shlex
 import subprocess
 import sys
+import time
 
 from . import relay, sandbox
 
@@ -221,14 +222,18 @@ def missing_requirements(args: list[str], env: dict[str, str], item: dict) -> li
 
 
 def run_checks(args: list[str], env: dict[str, str], commands: list[str],
-               timeout: float = 120) -> list[dict]:
+               timeout: float = 120, *, deadline: float | None = None) -> list[dict]:
     """Run declared verification inside the same sparse/no-network sandbox."""
     results = []
     for command in commands:
+        remaining = min(timeout, deadline - time.monotonic()) if deadline is not None else timeout
+        if remaining <= 0:
+            results.append({'command': command, 'exit_code': 124})
+            break
         try:
             result = subprocess.run(
                 [*args, '--', '/bin/sh', '-lc', command],
-                env=env, text=True, capture_output=True, timeout=timeout, check=False)
+                env=env, text=True, capture_output=True, timeout=remaining, check=False)
             results.append({'command': command, 'exit_code': result.returncode})
         except subprocess.TimeoutExpired:
             results.append({'command': command, 'exit_code': 124})

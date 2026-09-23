@@ -22,7 +22,7 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
     effort = api.DEFAULT_EFFORT if requested_effort in (None, 'auto') else api.effort_level(requested_effort)
     if not task.strip():
         raise api.WorkerError(64, 'Pass a task on stdin or as one argument.')
-    slot = api.acquire_slot(args.state_dir)
+    slot = api.acquire_job_slot(args, policy=policy, root=copy.source if copy else Path.cwd())
     started = time.monotonic()
     try:
         runtime, binary = api.resolve_runtime(args.runtime, args.codex, args.claude)
@@ -76,6 +76,7 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
                     prepared_changes, _ignored = copy.changes()
                     coord_before = workspace.content_snapshot(copy)
                 # Only after the actual namespace/readiness probes have succeeded.
+                args.validate_admission()
                 key = api.load_api_key()
                 if not key.strip():
                     raise api.WorkerError(78, 'Provider credential is absent; configure it locally. Workspace retained.')
@@ -95,8 +96,11 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
                                          configuration_sources=dict(policy.sources), runtime=runtime,
                                          model=api.MODEL, effort=effort)
                     copy.save()
+                    args.validate_admission(started=coord_started)
                     with relay.ProviderRelay(control / 'provider.sock', key) as provider:
-                        timeout = max(0.001, args.timeout - (time.monotonic() - started)) if args.timeout else None
+                        timeout = args.job_deadline - time.monotonic() if args.job_deadline else None
+                        if timeout is not None and timeout <= 0:
+                            raise api.WorkerError(124, 'DeepSeek worker exceeded its total timeout before execution.')
                         execution_started = True
                         code, out, err = api.execute(development.bridge_command(layout), env, task, timeout)
                         message, errors, completed = api.runtime_result(runtime, out)
@@ -105,11 +109,12 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
                         check_results = []
                         if code == 0 and coord_item is not None:
                             check_results = development.run_checks(
-                                layout, env, coord_item.get('checks', []))
+                                layout, env, coord_item.get('checks', []), deadline=args.job_deadline)
                             if any(row['exit_code'] != 0 for row in check_results):
-                                code = 65
+                                code = 124 if any(row['exit_code'] == 124 for row in check_results) else 65
                                 errors = (errors + '\nDeclared workspace verification failed.').strip()
                         kind = ('provider' if provider.failures else
+                                'environment' if any(row['exit_code'] == 124 for row in check_results) else
                                 'verification' if any(row['exit_code'] != 0 for row in check_results) else 'execution')
                         worker_changes = (workspace.changed_since(copy, coord_before)
                                           if coord_before is not None else [])
@@ -136,6 +141,9 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
                         'changed_files': result['changed_files'],
                         'ignored_artifacts': result['ignored_artifacts'],
                         'elapsed_seconds': round(time.monotonic() - started, 3),
+                        'queue_seconds': round(args.queue_seconds, 3),
+                        'checks_passed': sum(row['exit_code'] == 0 for row in check_results),
+                        'checks_failed': sum(row['exit_code'] != 0 for row in check_results),
                     }), file=api.sys.stderr)
                     return code
                 except BaseException as error:

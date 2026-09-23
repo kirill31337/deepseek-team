@@ -60,6 +60,9 @@ if mode == "secret":
     prompt = os.environ["DEEPSEEK_API_KEY"]
 if mode == "sleep":
     time.sleep(1)
+if mode == "hold":
+    while not (root / "release").exists():
+        time.sleep(0.01)
 print(json.dumps({"type":"item.completed", "item":{"type":"reasoning", "text":"PRIVATE_REASONING"}}))
 print(json.dumps({"type":"item.completed", "item":{"type":"agent_message", "text":prompt}}))
 print(json.dumps({"type":"turn.completed", "usage":{"input_tokens":1,"output_tokens":1}}))
@@ -87,7 +90,7 @@ wire_api = "responses"
 ''')
         self.config_before = self.config.read_bytes()
         (self.user / 'auth.json').write_text('{"synthetic":true}')
-        for mode in ['ok', 'timeout', 'rate', 'error', 'secret', 'sleep',
+        for mode in ['ok', 'timeout', 'rate', 'error', 'secret', 'sleep', 'hold',
                      'events', 'events-error', 'recover']:
             fake = self.root / f'codex-{mode}'
             fake.write_text(FAKE)
@@ -376,11 +379,32 @@ wire_api = "responses"
 
     def test_two_independent_workers_and_three_slot_limit(self):
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-            results = list(pool.map(lambda n: self.run_worker(task=f'task {n}', mode='sleep'), range(4)))
+            pending = []
+            try:
+                for n in range(3):
+                    pending.append(pool.submit(self.run_worker, task=f'task {n}', mode='hold',
+                        args=['--max-workers', '3', '--no-wait']))
+                    deadline = time.monotonic() + 5
+                    while len(self.calls()) < n + 1 and time.monotonic() < deadline:
+                        time.sleep(0.01)
+                    self.assertEqual(len(self.calls()), n + 1, 'Worker did not acquire its slot')
+                refused = self.run_worker(args=['--max-workers', '3', '--no-wait'])
+            finally:
+                (self.root / 'release').touch()
+            results = [future.result() for future in pending] + [refused]
         self.assertEqual(sorted(r.returncode for r in results), [0, 0, 0, 75])
         successes = [r.stdout.strip() for r in results if r.returncode == 0]
         self.assertEqual(len(set(successes)), 3)
         self.assertEqual(len({c['home'] for c in self.calls()}), 3)
+
+    def test_more_jobs_than_capacity_wait_and_all_finish(self):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
+            results = list(pool.map(lambda n: self.run_worker(task=f'queued {n}', mode='sleep',
+                args=['--max-workers', '2']), range(5)))
+        self.assertEqual([r.returncode for r in results], [0] * 5,
+                         '\n'.join(r.stderr for r in results if r.returncode))
+        self.assertEqual(len(self.calls()), 5)
+        self.assertTrue(any('Queued:' in r.stderr for r in results))
 
 
 if __name__ == '__main__':
