@@ -1,17 +1,19 @@
-"""Persistent, conservative recovery scheduler for regular low-risk tasks.
+"""Persistent trial scheduler for regular low-risk tasks.
 
 The scheduler exists so that adaptive delegation cannot collapse permanently
 after a negative worker rating.  It selects at most one small, low-risk,
 fully specified fallback case at a time and then applies a global project-wide
 quota of one selection per ``ceil(1 / recovery_rate)`` distinct eligible
-binding opportunities.  It never widens caller access, never retries a paid
+binding opportunities. Bootstrap shares this lifecycle with up to three total
+trials, no recovery stride and a periodic coordinator comparison.
+It never widens caller access, never retries a paid
 call and never re-rolls a task that already produced an immutable result.
 
 Contract
 --------
 * :data:`SCHEMA` maps every created table/index name to its ``CREATE`` SQL.
-  Names are prefixed ``routing_recovery``; :func:`initialize` creates them and
-  never commits.
+  Names are prefixed ``routing_recovery``; :func:`initialize` creates them plus
+  bootstrap metadata and never commits.
 * :func:`consider`, :func:`mark_started`, :func:`finish` and :func:`release`
   mutate the caller's database and therefore require a caller-owned
   ``BEGIN IMMEDIATE`` transaction.  The module never begins, commits or rolls
@@ -24,6 +26,8 @@ from __future__ import annotations
 import time
 import uuid
 from decimal import Decimal
+
+from . import routing_bootstrap
 
 from .routing_models import (
     READ_KINDS,
@@ -130,9 +134,10 @@ def initialize(conn) -> None:
     """Create the recovery schema on ``conn`` without committing."""
     for statement in SCHEMA.values():
         conn.execute(statement)
+    routing_bootstrap.initialize(conn)
 
 
-def consider(conn, config, features, binding, *, now=None) -> dict:
+def consider(conn, config, features, binding, *, now=None, admission='recovery') -> dict:
     """Consider one candidate binding and maybe open a recovery ticket.
 
     Returns ``{'selected': bool, 'reason': str, 'ticket_id': str | None}``.
@@ -140,6 +145,8 @@ def consider(conn, config, features, binding, *, now=None) -> dict:
     mutates the caller's transaction for a fresh eligible binding.
     """
     timestamp = _epoch(now)
+    if admission not in ('bootstrap', 'recovery'):
+        raise RoutingError('Unknown automatic admission stage.')
     recovery = _recovery_config(config)
     validated = validate_features(features)
     binding_key = _binding_key(binding)
@@ -159,7 +166,7 @@ def consider(conn, config, features, binding, *, now=None) -> dict:
         return _not_selected(guard)
     if config.get('access') == 'read-only' and validated['kind'] in WRITE_KINDS:
         return _not_selected('guard_access')
-    if recovery['recovery_rate'] <= 0.0:
+    if admission == 'recovery' and recovery['recovery_rate'] <= 0.0:
         return _not_selected('disabled')
     ineligible = _ineligible_reason(validated)
     if ineligible is not None:
@@ -172,21 +179,28 @@ def consider(conn, config, features, binding, *, now=None) -> dict:
     if considered >= MAX_CONSIDERED_BINDINGS:
         raise RoutingError('Considered binding limit reached.')
 
-    opportunity, last_selection = _load_counters(conn)
-    ordinal = opportunity + 1
-    due = _selection_due(ordinal, last_selection, recovery['recovery_rate'])
     bucket = _bucket_key(validated)
+    opportunity, last_selection = _load_counters(conn)
+    ordinal = (routing_bootstrap.opportunity(conn, bucket) if admission == 'bootstrap'
+               else opportunity + 1)
+    due = (True if admission == 'bootstrap' else
+           _selection_due(ordinal, last_selection, recovery['recovery_rate']))
     active = conn.execute(
-        'SELECT 1 FROM routing_recovery_tickets WHERE status IN (?, ?) LIMIT 1',
-        ACTIVE_STATUSES).fetchone() is not None
+        'SELECT COUNT(*), SUM(CASE WHEN b.ticket_id IS NULL THEN 1 ELSE 0 END) '
+        'FROM routing_recovery_tickets t LEFT JOIN routing_bootstrap_tickets b '
+        'ON b.ticket_id=t.ticket_id WHERE t.status IN (?, ?)', ACTIVE_STATUSES).fetchone()
     cooling = _bucket_cooling(conn, bucket, timestamp)
 
     if not due:
         reason = 'quota'
-    elif active:
+    elif active[0] >= routing_bootstrap.MAX_ACTIVE_TRIALS:
+        reason = 'capacity'
+    elif admission == 'recovery' and active[1]:
         reason = 'active_ticket'
     elif cooling:
         reason = 'bucket_cooldown'
+    elif admission == 'bootstrap' and ordinal % routing_bootstrap.COORDINATOR_COMPARISON_INTERVAL == 0:
+        reason = 'coordinator_comparison'
     else:
         reason = 'selected'
     selected = reason == 'selected'
@@ -200,14 +214,18 @@ def consider(conn, config, features, binding, *, now=None) -> dict:
             'VALUES(?, ?, ?, ?, NULL, ?, ?, NULL, NULL, ?)',
             (ticket_id, binding_key, bucket, STATUS_PENDING, timestamp,
              timestamp + PENDING_TTL_SECONDS, recovery['recovery_cooldown_seconds']))
-        last_selection = ordinal
+        if admission == 'bootstrap':
+            conn.execute('INSERT INTO routing_bootstrap_tickets VALUES (?)', (ticket_id,))
+        else:
+            last_selection = ordinal
 
     conn.execute(
         'INSERT INTO routing_recovery_bindings(binding_id, features_fingerprint, bucket_id, '
         'ordinal, selected, ticket_id, reason, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)',
         (binding_key, features_key, bucket, ordinal, 1 if selected else 0,
          ticket_id, reason, timestamp))
-    _save_counters(conn, ordinal, last_selection, timestamp)
+    if admission == 'recovery':
+        _save_counters(conn, ordinal, last_selection, timestamp)
     return {'selected': selected, 'reason': reason, 'ticket_id': ticket_id}
 
 
@@ -218,7 +236,7 @@ def mark_started(conn, ticket_id, *, now=None) -> dict:
     identifier(ticket_id, 'ticket_id')
     _expire_pending(conn, timestamp)
     row = conn.execute(
-        'SELECT status FROM routing_recovery_tickets WHERE ticket_id = ?',
+        'SELECT status, bucket_id FROM routing_recovery_tickets WHERE ticket_id = ?',
         (ticket_id,)).fetchone()
     if row is None:
         raise RoutingError('Unknown recovery ticket.')
@@ -227,6 +245,8 @@ def mark_started(conn, ticket_id, *, now=None) -> dict:
         return {'ticket_id': ticket_id, 'status': status, 'started': True,
                 'reason': 'idempotent'}
     if status == STATUS_PENDING:
+        if _bucket_cooling(conn, row[1], timestamp):
+            raise RoutingError('Task family is in a quality failure cooldown; inspect and replan later.', 78)
         conn.execute(
             'UPDATE routing_recovery_tickets SET status = ?, started_at = ? WHERE ticket_id = ?',
             (STATUS_RUNNING, timestamp, ticket_id))
@@ -324,11 +344,19 @@ def status(conn, config, *, now=None) -> dict:
     tickets = [{'ticket_id': r[0], 'binding_id': r[1], 'bucket_id': r[2], 'status': r[3],
                 'created_at': r[4], 'expires_at': r[5], 'started_at': r[6]}
                for r in list(pending_rows) + list(running_rows)]
+    bootstrap_ids = {r[0] for r in conn.execute('SELECT ticket_id FROM routing_bootstrap_tickets')}
+    for ticket in tickets:
+        ticket['admission'] = 'bootstrap' if ticket['ticket_id'] in bootstrap_ids else 'recovery'
     return {
         'eligible_seen': opportunity,
         'selected_count': selected_count,
         'running_count': running,
         'pending_count': len(pending_rows),
+        'bootstrap_pending_count': sum(t['admission'] == 'bootstrap' and t['status'] == STATUS_PENDING for t in tickets),
+        'bootstrap_running_count': sum(t['admission'] == 'bootstrap' and t['status'] == STATUS_RUNNING for t in tickets),
+        'recovery_active_count': sum(t['admission'] == 'recovery' for t in tickets),
+        'max_active_trials': routing_bootstrap.MAX_ACTIVE_TRIALS,
+        'coordinator_comparison_interval': routing_bootstrap.COORDINATOR_COMPARISON_INTERVAL,
         'tickets': tickets,
         'recovery_rate': recovery['recovery_rate'],
         'cooldown_seconds': recovery['recovery_cooldown_seconds'],
@@ -450,11 +478,21 @@ def _bucket_cooling(conn, bucket: str, timestamp: float) -> bool:
     return row is not None and row[0] > timestamp
 
 
+def cooling(conn, features, *, now=None):
+    return _bucket_cooling(conn, _bucket_key(features), _epoch(now))
+
+
+def record_failure(conn, features, config, *, now=None):
+    _require_transaction(conn)
+    _start_cooldown(conn, _bucket_key(features), _recovery_config(config)['recovery_cooldown_seconds'], _epoch(now))
+
+
 def _start_cooldown(conn, bucket: str, seconds: float, timestamp: float) -> None:
     conn.execute(
         'INSERT INTO routing_recovery_cooldowns(bucket_id, failure_at, cooldown_until) '
         'VALUES(?, ?, ?) ON CONFLICT(bucket_id) DO UPDATE SET '
-        'failure_at = excluded.failure_at, cooldown_until = excluded.cooldown_until',
+        'failure_at = MAX(failure_at, excluded.failure_at), '
+        'cooldown_until = MAX(cooldown_until, excluded.cooldown_until)',
         (bucket, timestamp, timestamp + seconds))
 
 

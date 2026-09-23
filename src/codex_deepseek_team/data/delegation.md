@@ -26,12 +26,20 @@ outcomes continue to teach the router. Match its runtime/model/effort/context to
 actual assignment, and keep unknown task attributes unknown. Protected coordinator
 responsibilities keep an explicit coordinator executor.
 
-Auto uses capped public evidence and comparable local outcomes, with uncertainty and
-measured total cost. Controlled recovery admits only small, low-risk, local tasks with
-known scope and concrete checks: one pending/running recovery assignment project-wide,
-then at least ten distinct eligible opportunities between selections by default.
-Quality failures pause that task family for one hour; old evidence loses weight.
-Recovery never grants access or automatically retries a failed implementation.
+Auto automatically selects **bootstrap**, **adaptive**, or **recovery** for each
+comparable task category; there is no manual stage switch. Missing data is not a
+quality failure. Bootstrap actively admits small, low-risk, known/local tasks with
+concrete checks, without the recovery spacing, until quality is supported. Up to
+three bootstrap/recovery trials may be pending or running across the project. Every
+tenth eligible bootstrap or cost-learning opportunity in a category stays with the
+coordinator for comparison. Unknown prices permit bounded cost learning, never
+invented savings; sufficiently supported poor economics veto all trials.
+
+Actual quality failures pause that family for one hour by default. Unsupported
+quality then uses controlled recovery: at most one active recovery trial within
+the shared cap, with at least ten distinct eligible recovery opportunities between
+selections by default. Old evidence loses weight; successful retries never erase
+first-pass failures. No stage grants access or automatically retries implementation.
 
 Keep the required Linux OS sandbox enabled for managed workers. Never add `--os-sandbox off`
 to ordinary coordination flows and do not weaken Ubuntu AppArmor

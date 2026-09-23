@@ -20,11 +20,17 @@ The system answers three questions in order: **what is this task, how likely is 
 
 1. **The classifier describes the task.** Before execution, the Codex or Claude coordinator records what needs changing, where the code is, how many components are involved, the risk, and how the result will be checked. It also records the worker's model, runtime and reasoning effort. Unknown task details stay unknown. This feature card is filled by the coordinator; the package does not train a separate classifier.
 2. **The estimator learns from comparable results.** It estimates the chance that a DeepSeek result will be accepted without rework and shows how uncertain that estimate is. A Python bug fix is compared with the same kind of operation under matching execution conditions. Old results gradually lose weight. Explicitly imported public benchmarks can help, but their contribution is capped so that enough local experience can outweigh them.
-3. **The router chooses an executor.** It first checks permissions and which responsibilities belong to the coordinator. Ordinary automatic delegation then requires enough evidence of quality and a lower measured total cost, including review and rework. With too little evidence, it normally keeps the coordinator. The decision and its reasons are saved; the coordinator launches any assigned worker and reviews its work.
+3. **The router chooses an executor.** It first checks permissions and which responsibilities belong to the coordinator. Auto gathers evidence through bounded assignments of safe tasks, then uses the quality estimate and measured total cost, including review and rework, to choose an executor. The decision and its reasons are saved; the coordinator launches any assigned worker and reviews its work.
 
 **Example:** for “add a `--quiet` flag to `status` and a unit test,” the coordinator can record a small, localized Python change with a clear check. After execution it records whether the result was accepted, needed rework, or was rejected, plus the total cost when known. This updates the statistics for later comparable tasks. Learning needs no model fine-tuning or separate paid training runs; saved manual `25`/`50`/`75` profiles collect the same feedback.
 
-**Delegation can recover after failures.** In Auto, a limited share of safe, small tasks with concrete checks can still go to DeepSeek: the first eligible recovery case, then a gap of at least ten distinct eligible cases between selections by default. Only one such task may be pending or running; a quality failure pauses that task family for one hour. Provider failures do not lower the quality estimate. These safeguards keep new evidence arriving without granting extra access. Fresh Auto settings remain read-only until write access is explicitly allowed.
+**Auto selects its learning stage automatically for each task family and execution context:**
+
+- **Bootstrap:** small, low-risk tasks with a known scope, clear requirements and concrete checks can go to DeepSeek immediately. Every tenth eligible opportunity in that family stays with the coordinator for a measured cost comparison. Bootstrap continues until both the minimum local evidence and the conservative quality threshold are met; five successes alone do not trigger a switch.
+- **Adaptive:** supported quality and measured savings guide delegation. Missing cost data still permits bounded assignments of the same safe tasks to collect it. Sufficient evidence of poor economics blocks these trials; missing costs never count as savings.
+- **Recovery:** when comparable quality failures leave quality unsupported, trials become less frequent: the first eligible recovery case, then one per ten distinct eligible recovery opportunities across the project by default. A quality failure pauses the affected family for one hour.
+
+Bootstrap and recovery share a limit of **three pending or running trials per project**, with at most **one recovery trial** among them. Provider or infrastructure failures and cancellations do not lower the quality estimate. Old failures lose weight at the same rate as successes; retrying a failed case does not erase its first failure. These stages need no manual switch and never widen access. Fresh Auto settings remain read-only until write access is explicitly allowed.
 
 See [the routing guide](docs/ROUTING.md) for the diagram, scoring details and commands.
 
@@ -255,7 +261,7 @@ Settings are layered independently:
 
 | Profile | `access=auto` | Intended practice |
 | --- | --- | --- |
-| **Auto (default)** | `read-only` | Use recorded task features, uncertainty and measured total costs to choose each executor; retain the coordinator when evidence is insufficient. |
+| **Auto (default)** | `read-only` | Automatically bootstrap on safe tasks, use learned quality and measured costs, and recover cautiously after failures; access and task eligibility still govern delegation. |
 | **25%** | `read-only` | Bounded research, diagnosis and review; coordinator performs the main implementation. |
 | **50%** | `full-access` | Delegate independent implementation slices and their tests before doing the same work locally; coordinator owns architecture/interfaces and integration. |
 | **75%** | `full-access` | Delegate most separable implementation, tests, docs and independent review; use up to three workers only when assignments are genuinely independent. |

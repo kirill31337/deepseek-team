@@ -75,6 +75,30 @@ class IntegrationTests(unittest.TestCase):
             coordination.assignment_started(self.root, task['id'], result['assignments'][0]['id'],
                                              'workspace', 'claude', [], effort='high')
 
+    def test_running_adaptive_reconciliation_does_not_relaunch_during_cooldown(self):
+        self.enable_recovery()
+        self.seed()
+        task = self.task()
+        plan = self.plan(task)
+        aid = plan['assignments'][0]['id']
+        coordination.assignment_started(self.root, task['id'], aid, 'ws', 'codex', [], effort='medium')
+        self.service.observe(dict(id='parallel-failure', case_id='parallel-case', origin='local',
+            features=self.features, action='worker', outcome='rejected', observed_at=time.time()))
+        again = coordination.assignment_started(self.root, task['id'], aid, 'ws', 'codex', [], effort='medium')
+        self.assertEqual(again['assignments'][0]['status'], 'running')
+
+    def test_queued_automatic_start_rechecks_current_routing_mode(self):
+        self.enable_recovery()
+        task = self.task()
+        plan = self.plan(task)
+        aid = plan['assignments'][0]['id']
+        for mode in ('off', 'shadow', 'advisory'):
+            self.service.configure({'mode': mode})
+            with self.subTest(mode=mode), self.assertRaisesRegex(coordination.CoordinationError, 'mode'):
+                coordination.assignment_started(self.root, task['id'], aid, 'ws', 'codex', [], effort='medium')
+        self.assertEqual(coordination.load_task(self.root, task['id'])['assignments'][0]['status'], 'planned')
+        self.assertEqual(self.service.recovery_status()['running_count'], 0)
+
     def test_forged_routing_cannot_bypass_manual_profile(self):
         task = self.task(settings.resolve(self.root))
         self.plan(task, 'coordinator', routing={'action': 'coordinator', 'mode': 'auto', 'decision_id': 'fake'},
@@ -307,6 +331,30 @@ class IntegrationTests(unittest.TestCase):
         with self.assertRaises(coordination.CoordinationError):
             coordination.assignment_started(self.root, task['id'], aid, 'another-ws', 'codex', [], effort='medium')
 
+    def test_pending_crash_reconciliation_still_respects_mode_revocation(self):
+        self.enable_recovery()
+        task = self.task()
+        plan = self.plan(task)
+        aid = plan['assignments'][0]['id']
+        atomic = coordination._atomic
+        def interrupted(path, value):
+            atomic(path, value)
+            raise OSError('simulated crash after ledger rename')
+        with patch.object(coordination, '_atomic', side_effect=interrupted):
+            with self.assertRaises(coordination.CoordinationError):
+                coordination.assignment_started(self.root, task['id'], aid, 'ws', 'codex', [], effort='medium')
+        self.assertEqual(coordination.load_task(self.root, task['id'])['assignments'][0]['status'], 'running')
+        self.assertEqual(self.service.recovery_status()['pending_count'], 1)
+        self.service.configure({'mode': 'off'})
+        with self.assertRaisesRegex(coordination.CoordinationError, 'mode'):
+            coordination.assignment_started(self.root, task['id'], aid, 'ws', 'codex', [], effort='medium')
+        self.assertEqual(self.service.recovery_status()['running_count'], 0)
+        self.service.configure({'mode': 'auto'})
+        coordination.assignment_started(self.root, task['id'], aid, 'ws', 'codex', [], effort='medium')
+        self.service.configure({'mode': 'off'})
+        coordination.assignment_started(self.root, task['id'], aid, 'ws', 'codex', [], effort='medium')
+        self.assertEqual(self.service.recovery_status()['running_count'], 1)
+
     def test_real_process_exit_between_ledger_and_sqlite_commits_is_recoverable(self):
         self.enable_recovery()
         task = self.task()
@@ -361,14 +409,14 @@ else:
         self.assertEqual(self.service.recovery_status()['running_count'], 0)
         self.assertTrue(all(row['outcome'] == 'cancelled' for row in self.service.observations()))
 
-    def test_auto_cold_start_recovers_on_safe_regular_task_and_accounts_for_outcome(self):
+    def test_auto_cold_start_bootstraps_safe_task_and_accounts_for_outcome(self):
         self.enable_recovery()
         task = self.task()
         result = self.plan(task)
         self.assertEqual(result['deliverables'][0]['executor'], 'worker')
         decision = self.service.decision(result['deliverables'][0]['routing']['decision_id'])
         self.assertEqual(decision['estimated_action'], 'abstain')
-        self.assertIn('controlled_recovery', decision['reason_codes'])
+        self.assertIn('active_bootstrap', decision['reason_codes'])
         self.assertEqual(self.service.recovery_status()['pending_count'], 1)
         aid = result['assignments'][0]['id']
         coordination.assignment_started(self.root, task['id'], aid, 'ws', 'codex', [], effort='medium')
@@ -378,18 +426,19 @@ else:
         self.assertEqual(self.service.recovery_status()['running_count'], 0)
         self.assertEqual(len(self.service.observations()), 1)
 
-    def test_no_reroll_or_concurrent_recovery_and_removed_plan_releases_pending(self):
+    def test_no_reroll_over_bootstrap_capacity_and_removed_plan_releases_pending(self):
         self.enable_recovery()
         task = self.task()
         first = self.plan(task)
         repeated = self.plan(task)
         self.assertEqual(first['assignments'][0]['id'], repeated['assignments'][0]['id'])
-        self.assertEqual(self.service.recovery_status()['eligible_seen'], 1)
+        self.assertEqual(first['deliverables'][0]['routing'], repeated['deliverables'][0]['routing'])
+        self.assertEqual(self.service.recovery_status()['bootstrap_pending_count'], 1)
         for n in range(1, 12):
             result = self.plan(self.task(turn=f'other-{n}'))
-            self.assertEqual(result['deliverables'][0]['executor'], 'coordinator')
+            self.assertEqual(result['deliverables'][0]['executor'], 'worker' if n < 3 else 'coordinator')
         coordination.plan_task(self.root, task['id'], {'classification': 'substantial', 'deliverables': []})
-        self.assertEqual(self.service.recovery_status()['pending_count'], 0)
+        self.assertEqual(self.service.recovery_status()['pending_count'], 2)
         result = self.plan(self.task(turn='after-release'))
         self.assertEqual(result['deliverables'][0]['executor'], 'worker')
 
@@ -399,7 +448,7 @@ else:
         for index in range(30):
             self.service.observe(dict(id=f'failure-{index}', case_id=f'failed-case-{index}',
                 origin='local', features=self.features, action='worker', outcome='rejected',
-                observed_at=now - 10))
+                observed_at=now - 7200))
         task = self.task()
         first = self.plan(task)
         decision = self.service.decision(first['deliverables'][0]['routing']['decision_id'])

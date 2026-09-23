@@ -148,7 +148,7 @@ class RoutingStore:
 
     @staticmethod
     def _verify_schema(db, *, with_index):
-        from . import routing_budget, routing_recovery
+        from . import routing_bootstrap, routing_budget, routing_recovery
         expected = dict(BASE_SCHEMA)
         if with_index:
             expected.update(INDEX_SCHEMA)
@@ -156,6 +156,8 @@ class RoutingStore:
         expected.update(budget)
         recovery = routing_recovery.SCHEMA
         expected.update(recovery)
+        bootstrap = routing_bootstrap.SCHEMA
+        expected.update(bootstrap)
         def normalized(sql):
             return re.sub(r'\s+', ' ', sql.replace('IF NOT EXISTS ', '')).strip()
         present = set()
@@ -167,7 +169,8 @@ class RoutingStore:
             present.add(name)
         required = set(BASE_SCHEMA) | (set(INDEX_SCHEMA) if with_index else set())
         if (not required <= present or (present & set(budget) and not set(budget) <= present)
-                or (present & set(recovery) and not set(recovery) <= present)):
+                or (present & set(recovery) and not set(recovery) <= present)
+                or (present & set(bootstrap) and not set(bootstrap) <= present)):
             raise RoutingError('Routing database schema is incomplete.', 78)
 
     @staticmethod

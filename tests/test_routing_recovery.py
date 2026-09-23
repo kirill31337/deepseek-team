@@ -415,13 +415,14 @@ class StatusTests(RecoveryTestBase):
         self.assertFalse(self.conn.in_transaction)
         self.assertEqual(set(state), {'eligible_seen', 'selected_count', 'running_count',
                                       'pending_count', 'tickets', 'recovery_rate',
-                                      'cooldown_seconds'})
+                                      'cooldown_seconds', 'bootstrap_pending_count', 'bootstrap_running_count',
+                                      'recovery_active_count', 'max_active_trials', 'coordinator_comparison_interval'})
         self.assertEqual(state['recovery_rate'], 0.25)
         self.assertEqual(state['cooldown_seconds'], 50.0)
         self.assertEqual(state['tickets'][0]['ticket_id'], first['ticket_id'])
         self.assertEqual(set(state['tickets'][0]),
                          {'ticket_id', 'binding_id', 'bucket_id', 'status', 'created_at',
-                          'expires_at', 'started_at'})
+                          'expires_at', 'started_at', 'admission'})
         self.assertEqual(recovery.status(self.conn, config), state)
 
     def test_status_counts_only_active_selected_records(self):

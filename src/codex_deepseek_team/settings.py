@@ -295,13 +295,13 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
     )
 
     full_profiles = {
-        'auto': 'Delegation depth is adaptive (auto), not a fixed target: delegate a separable implementation, test, fixture, documentation or review slice when the captured task features show it is worthwhile, and leave the task with the coordinator on cold start or when it is not separable.',
+        'auto': 'Delegation depth is adaptive (auto), not a fixed target: register separable implementation, test, fixture, documentation or review slices with executor:auto. Safe small tasks actively gather evidence at cold start; the router automatically chooses bootstrap, adaptive or recovery for each comparable category.',
         25: 'Delegate bounded research, diagnosis and independent review. The coordinator performs the main implementation.',
         50: 'Delegate at least one separable implementation/test/docs slice when such work exists; coordinator defines architecture/interfaces and integrates.',
         75: 'Delegate most separable implementation, tests, fixtures, documentation, non-secret metadata and independent review before doing that same work yourself. Use up to three workers only for genuinely independent assignments.',
     }
     read_only_profiles = {
-        'auto': 'Delegation depth is adaptive (auto), not a fixed target: delegate bounded research, diagnosis, design validation and independent review when the captured task features show it is worthwhile, and leave the task with the coordinator on cold start or when it is not separable. Read-only auto never delegates writing tasks.',
+        'auto': 'Delegation depth is adaptive (auto), not a fixed target: register bounded research, diagnosis, design validation and independent review with executor:auto. Safe small tasks actively gather evidence at cold start; stages change automatically. Read-only auto never delegates writing tasks.',
         25: 'Delegate bounded research, diagnosis and independent review. The coordinator performs the main implementation.',
         50: 'Delegate substantial investigation, design validation, test planning and independent review before the coordinator implements the corresponding changes.',
         75: 'Delegate most separable analysis, diagnostics, design validation, test planning and independent review. Use up to three read-only workers only for genuinely independent assignments.',
@@ -336,10 +336,17 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
             'executor: "auto" together with a "features" card capturing the task before execution: '
             'kind, domain, operation, localization, coupling, verification, clarity, risk, scope_size, '
             'runtime, model, effort and context_version. The coordinator classifies the task; the router '
-            'resolves its saved feature card. Workers must not self-select a profile. Cold start '
-            'may abstain and return the task to the coordinator. A bounded share of safe, small, locally '
-            'verifiable regular tasks can be delegated for recovery, with one such assignment in flight '
-            'and a finite cooldown after failures. There is no automatic paid exploration outside the '
+            'resolves its saved feature card. Workers must not self-select a profile or stage. Auto '
+            'automatically selects bootstrap, adaptive or recovery per comparable task category. '
+            'Bootstrap admits safe, small, known/local tasks with concrete checks without a recovery '
+            'stride, up to three pending/running trials project-wide. Every tenth eligible bootstrap '
+            'or cost-learning opportunity in that category stays with the coordinator for comparison. '
+            'Missing data is not negative evidence: bootstrap continues until quality is supported; '
+            'unknown prices permit bounded cost learning, never invented savings. Supported poor '
+            'economics veto trials. Actual quality failures pause the affected family for one hour '
+            'by default; unsupported quality then uses recovery (one active trial and the configured '
+            'opportunity spacing within the shared three-slot cap). There is no manual stage switch. '
+            'There is no automatic paid exploration outside the '
             'normal task stream and no automatic permission widening; keep the resolved access and explicit executor '
             'choices. Inspect adaptive routing state with deepseek-team routing status and adjust it '
             'with deepseek-team routing configure.\n'

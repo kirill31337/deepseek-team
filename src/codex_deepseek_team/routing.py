@@ -8,7 +8,7 @@ import io
 import time
 import uuid
 
-from . import routing_estimator, settings
+from . import routing_bootstrap, routing_estimator, routing_recovery, settings
 from .routing_models import (RoutingError, canonical, fingerprint, identifier, read_json,
                              number, validate_config, validate_features, validate_observation)
 from .routing_store import RoutingStore, evidence_key
@@ -87,6 +87,8 @@ class RoutingService:
                     raise RoutingError('Observation must match its original recorded feature card.')
                 if row['observed_at'] < decision['created_at']:
                     raise RoutingError('An outcome cannot precede its recorded decision.')
+                if (decision.get('recovery') or {}).get('selected') and row['action'] != 'worker':
+                    raise RoutingError('A worker trial requires worker outcome feedback.')
                 case = db.execute('SELECT case_id FROM evidence_index WHERE decision_id=? LIMIT 1',
                                   (row['decision_id'],)).fetchone()
                 if case and case[0] != row['case_id']:
@@ -96,9 +98,11 @@ class RoutingService:
             if latest is not None and row['observed_at'] < latest:
                 raise RoutingError('Local outcomes cannot be backdated before an existing case event.')
             self.store.put(db, 'observations', row['id'], row)
+            routing_recovery.initialize(db)
+            if row['action'] == 'worker' and row['outcome'] in ('rework', 'rejected'):
+                routing_recovery.record_failure(db, row['features'], self._config(db), now=row['observed_at'])
             if row['decision_id'] and (decision.get('recovery') or {}).get('selected'):
-                from . import routing_recovery
-                routing_recovery.finish(db, decision['recovery']['ticket_id'], row['outcome'])
+                routing_recovery.finish(db, decision['recovery']['ticket_id'], row['outcome'], now=row['observed_at'])
         return row
 
     def predict(self, features, access=None, record=True, *, binding=None, recovery=False):
@@ -118,31 +122,59 @@ class RoutingService:
         with self._transaction() as db:
             config = self._config(db)
             now = time.time()
+            routing_recovery.initialize(db)
+            from .routing_models import WRITE_KINDS
+            automatic = (policy.enabled and policy.delegation_level == 'auto' and config['mode'] == 'auto')
+            if record and binding is not None:
+                previous = routing_bootstrap.bound_decision(db, binding, features)
+                if previous is not None:
+                    # A revocation can narrow a frozen plan, never promote a
+                    # denied/expired trial into a new worker opportunity.
+                    writable = features['kind'] not in WRITE_KINDS or access == 'full-access'
+                    if previous['action'] != 'worker' or (policy.enabled and writable and config['mode'] != 'off'
+                            and (not previous.get('recovery', {}).get('selected') or automatic)):
+                        return previous
             decision = routing_estimator.recommend(features, self.store.all(db, 'observations'),
                         config, access=access, enabled=policy.enabled, now=now)
             decision['estimated_action'] = decision['action']
-            from .routing_models import WRITE_KINDS
-            if (recovery and record and binding is not None and policy.enabled
-                    and policy.delegation_level == 'auto' and config['mode'] == 'auto'
+            assessment = routing_bootstrap.assess(decision, config)
+            decision['phase'] = assessment['phase']
+            decision['phase_evidence'] = assessment
+            if automatic:
+                if routing_recovery.cooling(db, features, now=now):
+                    decision['phase'] = 'recovery'
+                    decision['phase_evidence'].update(phase='recovery', cooldown_active=True)
+                    decision['action'] = 'coordinator'
+                    decision['reason_codes'] = ['quality_failure_cooldown', *decision['reason_codes']]
+                if assessment['economic_veto']:
+                    decision['action'] = 'coordinator'
+                    decision['reason_codes'] = ['insufficient_measured_savings',
+                        *(r for r in decision['reason_codes'] if r != 'insufficient_measured_savings')]
+            if (recovery and record and binding is not None and automatic
                     and decision['action'] != 'worker'
+                    and not assessment['economic_veto']
                     and (features['kind'] not in WRITE_KINDS or access == 'full-access')):
-                from . import routing_recovery
-                routing_recovery.initialize(db)
+                admission = 'recovery' if decision['phase'] == 'recovery' else 'bootstrap'
                 info = routing_recovery.consider(db, dict(config, profile=policy.delegation_level,
-                    access=access, recommendation=decision['action']), features, binding, now=now)
+                    access=access, recommendation=decision['action']), features, binding, now=now,
+                    admission=admission)
                 decision['recovery'] = info
                 if info['selected']:
                     decision['action'] = 'worker'
-                    decision['reason_codes'] = ['controlled_recovery', *decision['reason_codes']]
+                    reason = ('controlled_recovery' if admission == 'recovery' else
+                              'bounded_cost_learning' if decision['phase'] == 'adaptive' else 'active_bootstrap')
+                    decision['reason_codes'] = [reason, *decision['reason_codes']]
             evidence_ids = decision['posterior'].get('evidence_ids', [])
             decision['posterior'].update(evidence_ids=evidence_ids[:128], evidence_count=len(evidence_ids),
                                          evidence_digest=fingerprint(evidence_ids))
             decision.update(id='decision-' + uuid.uuid4().hex, created_at=now,
                             features=features, feature_hash=fingerprint(features),
                             config=config, mode=config['mode'], access=access,
-                            enabled=policy.enabled, algorithm_version=1, binding=binding)
+                            enabled=policy.enabled, algorithm_version=2, binding=binding)
             if record:
                 self.store.put(db, 'decisions', decision['id'], decision)
+                if binding is not None:
+                    routing_bootstrap.bind_decision(db, decision)
             return decision
 
     def decision(self, decision_id):
@@ -197,13 +229,25 @@ class RoutingService:
             routing_recovery.initialize(db)
             return routing_recovery.status(db, self._config(db))
 
-    def start_recovery(self, decision_id):
+    def start_recovery(self, decision_id, *, already_running=False):
         from . import routing_recovery
         with self._transaction() as db:
             decision = self.store.get(db, 'decisions', decision_id)
             if decision is None:
                 raise RoutingError('Unknown routing decision.', 66)
             info = (decision or {}).get('recovery') or {}
+            routing_recovery.initialize(db)
+            # A running ticket is an idempotent reconciliation, not a new
+            # launch. Pending trials and ordinary automatic starts must still
+            # observe failures learned after their plan was recorded.
+            running = info.get('selected') and db.execute(
+                'SELECT 1 FROM routing_recovery_tickets WHERE ticket_id=? AND status=?',
+                (info['ticket_id'], 'running')).fetchone()
+            reconciling_ordinary = already_running and not info.get('selected')
+            if not running and not reconciling_ordinary and self._config(db)['mode'] != 'auto':
+                raise RoutingError('Current routing mode does not permit a new automatic worker start.', 78)
+            if not running and not reconciling_ordinary and routing_recovery.cooling(db, decision['features']):
+                raise RoutingError('Task family is in a quality failure cooldown; inspect and replan later.', 78)
             if info.get('selected'):
                 result = routing_recovery.mark_started(db, info['ticket_id'])
                 if not result['started']:

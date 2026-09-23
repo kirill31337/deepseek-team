@@ -550,7 +550,7 @@ def assignment_started(root: Path, task_id: str, assignment_id: str,
                     decision = service.predict(row['routing_features'], access=task['policy']['effective_access'])
                     row['routing_decision_id'] = decision['id']
                     _atomic(_task_path(root, task_id), task)
-                service.start_recovery(row['routing_decision_id'])
+                service.start_recovery(row['routing_decision_id'], already_running=True)
             return task
         if row["status"] not in ("planned", "failed"):
             raise CoordinationError("Assignment is already active or completed.", 64)

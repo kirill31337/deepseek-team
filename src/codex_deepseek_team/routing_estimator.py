@@ -188,6 +188,8 @@ def _posterior(weighted, config, *, intervals=True, evidence_ids=True):
             "upper": 1. - _beta_quantile(tail, beta, alpha) if intervals else None,
             "alpha": alpha, "beta": beta,
             "local_effective": math.fsum(w for r, w in rows if r["origin"] == "local"),
+            "local_failure_effective": math.fsum(w for r, w in rows
+                if r["origin"] == "local" and r["outcome"] != "accepted"),
             "external_effective": math.fsum(w for r, w in rows if r["origin"] == "external"),
             "matched_local": sum(r.get("_count", 1) for r, _ in rows if r["origin"] == "local"),
             "matched_external": sum(r.get("_count", 1) for r, _ in rows if r["origin"] == "external"),
