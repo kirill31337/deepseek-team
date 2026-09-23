@@ -316,9 +316,11 @@ Claude uses the same ledger through its user-level hooks and a project attached 
 
 - `SessionStart` and `UserPromptSubmit` restore/inject the current coordination state, including after compaction;
 - `PreToolUse` can technically deny coordinator source mutation before execution when the distribution is missing/noncompliant, when a new scope was not planned, or when the path is still owned by a pending worker assignment;
-- `Stop` requests a continuation while assignments are pending or completed worker results have no disposition. In Claude, if `stop_hook_active` is already true, it shows the remaining work and leaves the task unfinished in the ledger instead of blocking again.
+- `Stop` requests a continuation while assignments are pending, worker results have no disposition, or coordinator/native-agent deliverables lack a terminal outcome. In both runtimes, a repeated Stop shows the remaining work and leaves the task unfinished without vetoing another hook's continuation.
 
-Claude's gate covers `Edit`, `Write`, `NotebookEdit` and recognized mutating `Bash` commands. File paths are checked against the project scopes, including absolute paths. In plan mode, Markdown files in Claude's native plan directory can be edited before a distribution is registered, and `Stop` leaves the task open. This exception supports the default directory and `plansDirectory` in user, project or local settings files. Shell detection uses known patterns; hooks do not intercept every possible write through arbitrary commands or external tools. Claude native-subagent events do not open, complete or enforce the coordinator's task. These hooks control the coordinator's workflow; worker isolation is enforced separately by the OS sandbox.
+An unplanned turn with no recorded work (for example, a status question) closes its provisional record without claiming implementation completion or requiring a distribution plan. A status question during an unfinished task preserves that task and its assignments.
+
+Claude's gate covers `Edit`, `Write`, `NotebookEdit` and recognized mutating `Bash` commands. File paths are checked against the project scopes, including absolute paths. In plan mode, Markdown files in Claude's native plan directory can be edited before a distribution is registered, and `Stop` leaves the task open. This exception supports the default directory and `plansDirectory` in user, project or local settings files. Shell detection distinguishes quoted text and heredoc bodies from actual redirections and known write commands; it does not intercept every possible write through arbitrary programs or external tools. Claude native-subagent events do not open, complete or enforce the coordinator's task. These hooks control the coordinator's workflow; worker isolation is enforced separately by the OS sandbox.
 
 At **75/full-access**, ordinary separable implementation, tests, fixtures, documentation and non-secret metadata are worker-eligible by default. Merely running one implementation/review worker does not satisfy the profile if the coordinator then retains the remaining worker-eligible work without a supported constraint. At **50/full-access**, a review-only worker does not substitute for delegating an available implementation/test/docs slice. Access remains independent: an explicit read-only override never becomes writable.
 
@@ -358,6 +360,15 @@ Runner start/completion, workspace id, worker-only delta and declared checks are
 deepseek-team coordination use --task TASK_ID --assignment ASSIGNMENT_ID \
   --disposition incorporated --evidence "reviewed diff and accepted result"
 ```
+
+Record each verified coordinator or native-agent deliverable before completion:
+
+```bash
+deepseek-team coordination result --task TASK_ID --deliverable DELIVERABLE_ID \
+  --outcome accepted --evidence "reviewed changes and checks passed"
+```
+
+Only `accepted` and explicitly `cancelled` outcomes are terminal; rework, rejection and infrastructure failures keep the deliverable open. A later recognized mutation in its scope requires fresh acceptance. Native-agent results are recorded for completion but do not train coordinator routing estimates. Compatible replans preserve recorded results.
 
 If an assignment needs selected uncommitted source, import only the required files:
 

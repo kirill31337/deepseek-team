@@ -370,15 +370,21 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
             '--coord-task TASK_ID --coord-assignment ASSIGNMENT_ID. '
             + effort_note +
             'The runner records start/result/workspace/checks automatically. After reviewing a result, '
-            'record its use with deepseek-team coordination use. New substantial scope requires '
+            'record its use with deepseek-team coordination use. Record verified coordinator and '
+            'native-agent outcomes with deepseek-team coordination result; accepted or explicitly '
+            'cancelled outcomes are required for completion. Later recognized scope mutations '
+            'require fresh acceptance. New substantial scope requires '
             f'a revised plan. {coordinator} PreToolUse blocks recognized source edits while the distribution '
             'is missing/noncompliant, blocks unplanned scope, and blocks duplicate work owned by a '
             'pending worker assignment. Hook coverage depends on the tools and native runtime settings; '
             'it does not replace the worker OS sandbox. '
+            'An unplanned turn without recorded work closes without a distribution plan; status '
+            'prompts retain existing unfinished tasks. Stop requests continuation for unfinished '
+            'assignments/results, including coordinator and native-agent outcomes. On repeated Stop '
+            'it warns and keeps the ledger unfinished without vetoing another hook continuation. '
     )
     if runtime == 'codex':
         process += (
-            'Stop prevents silent completion with pending/undispositioned worker results. '
             'Native hook trust is controlled by Codex and is not inferred by this package.\n')
     else:
         process += (

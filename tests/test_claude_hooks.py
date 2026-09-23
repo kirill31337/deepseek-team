@@ -259,6 +259,8 @@ class ClaudeHooksTests(unittest.TestCase):
     def test_new_prompt_after_completion_gets_fresh_task_without_turn_id(self):
         task = self.start()
         self.plan(task)
+        coordination.observe_coordinator_result(
+            self.repo, task['id'], 'change', 'accepted', 'Value checked')
         self.hook('Stop')
         self.hook('UserPromptSubmit', prompt='Implement the feature')
         following = coordination.latest_task(self.repo, 'claude-session')

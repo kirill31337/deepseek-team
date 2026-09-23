@@ -135,8 +135,11 @@ deepseek-team coordination use --task TASK_ID --assignment ASSIGNMENT_ID \
 --disposition incorporated --evidence "reviewed diff and accepted result"
 ```
 
-Record verified coordinator outcomes with `coordination result --task TASK_ID
+Record verified coordinator and native-agent outcomes with `coordination result --task TASK_ID
 --deliverable DELIVERABLE_ID --outcome accepted --evidence "checks passed"`.
+Every such deliverable needs an accepted or explicitly cancelled outcome before
+completion. A later recognized mutation in its scope requires fresh acceptance.
+Native-agent outcomes do not train the coordinator routing estimates.
 Both result commands accept `--cost-usd` for the measured total, including review
 and rework; omit unknown costs rather than inventing a subscription dollar value.
 Use `needs-rework` when the worker result needed fixes. Repeated attempts remain one
@@ -167,6 +170,12 @@ Codex: distribution/source-mutation gates use supported lifecycle hooks, but nat
 hook trust is owned by Codex and must be reviewed there once; DeepSeek Team does not
 bypass or infer it. Hooks are a coordinator-process guardrail, not a replacement for
 the worker Bubblewrap/AppArmor security boundary.
+
+For both runtimes, an unplanned turn with no recorded work closes without requiring
+a distribution plan or claiming implementation completion. Status prompts retain
+existing unfinished tasks. Stop requests continuation for unfinished assignments,
+undisposed worker results and missing coordinator/native outcomes. A repeated Stop
+warns and keeps the ledger unfinished without vetoing another hook's continuation.
 
 Claude Code: after `setup --runtime claude` and project attachment, user-level hooks
 inject the current policy and enforce the same ledger distribution through PreToolUse.

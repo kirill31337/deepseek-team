@@ -8,6 +8,7 @@ import re
 import uuid
 
 from . import activation, coordination, project, settings
+from .shell_mutation import classify_shell_mutation
 
 
 def _context(text: str, event: str) -> dict:
@@ -23,21 +24,23 @@ def _deny(reason: str) -> dict:
 
 
 def _paths_from_apply_patch(command: str) -> list[str]:
-    return re.findall(r"^\*\*\* (?:Update|Add|Delete) File: (.+)$", command, re.M)
+    return re.findall(r"^\*\*\* (?:(?:Update|Add|Delete) File|Move to): (.+)$", command, re.M)
 
 
-def _overlap(path: str, scope: str, root: Path) -> bool:
+def _overlap(path: str, scope: str, root: Path, *, descendants: bool = False) -> bool:
     declared = Path(scope)
     declared = declared if declared.is_absolute() else root / declared
     try:
         scope = declared.resolve().relative_to(root.resolve()).as_posix()
     except ValueError:
         return False
-    if scope == '.':
+    if scope == '.' or (descendants and path == '.'):
         return True
     if scope.endswith("*"):
-        return path.startswith(scope[:-1])
-    return path == scope or path.startswith(scope.rstrip("/") + "/")
+        return (path.startswith(scope[:-1])
+                or (descendants and scope[:-1].startswith(path.rstrip("/") + "/")))
+    return (path == scope or path.startswith(scope.rstrip("/") + "/")
+            or (descendants and scope.startswith(path.rstrip("/") + "/")))
 
 
 def _mutation(payload: dict) -> tuple[bool, list[str]]:
@@ -53,12 +56,7 @@ def _mutation(payload: dict) -> tuple[bool, list[str]]:
         return True, [str(path)] if isinstance(path, str) and path else []
     if tool != "Bash":
         return False, []
-    if "deepseek-team coordination" in command or "deepseek-team worker" in command:
-        return False, []
-    patterns = (r"(^|[;&|]\s*)(rm|mv|cp|touch|truncate|patch)\s",
-                r"sed\s+[^\n]*-i", r"git\s+apply\b", r"\btee\s",
-                r"(^|[^>])>{1,2}\s*[^&]")
-    return any(re.search(p, command) for p in patterns), []
+    return classify_shell_mutation(command)
 
 
 def handle(payload: dict, runtime: str = 'codex') -> dict:
@@ -112,8 +110,10 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
             "Capture a structured features card before execution. In delegation Auto, use executor:auto "
             "to resolve each eligible task from local learning and bounded public evidence. Saved manual "
             "25/50/75 profiles retain priority and continue learning from outcomes. Routing never grants access. "
-            "Record worker acceptance/rework via coordination use and verified coordinator outcomes via "
-            "coordination result. Supply measured total --cost-usd only when known; never invent subscription costs."
+            "Record worker acceptance/rework via coordination use and verified coordinator/native-agent "
+            "outcomes via coordination result before completion. An unplanned turn with no work closes "
+            "without a distribution plan; an existing unfinished task remains open. "
+            "Supply measured total --cost-usd only when known; never invent subscription costs."
         )
         return _context(text, event)
     task = coordination.latest_task(root, session)
@@ -167,6 +167,7 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
             return _deny(
                 "Unscoped mutating Bash cannot be mapped to the registered Auto/75 full-access "
                 "distribution. Revise the plan or use a file edit whose scope can be checked.")
+        normalized_paths = []
         for path in paths:
             # Claude Edit/Write normally provide absolute paths. Resolve from
             # the hook cwd, then compare project-relative scopes. Symlinks may
@@ -177,6 +178,7 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
                 path = candidate.resolve().relative_to(root.resolve()).as_posix()
             except ValueError:
                 return _deny('Mutation scope is outside the attached project: ' + path)
+            normalized_paths.append(path)
             matching = [
                 deliverable for deliverable in task.get("deliverables", [])
                 if any(_overlap(path, scope, root) for scope in deliverable.get("scope", []))
@@ -185,16 +187,24 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
                 return _deny(
                     f"Unplanned mutation scope {path}. Revisit the distribution before "
                     "starting a new block of work.")
-            for deliverable in matching:
+            # A directory write also conflicts with worker-owned descendants.
+            for deliverable in task.get("deliverables", []):
+                if not any(_overlap(path, scope, root, descendants=True)
+                           for scope in deliverable.get("scope", [])):
+                    continue
                 assignment = next((row for row in task.get("assignments", [])
                                    if row.get("deliverable_id") == deliverable.get("id")), None)
                 if assignment and assignment.get("status") in ("planned", "running"):
                     return _deny(
                         f"Path {path} belongs to pending worker assignment {assignment['id']}; "
                         "wait for/review that result before duplicating implementation.")
-        coordination.record_coordinator_event(root, task["id"], "mutation_requested", paths)
+        coordination.record_coordinator_event(root, task["id"], "mutation_requested", normalized_paths)
         return {}
     if event == "Stop":
+        # A conversational/read-only turn need not invent implementation work.
+        # The ledger guard refuses closure if a plan or work already exists.
+        if coordination.close_unstarted_task(root, task["id"]):
+            return {"continue": True}
         issues = coordination.validate_task(root, task["id"])
         pending = [a["id"] for a in task.get("assignments", [])
                    if a.get("status") in ("planned", "running")]
@@ -207,15 +217,14 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
             reasons.append("Worker assignments are still pending: " + ", ".join(pending))
         if undisposed:
             reasons.append("Completed worker results require a recorded disposition: " + ", ".join(undisposed))
+        reasons.extend(coordination.completion_issues(task))
         if reasons:
             reason = " ".join(reasons)
             if not payload.get("stop_hook_active"):
                 return {"decision": "block", "reason": reason}
-            if runtime == 'claude':
-                # Avoid an endless Stop continuation. Keep the task unfinished
-                # in the ledger and show the remaining work to the user.
-                return {"systemMessage": "DeepSeek Team task remains unfinished. " + reason}
-            return {"continue": False, "stopReason": reason, "systemMessage": reason}
+            # Bound our own retry without vetoing another hook's continuation.
+            # The ledger stays unfinished and the runtime receives a warning.
+            return {"systemMessage": "DeepSeek Team task remains unfinished. " + reason}
         coordination.complete_task(root, task["id"])
         return {"continue": True}
     return {}

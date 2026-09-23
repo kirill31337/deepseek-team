@@ -31,7 +31,7 @@ def main(argv):
     use.add_argument('--cost-usd', type=float,
                      help='Measured total cost including worker, review and rework; omit if unknown.')
 
-    result = subs.add_parser('result', help='Record a verified coordinator outcome and optional total cost.')
+    result = subs.add_parser('result', help='Record a verified coordinator or native-agent outcome and optional total cost.')
     result.add_argument('--path', type=Path, default=Path.cwd())
     result.add_argument('--task', required=True)
     result.add_argument('--deliverable', required=True)
@@ -95,7 +95,8 @@ def main(argv):
             print(json.dumps(task, indent=2))
         else:
             print(coordination.summary(task))
-            issues = coordination.validate_task(args.path, task['id'])
+            closed_draft = task.get('status') == 'closed' and coordination._unstarted_task(task)
+            issues = [] if closed_draft else coordination.validate_task(args.path, task['id'])
             if issues:
                 print('Distribution issues:')
                 for issue in issues:

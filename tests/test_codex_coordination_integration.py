@@ -27,6 +27,15 @@ class RealCodexCoordinatorHookTests(unittest.TestCase):
         self.skipTest("Codex CLI is not installed")
 
     def test_new_session_registers_distribution_before_blocked_duplicate_mutation(self):
+        self._run_hook_fixture('worker')
+
+    def test_status_only_turn_closes_without_extra_model_request(self):
+        self._run_hook_fixture('status')
+
+    def test_repeated_stop_does_not_veto_another_hooks_continuation(self):
+        self._run_hook_fixture('other-hook')
+
+    def _run_hook_fixture(self, scenario):
         binary = self._codex()
         requests = []
         tool_outputs = []
@@ -58,6 +67,27 @@ class RealCodexCoordinatorHookTests(unittest.TestCase):
                                 delegation_level=75, access="full-access")
             project.attach(repo, coordinator="codex")
             config.install_codex_hooks(home)
+            if scenario == 'other-hook':
+                # Another hook requests continuation on the second Stop, when
+                # DeepSeek Team has already requested its own continuation.
+                other_hook = root / 'other_stop.py'
+                counter = root / 'stop-count'
+                other_hook.write_text(
+                    'import json\nfrom pathlib import Path\n'
+                    f'p = Path({str(counter)!r})\n'
+                    'count = int(p.read_text()) + 1 if p.exists() else 1\n'
+                    'p.write_text(str(count))\n'
+                    'if count == 2:\n'
+                    '    print(json.dumps({"decision": "block", '
+                    '"reason": "OTHER_HOOK_CONTINUATION"}))\n'
+                )
+                hooks_file = home / 'hooks.json'
+                hooks = json.loads(hooks_file.read_text())
+                hooks['hooks']['Stop'].append({'hooks': [{
+                    'type': 'command',
+                    'command': shlex.quote(sys.executable) + ' ' + shlex.quote(str(other_hook)),
+                }]})
+                hooks_file.write_text(json.dumps(hooks))
 
             class Handler(BaseHTTPRequestHandler):
                 def log_message(self, *_):
@@ -99,7 +129,14 @@ class RealCodexCoordinatorHookTests(unittest.TestCase):
                             "arguments": json.dumps(arguments), "status": "completed",
                         }
 
-                    if step == 0:
+                    if scenario == 'status':
+                        output = [{
+                            "type": "message", "id": f"msg_status_{step}", "role": "assistant",
+                            "status": "completed", "content": [{
+                                "type": "output_text", "text": "STATUS_REPORTED", "annotations": []
+                            }]
+                        }]
+                    elif step == 0:
                         if state["task_id"] is None:
                             output = [{
                                 "type": "message", "id": "msg_missing", "role": "assistant",
@@ -195,20 +232,31 @@ class RealCodexCoordinatorHookTests(unittest.TestCase):
                     binary, "exec", "--strict-config", "--ephemeral", "--json",
                     "--sandbox", "danger-full-access", "--dangerously-bypass-hook-trust",
                     "-C", str(repo),
-                    "Implement the feature. Follow all project and lifecycle-hook instructions."
+                    ("What is the current status?" if scenario == "status" else
+                     "Implement the feature. Follow all project and lifecycle-hook instructions.")
                 ], env=env, text=True, capture_output=True, timeout=45, check=False)
 
                 self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
-                self.assertGreaterEqual(len(requests), 3, result.stderr + result.stdout)
                 self.assertIsNotNone(state["task_id"], "UserPromptSubmit context did not reach Codex")
-                self.assertIsNotNone(state["assignment_id"], str(tool_outputs))
                 self.assertEqual((repo / "a.py").read_text(), "VALUE = 1\n",
                                  "Coordinator mutation reached disk despite pending worker assignment")
                 with unittest.mock.patch.dict(
                         os.environ, {"DEEPSEEK_TEAM_STATE_DIR": str(root / "state")}):
                     task = coordination.load_task(repo, state["task_id"])
+                if scenario == 'status':
+                    self.assertEqual(len(requests), 1, result.stderr + result.stdout)
+                    self.assertEqual(task['status'], 'closed')
+                    self.assertEqual(task['deliverables'], [])
+                    self.assertIn('STATUS_REPORTED', result.stdout)
+                    return
+                self.assertGreaterEqual(len(requests), 3, result.stderr + result.stdout)
+                self.assertIsNotNone(state["assignment_id"], str(tool_outputs))
                 self.assertEqual(task["assignments"][0]["status"], "planned")
                 self.assertEqual(task["assignments"][0]["id"], state["assignment_id"])
+                self.assertNotIn(task['status'], ('completed', 'closed'))
+                if scenario == 'other-hook':
+                    self.assertGreaterEqual(len(requests), 5, result.stderr + result.stdout)
+                    self.assertEqual(counter.read_text(), '3')
                 combined = "\n".join(tool_outputs) + result.stdout + result.stderr
                 self.assertRegex(combined.lower(), r"(deny|blocked|pending worker|distribution)")
             finally:

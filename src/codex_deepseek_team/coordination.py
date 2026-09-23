@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import fcntl
+import fnmatch
 import hashlib
 import json
 import os
@@ -196,9 +197,93 @@ def latest_task(root: Path, session_id: str) -> dict | None:
 
 def active_task(root: Path, session_id: str) -> dict | None:
     task = latest_task(root, session_id)
-    if task is not None and task.get('status') != 'completed':
+    if task is not None and task.get('status') not in ('completed', 'closed'):
         return task
     return None
+
+
+def _unstarted_task(task):
+    return (task.get('classification') is None
+            and task.get('status') in ('planning', 'closed')
+            and not any(task.get(key) for key in (
+                'deliverables', 'assignments', 'coordinator_events', 'constraints')))
+
+
+def close_unstarted_task(root, task_id):
+    """Close an untouched conversational draft without claiming work completed."""
+    with _lock(root):
+        task = load_task(root, task_id)
+        if not _unstarted_task(task):
+            return False
+        if task.get('status') != 'closed':
+            now = time.time()
+            task.update(status='closed', closed_at=now, updated_at=now)
+            _atomic(_task_path(root, task_id), task)
+        return True
+
+
+def _deliverable_outcome(task, item):
+    if 'result_invalidated_at' in item:
+        return 'invalidated'
+    result = item.get('result')
+    outcome, recorded_at = 'pending', None
+    if isinstance(result, dict):
+        outcome, recorded_at = result.get('outcome') or 'pending', result.get('recorded_at')
+    elif item.get('executor') == 'coordinator':
+        # Older ledgers stored explicit outcomes only in the router outbox.
+        feedback = item.get('routing_feedback') or []
+        if feedback:
+            observation = feedback[-1].get('observation', {})
+            if observation.get('action') == 'coordinator':
+                outcome = observation.get('outcome') or 'pending'
+                recorded_at = observation.get('observed_at')
+    if outcome in ('accepted', 'cancelled'):
+        for event in task.get('coordinator_events', []):
+            if event.get('kind') != 'mutation_requested':
+                continue
+            at = event.get('at')
+            if (isinstance(at, (int, float)) and isinstance(recorded_at, (int, float))
+                    and at <= recorded_at):
+                continue
+            # Older hooks recorded mutations without marking result invalidation.
+            # Missing timing/project data cannot establish that acceptance is fresh.
+            project = task.get('project')
+            if not project or _mutation_touches_scope(
+                    Path(project), event.get('paths'), item.get('scope', [])):
+                return 'invalidated'
+    return outcome
+
+
+def completion_issues(task):
+    """Require terminal outcomes for work not tracked by worker assignments."""
+    issues = []
+    for item in task.get('deliverables', []):
+        if item.get('executor') not in ('coordinator', 'native-agent'):
+            continue
+        outcome = _deliverable_outcome(task, item)
+        if outcome not in ('accepted', 'cancelled'):
+            issues.append(f"{item['id']}: {item['executor']} outcome is outstanding; "
+                          "record an accepted or cancelled result with evidence")
+    return issues
+
+
+def _mutation_touches_scope(root, paths, scopes):
+    if not paths or not scopes:
+        return True
+    root = _project_root(root)
+
+    def relative(value):
+        # Match the hook's canonical paths, including symlinked scope prefixes.
+        # resolve() preserves glob characters; fnmatch below still interprets them.
+        return os.path.relpath((root / value).resolve(), root.resolve())
+
+    for path in map(relative, paths):
+        for scope in map(relative, scopes):
+            if (path == '.' or scope == '.' or fnmatch.fnmatchcase(path, scope)
+                    or path.startswith(scope.rstrip('/') + '/')
+                    or scope.startswith(path.rstrip('/') + '/')):
+                return True
+    return False
 
 
 def begin_turn(root: Path, *, session_id: str, turn_id: str, prompt: str,
@@ -227,6 +312,14 @@ def begin_turn(root: Path, *, session_id: str, turn_id: str, prompt: str,
 def complete_task(root: Path, task_id: str) -> dict:
     with _lock(root):
         task = load_task(root, task_id)
+        issues = validate_task(root, task_id) + completion_issues(task)
+        for row in task.get('assignments', []):
+            if row.get('status') not in ('succeeded', 'failed'):
+                issues.append(f"{row['id']}: worker assignment is unfinished")
+            elif not row.get('disposition'):
+                issues.append(f"{row['id']}: worker result has no disposition")
+        if issues:
+            raise CoordinationError('Cannot complete task: ' + '; '.join(issues))
         task['status'] = 'completed'
         task['completed_at'] = time.time()
         task['updated_at'] = task['completed_at']
@@ -256,8 +349,8 @@ def _normalize_deliverable(raw: dict) -> dict:
                 "Protected coordinator responsibilities cannot be assigned to a native agent.", 64)
     value = dict(raw)
     # Derived state is read only from our ledger, never accepted from a plan.
-    value.pop('routing', None)
-    value.pop('routing_feedback', None)
+    for key in ('routing', 'routing_feedback', 'result', 'result_evidence', 'result_invalidated_at'):
+        value.pop(key, None)
     value["scope"] = list(raw["scope"]) if isinstance(raw["scope"], list) else [str(raw["scope"])]
     value["acceptance"] = list(raw["acceptance"])
     value["dependencies"] = list(raw["dependencies"])
@@ -280,7 +373,8 @@ def _prepare_routing(root, task, items, service):
     previous = {item['id']: item for item in task.get('deliverables', [])}
     started = {row['deliverable_id'] for row in task.get('assignments', [])
                if row['status'] != 'planned'}
-    started.update(item['id'] for item in previous.values() if item.get('routing_feedback'))
+    started.update(item['id'] for item in previous.values()
+                   if item.get('routing_feedback') or item.get('result'))
     ids = set()
     for item in items:
         if item['id'] in ids:
@@ -300,7 +394,7 @@ def _prepare_routing(root, task, items, service):
                 raise CoordinationError('Started deliverable scope and features are immutable; use a new deliverable id.', 64)
             item['executor'] = prior['executor']
             item['routing'] = prior.get('routing')
-            for key in ('routing_feedback', 'result_evidence'):
+            for key in ('routing_feedback', 'result', 'result_evidence', 'result_invalidated_at'):
                 if key in prior:
                     item[key] = prior[key]
             continue
@@ -367,7 +461,8 @@ def plan_task(root: Path, task_id: str, plan: dict) -> dict:
             if row.get("status") not in ("planned",) and row.get("deliverable_id") not in incoming_ids
         ]
         historical_missing.extend(item['id'] for item in task.get('deliverables', [])
-                                  if item.get('routing_feedback') and item['id'] not in incoming_ids)
+                                  if (item.get('routing_feedback') or item.get('result'))
+                                  and item['id'] not in incoming_ids)
         if historical_missing:
             raise CoordinationError(
                 "Plan revision cannot remove started/completed worker deliverables: " +
@@ -707,17 +802,31 @@ def sync_routing_feedback(root: Path, task_id: str) -> None:
 def observe_coordinator_result(root: Path, task_id: str, deliverable_id: str,
                                outcome: str, evidence: str, *, cost_usd: float | None = None) -> dict:
     if outcome not in ('accepted', 'rework', 'rejected', 'infrastructure', 'cancelled', 'unknown') or not evidence.strip():
-        raise CoordinationError('Coordinator result requires a valid outcome and verification evidence.', 64)
+        raise CoordinationError('Deliverable result requires a valid outcome and verification evidence.', 64)
     with _lock(root):
         task = load_task(root, task_id)
         item = next((item for item in task['deliverables'] if item['id'] == deliverable_id), None)
-        if item is None or item['executor'] != 'coordinator' or not item.get('features'):
-            raise CoordinationError('Coordinator feedback requires a planned coordinator deliverable with original features.', 64)
-        decision_id = (item.get('routing') or {}).get('decision_id')
-        _queue_feedback(task, item, action='coordinator', outcome=outcome, cost_usd=cost_usd,
-                        features=item['features'], decision_id=decision_id, started_at=task['created_at'])
+        if item is None or item['executor'] not in ('coordinator', 'native-agent') or not item.get('features'):
+            raise CoordinationError('Result requires a planned coordinator or native-agent deliverable with original features.', 64)
+        if item['executor'] == 'coordinator':
+            decision_id = (item.get('routing') or {}).get('decision_id')
+            _queue_feedback(task, item, action='coordinator', outcome=outcome, cost_usd=cost_usd,
+                            features=item['features'], decision_id=decision_id, started_at=task['created_at'])
+        elif cost_usd is not None:
+            try:
+                number(cost_usd, 'cost_usd')
+            except RoutingError as error:
+                raise CoordinationError(error.message, error.code) from None
+        now = time.time()
+        item['result'] = {'outcome': outcome, 'evidence': evidence[:2000], 'recorded_at': now}
+        if cost_usd is not None:
+            item['result']['cost_usd'] = cost_usd
+        item.pop('result_invalidated_at', None)
         item['result_evidence'] = evidence[:2000]
-        task['updated_at'] = time.time()
+        if task.get('status') == 'completed' and completion_issues(task):
+            task['status'] = 'active'
+            task.pop('completed_at', None)
+        task['updated_at'] = now
         _atomic(_task_path(root, task_id), task)
     sync_routing_feedback(root, task_id)
     return load_task(root, task_id)
@@ -749,10 +858,19 @@ def record_coordinator_event(root: Path, task_id: str, kind: str,
                              paths: list[str] | None = None) -> None:
     with _lock(root):
         task = load_task(root, task_id)
+        now = time.time()
         task.setdefault("coordinator_events", []).append({
-            "kind": kind, "paths": list(paths or []), "at": time.time(),
+            "kind": kind, "paths": list(paths or []), "at": now,
         })
-        task["updated_at"] = time.time()
+        if kind == 'mutation_requested':
+            for item in task.get('deliverables', []):
+                if (item.get('executor') in ('coordinator', 'native-agent')
+                        and _mutation_touches_scope(root, paths, item.get('scope', []))):
+                    item['result_invalidated_at'] = now
+            if task.get('status') == 'completed':
+                task['status'] = 'active'
+                task.pop('completed_at', None)
+        task["updated_at"] = now
         _atomic(_task_path(root, task_id), task)
 
 
@@ -824,6 +942,7 @@ def summary(task: dict) -> str:
         f"DeepSeek Team coordination task {task['id']}: "
         f"{str(level) + '%' if level != 'auto' else 'Auto'}/{task['policy']['effective_access']}; "
         f"effort={task['policy'].get('effort', 'auto')}; "
+        f"status={task.get('status', 'unknown')}; "
         f"classification={task.get('classification') or 'pending'}.",
     ]
     for row in task.get("assignments", []):
@@ -836,8 +955,10 @@ def summary(task: dict) -> str:
             text += f"; disposition={row['disposition']['kind']}: {row['disposition']['evidence'][:300]}"
         lines.append(text)
     for item in task.get("deliverables", []):
-        if item.get("executor") == "native-agent":
-            reason = str(item.get("delegation_reason") or "")[:300]
-            lines.append(
-                f"- native-agent deliverable={item.get('id')} kind={item.get('kind')}; reason={reason}")
+        if item.get("executor") in ("coordinator", "native-agent"):
+            text = (f"- {item['executor']} deliverable={item.get('id')} kind={item.get('kind')}; "
+                    f"outcome={_deliverable_outcome(task, item)}")
+            if item['executor'] == 'native-agent':
+                text += '; reason=' + str(item.get('delegation_reason') or '')[:300]
+            lines.append(text)
     return "\n".join(lines)
