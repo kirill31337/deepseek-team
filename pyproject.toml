@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codex-deepseek-team"
-version = "0.7.1"
+version = "0.8.0"
 description = "Delegate bounded coding tasks from Codex and/or Claude Code to isolated DeepSeek workers."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -19,6 +19,8 @@ classifiers = [
 ]
 
 [project.urls]
+Documentation = "https://github.com/kirill31337/deepseek-team#quick-start"
+Changelog = "https://github.com/kirill31337/deepseek-team/releases"
 Repository = "https://github.com/kirill31337/deepseek-team"
 Issues = "https://github.com/kirill31337/deepseek-team/issues"
 

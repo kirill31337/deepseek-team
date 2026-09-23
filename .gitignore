@@ -6,6 +6,8 @@ dist/
 *.egg-info/
 .coverage
 .pytest_cache/
+.worktrees/
+.superpowers/
 
 # Private project preferences and their lock are never package source.
 .deepseek-team.toml

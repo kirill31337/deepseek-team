@@ -1,8 +1,8 @@
-![DeepSeek Team banner](assets/deepseek-team-banner-4b37ec05.jpg)
+![DeepSeek Team banner](https://raw.githubusercontent.com/kirill31337/deepseek-team/main/assets/deepseek-team-banner-4b37ec05.jpg)
 
 # DeepSeek Team
 
-**English** | [Русский](README.ru.md)
+**English** | [Русский](https://github.com/kirill31337/deepseek-team/blob/main/README.ru.md)
 
 One Linux package for **Codex and/or Claude Code coordinators** delegating bounded coding work to DeepSeek workers. The current source supports **Auto delegation with project learning** and manual **25/50/75% profiles**, independent `read-only/full-access` policy, and reusable isolated development copies.
 
@@ -10,9 +10,53 @@ One Linux package for **Codex and/or Claude Code coordinators** delegating bound
 
 The percentages are **target work-distribution profiles**, not measured token/time/line quotas and not promises of exact useful contribution. Small or inseparable tasks may delegate less. Fresh installs default to **Auto + access=auto → read-only**. Auto chooses an executor per task from bounded public evidence and local outcomes. Saved manual 25/50/75 preferences retain priority and continue collecting outcomes.
 
-Version **0.7.0** adds hybrid routing, persistent learning, chronological evaluation and transactional experiment budgets; see [the routing guide](docs/ROUTING.md). It retains frontier-selected DeepSeek effort with persistent `auto|low|medium|high` policy, preserves justified native Codex/Claude subagents alongside DeepSeek workers, and keeps DeepSeek workers fixed on `deepseek-flash` as isolated leaf workers. Version 0.5.0 introduced persistent coordination state and Codex lifecycle enforcement. The release supports **Linux, Python 3.11+, Git, Bubblewrap, and Codex CLI and/or Claude Code CLI**. Ubuntu has first-class AppArmor setup for its restricted unprivileged-user-namespace policy. A DeepSeek API key is required for live work. There are no Python runtime dependencies; Bubblewrap/AppArmor are system components.
+Version **0.8.0** prepares the product installation flow and keeps hybrid routing, persistent learning, chronological evaluation and transactional experiment budgets; see [the routing guide](https://github.com/kirill31337/deepseek-team/blob/main/docs/ROUTING.md). It retains frontier-selected DeepSeek effort with persistent `auto|low|medium|high` policy, preserves justified native Codex/Claude subagents alongside DeepSeek workers, and keeps DeepSeek workers fixed on `deepseek-flash` as isolated leaf workers. Version 0.5.0 introduced persistent coordination state and Codex lifecycle enforcement. The release supports **Linux, Python 3.11+, Git, Bubblewrap, and Codex CLI and/or Claude Code CLI**. Ubuntu has first-class AppArmor setup for its restricted unprivileged-user-namespace policy. A DeepSeek API key is required for live work. There are no Python runtime dependencies; Bubblewrap/AppArmor are system components.
 
 The current source also supports Claude Code coordination hooks: both coordinators use the persistent task ledger and the saved project `on/off` switch.
+
+## Quick start
+
+Install the CLI once for your user. PyPI publication is still pending, so install from the tested Git source:
+
+```bash
+# Ubuntu 23.04+: install pipx once.
+sudo apt-get install pipx
+pipx ensurepath
+
+# Open a new terminal, then install DeepSeek Team.
+pipx install 'git+https://github.com/kirill31337/deepseek-team.git'
+# Or, after cloning the repository: pipx install .
+```
+
+`pipx ensurepath` changes shell configuration, so open a new terminal before running `pipx install`. See the [pipx installation guide](https://pipx.pypa.io/latest/how-to/install-pipx.html) for other distributions. After the first PyPI release, the equivalent package command will be `pipx install codex-deepseek-team`. With [uv](https://docs.astral.sh/uv/getting-started/installation/), use `uv tool install 'git+https://github.com/kirill31337/deepseek-team.git'` now, or `uv tool install codex-deepseek-team` after publication.
+
+For a virtual-environment installation instead of pipx:
+
+```bash
+python3 -m venv ~/venvs/deepseek-team
+. ~/venvs/deepseek-team/bin/activate
+python -m pip install 'git+https://github.com/kirill31337/deepseek-team.git'
+```
+
+Use `pip` only inside a virtual environment; do not use `sudo pip` or `--break-system-packages`.
+
+Set up the user-level integration, then attach each project by its explicit path:
+
+```bash
+# Ubuntu: explicitly permit installation and probing of Bubblewrap/AppArmor.
+deepseek-team setup --with-sandbox
+
+# Attach a project. Replace this example with the project you want to enable.
+deepseek-team init --coordinator codex /path/to/project
+cd /path/to/project
+deepseek-team doctor --runtime auto --offline
+```
+
+On a non-Ubuntu system, or when the sandbox prerequisites are already installed, replace `setup --with-sandbox` with `setup`. `setup` defaults to `--runtime auto` and detects Codex and Claude Code on `PATH`; use `--runtime codex`, `claude`, or `both` to choose explicitly. `setup --with-sandbox` is the only setup path that authorizes Ubuntu package/profile installation and a sandbox probe. Ordinary `setup` never uses `sudo`: it reports missing prerequisites and the action needed. `setup --no-key` skips credential access and prompting. It prints readiness and native hook-trust instructions, but does not attach projects. In Codex, review the package hook through `/hooks`; for Claude, start a new session and check `/hooks`.
+
+Use `--coordinator claude` for Claude Code or `--coordinator both` when the project will use both coordinators. `setup --configure-only` preserves the earlier configure-only automation behavior; it changes configuration without readiness verification. Keep the DeepSeek credential private and set it separately with `deepseek-team auth set` when live work is needed.
+
+For release-owner steps, see [PUBLISHING.md](https://github.com/kirill31337/deepseek-team/blob/main/docs/PUBLISHING.md).
 
 ## How routing works: classifier, estimator, router
 
@@ -32,9 +76,9 @@ The system answers three questions in order: **what is this task, how likely is 
 
 Bootstrap and recovery share a limit of **three pending or running trials per project**, with at most **one recovery trial** among them. Provider or infrastructure failures and cancellations do not lower the quality estimate. Old failures lose weight at the same rate as successes; retrying a failed case does not erase its first failure. These stages need no manual switch and never widen access. Fresh Auto settings remain read-only until write access is explicitly allowed.
 
-See [the routing guide](docs/ROUTING.md) for the diagram, scoring details and commands.
+See [the routing guide](https://github.com/kirill31337/deepseek-team/blob/main/docs/ROUTING.md) for the diagram, scoring details and commands.
 
-## Ubuntu install — recommended
+## Source installer and manual sandbox setup
 
 Install the coordinator CLI(s) you intend to use, then:
 
@@ -48,37 +92,30 @@ deepseek-team sandbox status
 
 `--with-sandbox` is an **explicit privileged setup path**. On Ubuntu it installs the `bubblewrap` and `apparmor` packages, installs/reloads the package-owned named profile `deepseek-team-bwrap`, and probes the resulting sandbox. It does **not** disable AppArmor and does **not** change `kernel.apparmor_restrict_unprivileged_userns`.
 
-Then configure whichever coordinator(s) you use:
+The source installer remains an optional fallback. It creates a dedicated venv at `~/.local/share/codex-deepseek-team/venv` and publishes `deepseek-team` plus the legacy `codex-deepseek-team` alias. After installing it, use the Quick start commands above and always give `init` the target project path.
+
+For reference, explicit coordinator setup remains available:
 
 ```bash
 # Codex only
 deepseek-team setup --runtime codex
 deepseek-team hooks status
 deepseek-team doctor --runtime codex --offline
-deepseek-team init --coordinator codex
+deepseek-team init --coordinator codex /path/to/project
 # In Codex, review/trust the stable hook definition once with /hooks.
 
 # Claude Code only
 deepseek-team setup --runtime claude
 deepseek-team hooks status --runtime claude
 deepseek-team doctor --runtime claude --offline
-deepseek-team init --coordinator claude
+deepseek-team init --coordinator claude /path/to/project
 # Start a new Claude session and check /hooks.
 
 # Or both
 deepseek-team setup --runtime both
 deepseek-team doctor --runtime both --offline
-deepseek-team init --coordinator both
+deepseek-team init --coordinator both /path/to/project
 ```
-
-The installer creates a dedicated venv at `~/.local/share/codex-deepseek-team/venv` and publishes two equivalent commands:
-
-```text
-deepseek-team
-codex-deepseek-team   # legacy compatibility alias
-```
-
-The legacy Python distribution/namespace is intentionally preserved so existing installations and automation continue to work.
 
 ### Codex lifecycle hooks
 
@@ -104,7 +141,7 @@ Codex owns native hook trust. Review/trust the stable DeepSeek Team hook once fr
 
 ### Claude Code lifecycle hooks
 
-The standard installer also detects Claude Code on `PATH`. It installs DeepSeek Team handlers in `~/.claude/settings.json`, or in `$CLAUDE_CONFIG_DIR/settings.json` when that environment variable is set. `setup --runtime claude` installs the same handlers. Existing model, permissions, credentials and unrelated hooks are preserved. Projects opt in with `deepseek-team init --coordinator claude`.
+The standard installer also detects Claude Code on `PATH`. It installs DeepSeek Team handlers in `~/.claude/settings.json`, or in `$CLAUDE_CONFIG_DIR/settings.json` when that environment variable is set. `setup --runtime claude` installs the same handlers. Existing model, permissions, credentials and unrelated hooks are preserved. Projects opt in with `deepseek-team init --coordinator claude /path/to/project`.
 
 ```bash
 deepseek-team hooks install --runtime claude
@@ -123,7 +160,7 @@ When updating an already attached Claude project, `deepseek-team init --coordina
 You can ask Codex to install or update DeepSeek Team for the repository it is currently working in. Paste this short prompt into Codex from the project you want to enable:
 
 ```text
-Install or update DeepSeek Team in this Linux project from https://github.com/kirill31337/deepseek-team. Use the repository's standard install.py; on Ubuntu use --with-sandbox unless a working DeepSeek Team sandbox is already configured. Preserve my existing Codex model/auth, DeepSeek Team settings, and credential. Configure Codex support without asking me to paste secrets into this prompt; if no DeepSeek key exists, leave secret entry to "deepseek-team auth set". Ensure the stable Codex lifecycle hooks are installed and healthy with "deepseek-team hooks install" and "deepseek-team hooks status". If this repository does not already contain the DeepSeek Team managed block in AGENTS.md, attach it with "deepseek-team init --coordinator codex ."; if it is already attached, do not re-run init just because the package was updated. Verify "deepseek-team --version", "deepseek-team sandbox status", "deepseek-team hooks status", and "deepseek-team doctor --runtime codex --offline". Do not use --os-sandbox off and do not weaken AppArmor/Bubblewrap. If the hooks require native Codex trust/review, use the Codex "/hooks" interface and approve/trust the DeepSeek Team package-owned hooks yourself when the current Codex environment permits it. Do not bypass Codex hook trust or modify trust state outside the native Codex mechanism. Afterwards verify with "deepseek-team hooks status". Only ask me to approve the hooks manually if native approval cannot be completed from the current Codex session.
+Install or update DeepSeek Team for /path/to/project from https://github.com/kirill31337/deepseek-team. Install it with pipx from the Git source; on Ubuntu run "deepseek-team setup --with-sandbox --no-key", otherwise run "deepseek-team setup --no-key" after the sandbox prerequisites are installed. Preserve my existing Codex model/auth, DeepSeek Team settings, and credential. Do not ask me to paste secrets into this prompt; if no DeepSeek key exists, leave secret entry to a human using "deepseek-team auth set". Attach this project with "deepseek-team init --coordinator codex /path/to/project" only if it is not already attached. Verify "deepseek-team --version", "deepseek-team sandbox status", "deepseek-team hooks status", and, from /path/to/project, "deepseek-team doctor --runtime codex --offline". Do not use --os-sandbox off or weaken AppArmor/Bubblewrap. Review/trust the package-owned hook only through Codex "/hooks"; do not bypass its native trust process.
 ```
 
 The prompt intentionally does **not** contain an API key and does not change your delegation level, access policy, or saved effort policy. Configure the private DeepSeek credential separately with `deepseek-team auth set`, and set `delegation_level` / `access` / `effort` explicitly if you want values other than the existing configuration or defaults.
@@ -310,7 +347,7 @@ Project settings live in `.deepseek-team.toml`; global settings live under the u
 
 DeepSeek Team 0.5.0 adds a small persistent coordination ledger outside the repository. It records session/task ids, deliverables, worker assignments, workspace ids, declared dependencies/checks, worker-only file deltas, results, dispositions and technical constraints. It is deliberately **not** a scheduler or project-management system.
 
-For Codex, `deepseek-team setup --runtime codex` and the standard installer place one stable user-level lifecycle hook definition in `$CODEX_HOME/hooks.json`. The hook is inert unless the current repository has already been explicitly attached with `deepseek-team init --coordinator codex`. Codex owns native hook trust; review/trust the stable definition once with Codex `/hooks`. DeepSeek Team does not bypass or infer that decision.
+For Codex, `deepseek-team setup --runtime codex` and the standard installer place one stable user-level lifecycle hook definition in `$CODEX_HOME/hooks.json`. The hook is inert unless the current repository has already been explicitly attached with `deepseek-team init --coordinator codex /path/to/project`. Codex owns native hook trust; review/trust the stable definition once with Codex `/hooks`. DeepSeek Team does not bypass or infer that decision.
 
 Claude uses the same ledger through its user-level hooks and a project attached with `init --coordinator claude`. Both integrations handle these events:
 
@@ -509,7 +546,7 @@ deepseek-team doctor --runtime auto --offline
 
 If the repository was already attached before the update, do **not** re-run `init` just for the upgrade. For a new repository, attach it once with `deepseek-team init --coordinator codex /path/to/project` (or `--coordinator both` when both coordinator instruction files are desired). In Codex, review/trust the stable hook once with `/hooks`.
 
-For pipx: `pipx upgrade codex-deepseek-team`, then run `deepseek-team hooks install --runtime auto`, `deepseek-team hooks status --runtime auto`, and `deepseek-team sandbox status`.
+For a Git-source pipx installation, use `pipx upgrade codex-deepseek-team`: pipx retains the original installation source. For a local clone, run `pipx install --force .` from that clone. With uv, use `uv tool install --force --refresh 'git+https://github.com/kirill31337/deepseek-team.git'` to refresh Git and replace the installed tool. After the PyPI release, registry installs can use `pipx upgrade codex-deepseek-team` or `uv tool upgrade codex-deepseek-team`. Then run `deepseek-team hooks install --runtime auto`, `deepseek-team hooks status --runtime auto`, and `deepseek-team sandbox status`.
 
 Detach project instructions/package-owned coordinator configuration:
 
@@ -527,7 +564,7 @@ deepseek-team sandbox remove-apparmor
 
 `reset --runtime codex` removes this package's unmodified DeepSeek provider block and its Codex hooks. `reset --runtime claude` removes only the package-owned handlers from Claude settings. Both preserve primary auth/model, permissions and unrelated configuration. Environment keys and private Codex config backups are retained.
 
-Uninstall the Python package with your package manager, or remove the installer-owned `~/.local/bin/deepseek-team`, `~/.local/bin/codex-deepseek-team` symlinks and `~/.local/share/codex-deepseek-team` directory after detaching projects.
+Run `detach` and `reset` above before uninstalling. Then use `pipx uninstall codex-deepseek-team`, `uv tool uninstall codex-deepseek-team`, or remove the installer-owned `~/.local/bin/deepseek-team`, `~/.local/bin/codex-deepseek-team` symlinks and `~/.local/share/codex-deepseek-team` directory. For a virtual environment, deactivate it and remove its directory.
 
 ## Scope
 
@@ -535,4 +572,4 @@ This release remains **Linux-only**. Windows support is deliberately deferred ra
 
 ## License
 
-[MIT](LICENSE), copyright 2026 kirill31337.
+[MIT](https://github.com/kirill31337/deepseek-team/blob/main/LICENSE), copyright 2026 kirill31337.

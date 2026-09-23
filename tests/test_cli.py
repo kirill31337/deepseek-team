@@ -34,7 +34,7 @@ class CliTests(unittest.TestCase):
         path = home / 'config.toml'
         original = b'model="another-coordinator"\nmodel_provider="openai"\n'
         path.write_bytes(original)
-        r = self.cli('setup', '--no-key')
+        r = self.cli('setup', '--configure-only', '--runtime', 'codex', '--no-key')
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(tomllib.loads(path.read_text())['model'], 'another-coordinator')
         r = self.cli('doctor', '--offline', '--os-sandbox', 'off')
