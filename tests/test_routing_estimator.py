@@ -8,7 +8,7 @@ from unittest import mock
 
 from codex_deepseek_team import routing_estimator
 
-from codex_deepseek_team.routing_estimator import estimate, evaluate, recommend
+from codex_deepseek_team.routing_estimator import estimate, evaluate, forecast
 from codex_deepseek_team.routing_models import DEFAULT_CONFIG, FEATURE_DEFAULTS
 
 NOW = 1_780_000_000.0
@@ -228,96 +228,72 @@ class PosteriorTests(unittest.TestCase):
     def test_inputs_are_not_mutated(self):
         f, rows, cfg = features(), good_history(), config()
         before = deepcopy((f, rows, cfg))
-        recommend(f, rows, cfg, access="full-access", now=NOW)
+        forecast(f, rows, cfg, now=NOW)
         evaluate(rows, cfg, now=NOW)
         self.assertEqual((f, rows, cfg), before)
 
 
-class RecommendationTests(unittest.TestCase):
-    def test_quality_and_measured_total_cost_enable_worker(self):
-        result = recommend(features(), good_history(), config(), access="full-access", now=NOW)
-        self.assertEqual(result["action"], "worker")
+class ForecastTests(unittest.TestCase):
+    def test_forecast_contains_estimates_without_executor_decision(self):
+        for card in (features(), features(kind="security", risk="protected")):
+            for mode in ("auto", "off"):
+                with self.subTest(card=card, mode=mode):
+                    result = forecast(card, [], config(mode=mode), now=NOW)
+                    self.assertEqual(set(result), {"posterior", "economics"})
+                    self.assertEqual(result["posterior"]["mean"], .5)
+                    self.assertIsNone(result["economics"]["expected_savings_usd"])
+
+    def test_measured_total_costs_are_reported(self):
+        result = forecast(features(), good_history(), config(), now=NOW)
         self.assertEqual(result["economics"]["worker_mean_cost_usd"], 1)
         self.assertEqual(result["economics"]["coordinator_mean_cost_usd"], 5)
         self.assertEqual(result["economics"]["expected_total_cost_usd"], 1)
         self.assertEqual(result["economics"]["expected_savings_usd"], 4)
 
-    def test_no_local_history_abstains_even_with_perfect_external_results(self):
-        rows = [observation(i, origin="external") for i in range(100)]
-        result = recommend(features(), rows, config(), access="full-access", now=NOW)
-        self.assertEqual(result["action"], "abstain")
-        self.assertIn("insufficient_local_evidence", result["reason_codes"])
-
     def test_economics_does_not_borrow_costs_from_another_family(self):
-        result = recommend(features(domain="rust"), good_history(), config(),
-                           access="full-access", now=NOW)
-        self.assertEqual(result["action"], "abstain")
+        result = forecast(features(domain="rust"), good_history(), config(), now=NOW)
         self.assertIsNone(result["economics"]["worker_mean_cost_usd"])
         self.assertIsNone(result["economics"]["coordinator_mean_cost_usd"])
 
-    def test_protected_or_disallowed_write_remains_coordinator(self):
-        protected = recommend(features(kind="security"), good_history(), config(),
-                              access="full-access", now=NOW)
-        self.assertEqual(protected["action"], "coordinator")
-        limited = recommend(features(), good_history(), config(), access="read-only", now=NOW)
-        self.assertEqual(limited["action"], "coordinator")
-
-    def test_unknown_risk_or_inadequate_verification_abstains(self):
-        for changes in [dict(risk="unknown"), dict(risk="high"), dict(verification="none"),
-                        dict(verification="unknown"), dict(clarity="unknown")]:
-            with self.subTest(changes=changes):
-                result = recommend(features(**changes), good_history(), config(),
-                                   access="full-access", now=NOW)
-                self.assertEqual(result["action"], "abstain")
-
-    def test_disabled_and_off_do_not_recommend_workers(self):
-        for cfg, enabled in [(config(mode="off"), True), (config(), False)]:
-            result = recommend(features(), good_history(), cfg, enabled=enabled,
-                               access="full-access", now=NOW)
-            self.assertEqual(result["action"], "coordinator")
-
-    def test_quality_requires_lower_bound_not_only_posterior_mean(self):
-        rows = good_history(5)
-        result = recommend(features(), rows, config(min_local_evidence=1),
-                           access="full-access", now=NOW)
+    def test_posterior_reports_uncertainty_beyond_a_high_mean(self):
+        result = forecast(features(), good_history(5), config(), now=NOW)
         self.assertGreater(result["posterior"]["mean"], .8)
-        self.assertEqual(result["action"], "abstain")
-        self.assertIn("quality_bound_below_threshold", result["reason_codes"])
+        self.assertLess(result["posterior"]["lower"], .8)
 
-    def test_missing_or_unrepresentative_costs_cannot_claim_savings(self):
+    def test_missing_costs_remain_unknown_and_sparse_costs_report_support(self):
         rows = good_history()
         for row in rows:
             row["cost_usd"] = None
-        result = recommend(features(), rows, config(), access="full-access", now=NOW)
-        self.assertEqual(result["action"], "abstain")
+        result = forecast(features(), rows, config(), now=NOW)
         self.assertIsNone(result["economics"]["expected_savings_usd"])
         rows[-1]["cost_usd"] = 100
         rows[0]["cost_usd"] = .01
-        result = recommend(features(), rows, config(), access="full-access", now=NOW)
-        self.assertEqual(result["action"], "abstain")
+        result = forecast(features(), rows, config(), now=NOW)
+        self.assertEqual(result["economics"]["worker_cost_cases"], 1)
+        self.assertEqual(result["economics"]["coordinator_cost_cases"], 1)
+        self.assertEqual(result["economics"]["worker_cost_effective"], 1.)
 
     def test_unlabelled_costs_are_real_cost_without_quality_failures(self):
         rows = good_history()
         rows += [observation(i + 1000, outcome="infrastructure", cost_usd=100.)
                  for i in range(50)]
-        result = recommend(features(), rows, config(), access="full-access", now=NOW)
+        result = forecast(features(), rows, config(), now=NOW)
         self.assertEqual(result["posterior"]["beta"], 1.)
         self.assertEqual(result["posterior"]["local_effective"], 50.)
         self.assertEqual(result["economics"]["worker_mean_cost_usd"], 50.5)
-        self.assertEqual(result["action"], "coordinator")
 
     def test_labelled_total_replaces_earlier_infrastructure_cost(self):
         rows = [observation(1, case_id="same", outcome="infrastructure",
                             cost_usd=3., observed_at=NOW-1),
                 observation(2, case_id="same", cost_usd=5.)]
-        result = recommend(features(), rows, config(), access="full-access", now=NOW)
+        result = forecast(features(), rows, config(), now=NOW)
         self.assertEqual(result["economics"]["worker_mean_cost_usd"], 5.)
         self.assertEqual(result["economics"]["worker_cost_cases"], 1)
 
     def test_final_cost_does_not_launder_first_rework_into_success(self):
         rows = [observation(1, case_id="same", outcome="rework", cost_usd=3., observed_at=NOW-1),
                 observation(2, case_id="same", cost_usd=8.)]
-        result = recommend(features(), rows, config(), access="full-access", now=NOW)
+        result = forecast(features(), rows, config(), now=NOW)
         self.assertEqual(result["posterior"]["alpha"], 1.)
         self.assertGreater(result["posterior"]["beta"], 1.99)
         self.assertEqual(result["economics"]["worker_mean_cost_usd"], 8.)
@@ -327,36 +303,47 @@ class RecommendationTests(unittest.TestCase):
         rows = good_history()
         for row in rows:
             row["cost_usd"] = 1 if row["action"] == "worker" else 1e-310
-        result = recommend(features(), rows, config(), access="full-access", now=NOW)
+        result = forecast(features(), rows, config(), now=NOW)
         json.dumps(result, allow_nan=False)
-        self.assertEqual(result["action"], "coordinator")
+        self.assertIsNone(result["economics"]["savings_fraction"])
 
-    def test_explicit_quality_only_config_never_invents_costs(self):
-        rows = good_history()
-        for row in rows:
-            row["cost_usd"] = None
-        result = recommend(features(), rows, config(require_cost_evidence=False),
-                           access="full-access", now=NOW)
-        self.assertEqual(result["action"], "worker")
-        self.assertIn("cost_evidence_disabled", result["reason_codes"])
-        self.assertIsNone(result["economics"]["expected_savings_usd"])
-
-    def test_expensive_worker_does_not_pass_quality_only(self):
+    def test_expensive_worker_reports_negative_measured_savings(self):
         rows = good_history()
         for row in rows:
             row["cost_usd"] = 10 if row["action"] == "worker" else 1
-        result = recommend(features(), rows, config(), access="full-access", now=NOW)
-        self.assertEqual(result["action"], "coordinator")
-        self.assertIn("insufficient_measured_savings", result["reason_codes"])
+        result = forecast(features(), rows, config(), now=NOW)
+        self.assertEqual(result["economics"]["expected_savings_usd"], -9.)
+        self.assertEqual(result["economics"]["savings_fraction"], -9.)
 
 
 class EvaluationTests(unittest.TestCase):
+    def test_evaluation_reports_observations_without_simulated_policy(self):
+        result = evaluate([observation()], config(), now=NOW)
+        self.assertNotIn("coverage", result)
+        self.assertNotIn("observed_policy", result)
+        self.assertNotIn("policy_cases", result)
+        self.assertNotIn("action", result["predictions"][0])
+
     def test_empty_evaluation_has_no_invented_metrics(self):
         result = evaluate([], config(), now=NOW)
         self.assertEqual(result["evaluated_cases"], 0)
         self.assertIsNone(result["brier_score"])
         self.assertIsNone(result["log_loss"])
-        self.assertEqual(result["coverage"], 0)
+        self.assertEqual(result["observed_cases"], 0)
+
+    def test_observed_outcomes_do_not_filter_cold_start_or_expensive_execution(self):
+        rows = [observation(1, cost_usd=12.),
+                observation(2, outcome="rework", cost_usd=None),
+                observation(3, action="coordinator", outcome="rejected", cost_usd=3.)]
+        result = evaluate(rows, config(), now=NOW)
+        self.assertEqual(result["observed_cases"], 3)
+        self.assertEqual(result["evaluated_cases"], 2)
+        self.assertEqual(result["observed_outcomes"]["worker"],
+                         {"cases": 2, "accepted": 1, "rework": 1, "rejected": 0,
+                          "cost_cases": 1, "total_cost_usd": 12., "mean_cost_usd": 12.})
+        self.assertEqual(result["observed_outcomes"]["coordinator"],
+                         {"cases": 1, "accepted": 0, "rework": 0, "rejected": 1,
+                          "cost_cases": 1, "total_cost_usd": 3., "mean_cost_usd": 3.})
 
     def test_single_outcome_is_scored_before_learning(self):
         result = evaluate([observation()], config(), now=NOW)
@@ -387,7 +374,7 @@ class EvaluationTests(unittest.TestCase):
                              observed_at=NOW-2) for i in range(50)]
         rows.append(observation(2000, observed_at=NOW-1))
         result = evaluate(rows, config(), now=NOW)
-        self.assertEqual(result["predictions"][-1]["action"], "coordinator")
+        self.assertGreater(result["predictions"][-1]["economics"]["worker_mean_cost_usd"], 50.)
         self.assertEqual(result["evaluated_cases"], 51)
 
     def test_incremental_evaluation_matches_prefix_forecasts_with_expiry_and_revisions(self):
@@ -405,7 +392,7 @@ class EvaluationTests(unittest.TestCase):
                                     reliability=rng.choice([1., .5, .1]),
                                     cost_usd=rng.choice([None, 1., 2., 20.])))
         cfg = config(half_life_days=.00005, max_evidence_age_days=.0002,
-                     min_local_evidence=1, min_success_probability=.1)
+                     min_local_evidence=1)
         result = evaluate(rows, cfg, now=NOW)
         self.assertGreater(result["evaluated_cases"], 10)
         by_id = {row["id"]: row for row in rows}
@@ -413,10 +400,14 @@ class EvaluationTests(unittest.TestCase):
             row = by_id[prediction["id"]]
             prior = [r for r in rows if r["observed_at"] < row["observed_at"]
                      and r["case_id"] != row["case_id"]]
-            expected = recommend(row["features"], prior, cfg,
-                                 access="full-access", now=row["observed_at"])
+            expected = forecast(row["features"], prior, cfg,
+                                 now=row["observed_at"])
             self.assertAlmostEqual(prediction["probability"], expected["posterior"]["mean"], places=12)
-            self.assertEqual(prediction["action"], expected["action"])
+            for name, value in expected["economics"].items():
+                if isinstance(value, (int, float)):
+                    self.assertAlmostEqual(prediction["economics"][name], value, places=10)
+                else:
+                    self.assertEqual(prediction["economics"][name], value)
 
     def test_expiring_large_cost_preserves_small_remaining_costs(self):
         rows = [observation(1000, outcome="infrastructure", cost_usd=1e12, observed_at=NOW-6)]
@@ -424,20 +415,19 @@ class EvaluationTests(unittest.TestCase):
         rows += [observation(1001, observed_at=NOW-3), observation(1002, observed_at=NOW-1)]
         cfg = config(max_evidence_age_days=4.5/86400, minimum_savings_fraction=.8)
         result = evaluate(rows, cfg, now=NOW)
-        expected = recommend(features(), rows[:-1], cfg, access="full-access", now=NOW-1)
-        self.assertEqual(expected["action"], "worker")
-        self.assertEqual(result["predictions"][-1]["action"], "worker")
+        expected = forecast(features(), rows[:-1], cfg, now=NOW-1)
+        self.assertAlmostEqual(expected["economics"]["worker_mean_cost_usd"], 1., places=12)
+        self.assertAlmostEqual(result["predictions"][-1]["economics"]["worker_mean_cost_usd"], 1., places=12)
 
     def test_incremental_decay_rollovers_and_machine_underflow(self):
         rows = [observation(i, observed_at=NOW-400+i*.25,
                             outcome="rework" if i%10 == 0 else "accepted")
                 for i in range(1300)]
-        cfg = config(half_life_days=1/86400, require_cost_evidence=False)
+        cfg = config(half_life_days=1/86400)
         result = evaluate(rows, cfg, now=NOW)
         for i in (1, 1025, 1299):
-            expected = recommend(features(), rows[:i], cfg, access="full-access", now=rows[i]["observed_at"])
+            expected = forecast(features(), rows[:i], cfg, now=rows[i]["observed_at"])
             self.assertAlmostEqual(result["predictions"][i]["probability"], expected["posterior"]["mean"], places=12)
-            self.assertEqual(result["predictions"][i]["action"], expected["action"])
         tiny_cfg = config(half_life_days=5e-324)
         tiny = evaluate([observation(i, observed_at=NOW-10+i) for i in range(5)], tiny_cfg, now=NOW)
         self.assertTrue(all(p["probability"] == .5 for p in tiny["predictions"]))
@@ -474,23 +464,23 @@ class EvaluationTests(unittest.TestCase):
             row = lookup[prediction["id"]]
             prior = [r for r in rows if r["observed_at"] < row["observed_at"]
                      and r["case_id"] != row["case_id"]]
-            expected = recommend(row["features"], prior, config(mode="off"),
-                                 access="full-access", now=row["observed_at"])
+            expected = forecast(row["features"], prior, config(mode="off"),
+                                 now=row["observed_at"])
             self.assertAlmostEqual(prediction["probability"], expected["posterior"]["mean"], places=12)
         before = evaluate(rows, config(mode="off"), now=NOW-4)
         self.assertEqual(before["predictions"][0]["outcome"], "accepted")
         self.assertEqual(before["predictions"][0]["probability"], .5)
 
-    def test_observed_policy_uses_corrected_quality_and_latest_total_cost(self):
+    def test_observed_outcomes_use_actual_executor_corrected_quality_and_latest_cost(self):
         rows = [observation(1, case_id="same", action="coordinator", observed_at=NOW-3, cost_usd=1.),
                 observation(2, case_id="same", action="coordinator", outcome="rejected", observed_at=NOW-2, cost_usd=7.),
                 observation(3, case_id="same", action="coordinator", observed_at=NOW-1, cost_usd=9.)]
         result = evaluate(rows, config(mode="off"), now=NOW)
-        self.assertEqual(result["policy_cases"], 1)
-        self.assertEqual(result["observed_policy"]["matched_cases"], 1)
-        self.assertEqual(result["observed_policy"]["accepted"], 0)
-        self.assertEqual(result["observed_policy"]["rejected"], 1)
-        self.assertEqual(result["observed_policy"]["mean_cost_usd"], 9.)
+        self.assertEqual(result["observed_cases"], 1)
+        self.assertEqual(result["observed_outcomes"]["coordinator"]["cases"], 1)
+        self.assertEqual(result["observed_outcomes"]["coordinator"]["accepted"], 0)
+        self.assertEqual(result["observed_outcomes"]["coordinator"]["rejected"], 1)
+        self.assertEqual(result["observed_outcomes"]["coordinator"]["mean_cost_usd"], 9.)
 
     def test_expired_acceptance_can_be_corrected_but_expired_failure_stays_failed(self):
         rows = [observation(1, case_id="same", observed_at=NOW-10),
@@ -523,7 +513,6 @@ class EvaluationTests(unittest.TestCase):
         rows.append(observation(1000, features=features(kind="review", domain="rust", operation="review")))
         result = evaluate(rows, config(min_similarity=0), now=NOW)
         self.assertEqual(result["predictions"][-1]["probability"], .5)
-        self.assertEqual(result["predictions"][-1]["action"], "abstain")
 
     def test_repeated_context_evaluation_does_not_rescan_each_prior_case(self):
         rows = [observation(i, observed_at=NOW-2000+i) for i in range(1200)]

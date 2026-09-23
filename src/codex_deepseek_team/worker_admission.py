@@ -51,8 +51,8 @@ def acquire(args, api, *, policy=None, root=None):
                         and not (started and row['status'] == 'running')):
                     raise api.WorkerError(78, 'Assignment is already active or completed; it cannot launch again.')
                 if (item.get('routing') or {}).get('requested_executor') == 'auto':
-                    RoutingService(root).start_recovery(item['routing']['decision_id'],
-                        already_running=(resuming or started) and row['status'] == 'running', validate_only=True,
+                    RoutingService(root).validate_start(item['routing']['decision_id'],
+                        already_running=(resuming or started) and row['status'] == 'running',
                         access=coordination._effective_task_access(task, current))
         except (settings.SettingsError, coordination.CoordinationError, RoutingError) as error:
             raise api.WorkerError(getattr(error, 'code', 78), str(error)) from None

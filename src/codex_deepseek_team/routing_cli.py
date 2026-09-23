@@ -51,14 +51,10 @@ def _parser() -> argparse.ArgumentParser:
     configure = commands.add_parser('configure')
     _add_path(configure)
     configure.add_argument('--mode', choices=('off', 'shadow', 'advisory', 'auto'))
-    configure.add_argument('--admission-policy', choices=('immediate', 'evidence'),
-                           help='immediate delegates suitable tasks from first use (default).')
     for key in DEFAULT_CONFIG:
-        if key in ('mode', 'admission_policy', 'require_cost_evidence'):
+        if key == 'mode':
             continue
         configure.add_argument('--' + key.replace('_', '-'), dest=key, type=float)
-    configure.add_argument('--require-cost-evidence', action=argparse.BooleanOptionalAction,
-                           default=None)
 
     imported = commands.add_parser('import', help='Import a local, integrity-pinned evidence snapshot.')
     _add_path(imported)
@@ -103,13 +99,6 @@ def _parser() -> argparse.ArgumentParser:
     _add_path(release)
     release.add_argument('id')
 
-    recovery = commands.add_parser('recovery')
-    recovery_commands = recovery.add_subparsers(dest='recovery_command', required=True)
-    recovery_status = recovery_commands.add_parser('status')
-    _add_path(recovery_status)
-    recovery_release = recovery_commands.add_parser('release')
-    _add_path(recovery_release)
-    recovery_release.add_argument('id')
     return parser
 
 
@@ -232,11 +221,6 @@ def main(argv) -> int:
                 return 0
             _write_export(args.output, service)
             result = {'output': str(args.output)}
-        elif args.command == 'recovery':
-            if args.recovery_command == 'status':
-                result = service.recovery_status()
-            else:
-                result = service.release_recovery(args.id)
         elif args.budget_command == 'reserve':
             result = service.reserve_experiment(args.id, args.amount_usd)
         elif args.budget_command == 'settle':

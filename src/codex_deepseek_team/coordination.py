@@ -226,32 +226,9 @@ def _deliverable_outcome(task, item):
     if 'result_invalidated_at' in item:
         return 'invalidated'
     result = item.get('result')
-    outcome, recorded_at = 'pending', None
-    if isinstance(result, dict):
-        outcome, recorded_at = result.get('outcome') or 'pending', result.get('recorded_at')
-    elif item.get('executor') == 'coordinator':
-        # Older ledgers stored explicit outcomes only in the router outbox.
-        feedback = item.get('routing_feedback') or []
-        if feedback:
-            observation = feedback[-1].get('observation', {})
-            if observation.get('action') == 'coordinator':
-                outcome = observation.get('outcome') or 'pending'
-                recorded_at = observation.get('observed_at')
-    if outcome in ('accepted', 'cancelled'):
-        for event in task.get('coordinator_events', []):
-            if event.get('kind') != 'mutation_requested':
-                continue
-            at = event.get('at')
-            if (isinstance(at, (int, float)) and isinstance(recorded_at, (int, float))
-                    and at <= recorded_at):
-                continue
-            # Older hooks recorded mutations without marking result invalidation.
-            # Missing timing/project data cannot establish that acceptance is fresh.
-            project = task.get('project')
-            if not project or _mutation_touches_scope(
-                    Path(project), event.get('paths'), item.get('scope', [])):
-                return 'invalidated'
-    return outcome
+    if not isinstance(result, dict):
+        return 'pending'
+    return result.get('outcome') or 'pending'
 
 
 def completion_issues(task):
@@ -349,7 +326,7 @@ def _normalize_deliverable(raw: dict) -> dict:
                 "Protected coordinator responsibilities cannot be assigned to a native agent.", 64)
     value = dict(raw)
     # Derived state is read only from our ledger, never accepted from a plan.
-    for key in ('routing', 'routing_feedback', 'result', 'result_evidence', 'result_invalidated_at'):
+    for key in ('routing', 'routing_feedback', 'result', 'result_invalidated_at'):
         value.pop(key, None)
     value["scope"] = list(raw["scope"]) if isinstance(raw["scope"], list) else [str(raw["scope"])]
     value["acceptance"] = list(raw["acceptance"])
@@ -394,18 +371,17 @@ def _prepare_routing(root, task, items, service):
                 raise CoordinationError('Started deliverable scope and features are immutable; use a new deliverable id.', 64)
             item['executor'] = prior['executor']
             item['routing'] = prior.get('routing')
-            for key in ('routing_feedback', 'result', 'result_evidence', 'result_invalidated_at'):
+            for key in ('routing_feedback', 'result', 'result_invalidated_at'):
                 if key in prior:
                     item[key] = prior[key]
             continue
         requested = item['executor']
         if requested == 'auto' and service.config()['mode'] != 'auto':
             raise CoordinationError('executor:auto requires routing mode auto.', 64)
-        from .routing_immediate import manual_acceptance
+        from .routing_admission import manual_acceptance
         decision = service.predict(item['features'], access=task['policy']['effective_access'],
                                    binding=_binding(task['id'], item),
-                                   recovery=requested == 'auto' and task['policy']['delegation_level'] == 'auto'
-                                   and (bool(item['checks']) or manual_acceptance(item)))
+                                   verification_ready=bool(item['checks']) or manual_acceptance(item))
         if requested == 'auto':
             item['executor'] = 'worker' if decision['action'] == 'worker' else 'coordinator'
         item['routing'] = {'decision_id': decision['id'], 'requested_executor': requested,
@@ -451,7 +427,6 @@ def plan_task(root: Path, task_id: str, plan: dict) -> dict:
     root = _project_root(root)
     with _lock(root), _routing_batch(root) as service:
         task = load_task(root, task_id)
-        old_deliverables = task.get('deliverables', [])
         try:
             _prepare_routing(root, task, deliverables, service)
         except RoutingError as error:
@@ -494,26 +469,7 @@ def plan_task(root: Path, task_id: str, plan: dict) -> dict:
                     small_evidence=plan.get("small_evidence"),
                     deliverables=deliverables, assignments=assignments,
                     status="planned", updated_at=time.time())
-        # All routing changes stay uncommitted until the ledger is durable.
-        retained_tickets = set()
-        for item in deliverables:
-            if item.get('routing'):
-                info = service.decision(item['routing']['decision_id']).get('recovery') or {}
-                if info.get('selected'):
-                    retained_tickets.add(info['ticket_id'])
-        for item in old_deliverables:
-            if item.get('routing'):
-                try:
-                    info = service.decision(item['routing']['decision_id']).get('recovery') or {}
-                except RoutingError as error:
-                    if error.code != 66:
-                        raise
-                    # A crash after ledger rename but before the routing commit
-                    # can leave a safe-invalid planned decision. Replanning
-                    # replaces it; a rolled-back ticket cannot need release.
-                    continue
-                if info.get('selected') and info['ticket_id'] not in retained_tickets:
-                    service.release_recovery(info['ticket_id'])
+        # Persist the ledger before the surrounding routing transaction commits.
         _atomic(_task_path(root, task_id), task)
         return task
 
@@ -662,7 +618,8 @@ def assignment_started(root: Path, task_id: str, assignment_id: str,
                     decision = service.predict(row['routing_features'], access=task['policy']['effective_access'])
                     row['routing_decision_id'] = decision['id']
                     _atomic(_task_path(root, task_id), task)
-                service.start_recovery(row['routing_decision_id'], already_running=True)
+                service.validate_start(row['routing_decision_id'], already_running=True,
+                    access=_effective_task_access(task, settings.resolve(root)))
             return task
         if row["status"] not in ("planned", "failed"):
             raise CoordinationError("Assignment is already active or completed.", 64)
@@ -682,7 +639,7 @@ def assignment_started(root: Path, task_id: str, assignment_id: str,
                 decision = (service.decision(item['routing']['decision_id']) if auto else
                             service.predict(features, access=task['policy']['effective_access']))
                 if auto:
-                    service.start_recovery(decision['id'],
+                    service.validate_start(decision['id'],
                         access=_effective_task_access(task, settings.resolve(root)))
             except RoutingError as error:
                 raise CoordinationError(error.message, error.code) from None
@@ -842,7 +799,6 @@ def observe_coordinator_result(root: Path, task_id: str, deliverable_id: str,
         if cost_usd is not None:
             item['result']['cost_usd'] = cost_usd
         item.pop('result_invalidated_at', None)
-        item['result_evidence'] = evidence[:2000]
         if task.get('status') == 'completed' and completion_issues(task):
             task['status'] = 'active'
             task.pop('completed_at', None)

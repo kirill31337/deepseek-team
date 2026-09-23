@@ -188,7 +188,6 @@ class LiveDemoTests(LiveBase):
             delegation_level='auto', access='full-access')
         policy = self.policy('auto', 'full-access')
         service = RoutingService(self.source)
-        service.configure({'recovery_rate': .25, 'admission_policy': 'evidence'})
         copy, sibling = [workspace.create(self.source, self.state) for _ in range(2)]
         task = coordination.open_task(
             self.source, session_id='session-' + failure_point,
@@ -210,7 +209,9 @@ class LiveDemoTests(LiveBase):
             }],
         })
         self.assertEqual(planned['deliverables'][0]['executor'], 'worker')
-        self.assertEqual(service.recovery_status()['pending_count'], 1)
+        decision_id = planned['deliverables'][0]['routing']['decision_id']
+        decision = service.decision(decision_id)
+        self.assertEqual(planned['assignments'][0]['status'], 'planned')
         aid = planned['assignments'][0]['id']
         args = self.args(self.task('fix', sibling), coord_task=task['id'], coord_assignment=aid)
         error = (workspace.WorkspaceError('simulated post-start preparation failure')
@@ -222,11 +223,16 @@ class LiveDemoTests(LiveBase):
         assignment = coordination.load_task(self.source, task['id'])['assignments'][0]
         self.assertEqual(assignment['status'], 'failed')
         self.assertEqual(assignment['error_kind'], 'environment')
+        self.assertEqual(assignment['workspace_id'], copy.id)
+        self.assertEqual(assignment['routing_decision_id'], decision_id)
+        self.assertTrue(assignment['routing_feedback'][0]['recorded'])
         observations = service.observations()
         self.assertEqual(len(observations), 1)
         self.assertEqual(observations[0]['outcome'], 'infrastructure')
         self.assertNotIn(observations[0]['outcome'], ('rework', 'rejected'))
-        self.assertEqual(service.recovery_status()['running_count'], 0)
+        self.assertEqual(service.decision(decision_id), decision)
+        self.assertEqual(service.status()['decisions'], 1)
+        self.assertFalse(service.status()['admission']['active_cooldowns'])
 
     def test_copy_begin_failure_after_assignment_start_is_reconciled(self):
         self._assert_post_start_preparation_failure_is_reconciled('begin')

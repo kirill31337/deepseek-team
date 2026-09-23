@@ -76,7 +76,7 @@ class RoutingStore:
             raise RoutingError('Routing state must be outside the project working tree.', 78)
         self.state = state
         key = hashlib.sha256(os.fsencode(str(self.root))).hexdigest()[:24]
-        self.path = state / 'routing' / key / 'routing.sqlite3'
+        self.path = state / 'routing' / key / 'routing-v3.sqlite3'
 
     @contextmanager
     def transaction(self):
@@ -129,35 +129,28 @@ class RoutingStore:
 
     def _initialize(self, db):
         version = db.execute('PRAGMA user_version').fetchone()[0]
-        if version not in (0, 1, 2):
-            raise RoutingError('Routing state schema is newer than this package; upgrade before opening.', 78)
+        if version not in (0, 3):
+            raise RoutingError('Unsupported routing state format; this package only opens format 3. Existing data was not migrated.', 78)
         if version == 0:
-            for sql in BASE_SCHEMA.values():
+            from . import routing_admission
+            for sql in (*BASE_SCHEMA.values(), *INDEX_SCHEMA.values()):
                 db.execute(sql)
+            routing_admission.initialize(db)
             db.execute('INSERT INTO metadata VALUES (?, ?)', ('project', str(self.root)))
-        self._verify_schema(db, with_index=version == 2)
-        if version < 2:
-            for sql in INDEX_SCHEMA.values():
-                db.execute(sql)
-            for record in db.execute('SELECT value FROM observations').fetchall():
-                self._index(db, read_json(record[0]))
-            db.execute('PRAGMA user_version=2')
+            db.execute('PRAGMA user_version=3')
+        self._verify_schema(db)
         row = db.execute("SELECT value FROM metadata WHERE key='project'").fetchone()
         if row is None or row[0] != str(self.root):
             raise RoutingError('Routing state belongs to another project.', 78)
 
     @staticmethod
-    def _verify_schema(db, *, with_index):
-        from . import routing_bootstrap, routing_budget, routing_recovery
+    def _verify_schema(db):
+        from . import routing_admission, routing_budget
         expected = dict(BASE_SCHEMA)
-        if with_index:
-            expected.update(INDEX_SCHEMA)
+        expected.update(INDEX_SCHEMA)
         budget = dict(zip(('routing_budget', *routing_budget.INDEXES), routing_budget._SCHEMA))
         expected.update(budget)
-        recovery = routing_recovery.SCHEMA
-        expected.update(recovery)
-        bootstrap = routing_bootstrap.SCHEMA
-        expected.update(bootstrap)
+        expected.update(routing_admission.SCHEMA)
         def normalized(sql):
             return re.sub(r'\s+', ' ', sql.replace('IF NOT EXISTS ', '')).strip()
         present = set()
@@ -167,10 +160,8 @@ class RoutingStore:
             if kind not in ('table', 'index') or name not in expected or normalized(sql or '') != normalized(expected[name]):
                 raise RoutingError('Unexpected routing database schema; refusing changed tables, views or triggers.', 78)
             present.add(name)
-        required = set(BASE_SCHEMA) | (set(INDEX_SCHEMA) if with_index else set())
-        if (not required <= present or (present & set(budget) and not set(budget) <= present)
-                or (present & set(recovery) and not set(recovery) <= present)
-                or (present & set(bootstrap) and not set(bootstrap) <= present)):
+        required = set(BASE_SCHEMA) | set(INDEX_SCHEMA) | set(routing_admission.SCHEMA)
+        if not required <= present or (present & set(budget) and not set(budget) <= present):
             raise RoutingError('Routing database schema is incomplete.', 78)
 
     @staticmethod

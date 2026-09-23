@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """DeepSeek worker entrypoint for isolated delegated work. Python 3.11+, Linux."""
 import argparse
-import fcntl
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -16,6 +14,8 @@ import sys
 import tempfile
 import time
 import tomllib
+
+from . import sandbox
 
 
 MODEL = 'deepseek-flash'
@@ -131,7 +131,7 @@ def acquire_slot(state, **options):
 
 def acquire_job_slot(args, *, policy=None, root=None):
     from codex_deepseek_team import worker_admission
-    return worker_admission.acquire(args, sys.modules.get(__name__) or _worker_api(),
+    return worker_admission.acquire(args, sys.modules[__name__],
                                     policy=policy, root=root)
 
 
@@ -233,33 +233,9 @@ def resolve_runtime(requested, codex='codex', claude='claude'):
     raise WorkerError(78, f'{label} executable is unavailable.')
 
 
-def _sandbox_module():
-    """Load the sibling support module even when this file is executed directly."""
-    name = '_deepseek_team_os_sandbox'
-    if name in sys.modules:
-        return sys.modules[name]
-    path = Path(__file__).resolve().with_name('sandbox.py')
-    try:
-        spec = importlib.util.spec_from_file_location(name, path)
-        if spec is None or spec.loader is None:
-            raise ImportError('sandbox module spec unavailable')
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
-        try:
-            spec.loader.exec_module(module)
-        except BaseException:
-            sys.modules.pop(name, None)
-            raise
-        return module
-    except (OSError, ImportError):
-        raise WorkerError(78, 'OS sandbox support is unavailable; reinstall DeepSeek Team.') from None
-
-
 def resolve_os_sandbox(policy):
-    if policy == 'off':
-        print('WARNING: DeepSeek Team OS sandbox disabled explicitly for this worker.', file=sys.stderr)
-        return None, None
-    sandbox = _sandbox_module()
+    if policy != 'required':
+        raise WorkerError(64, 'The Linux OS sandbox is required for every worker.')
     try:
         return sandbox, sandbox.probe_backend()
     except sandbox.SandboxError as error:
@@ -362,48 +338,36 @@ def runtime_result(runtime, raw):
     raise WorkerError(64, f'Unsupported worker runtime: {runtime}.')
 
 
-def _worker_api():
-    from types import SimpleNamespace
-    return SimpleNamespace(**globals())
-
-
 def run(args):
-    if os.environ.get('DEEPSEEK_TEAM_DISABLED') == '1' or os.environ.get('CODEX_DEEPSEEK_DISABLED') == '1':
+    if os.environ.get('DEEPSEEK_TEAM_DISABLED') == '1':
         raise WorkerError(69, 'DeepSeek delegation disabled; the coordinator should continue locally.')
-    # Support direct execution and legacy standalone read-only deployments.
-    sibling = Path(__file__).resolve().with_name('settings.py')
-    if sibling.exists():
-        package_parent = str(sibling.parent.parent)
-        if package_parent not in sys.path:
-            sys.path.insert(0, package_parent)
-        from codex_deepseek_team import activation, settings, workspace, managed
-        try:
-            copy = workspace.load(args.state_dir, args.workspace) if getattr(args, 'workspace', None) else None
-            root = settings.project_root(copy.source if copy else Path.cwd(), required=copy is not None)
-            if not activation.resolve(root).enabled:
-                raise WorkerError(69, activation.DISABLED_GUIDANCE)
-            policy = settings.resolve(
-                root,
-                delegation_level=getattr(args, 'delegation_level', None),
-                access=getattr(args, 'access', None),
-                effort=getattr(args, 'effort', None),
-                max_workers=getattr(args, 'max_workers', None),
-            )
-        except (settings.SettingsError, workspace.WorkspaceError) as error:
-            raise WorkerError(getattr(error, 'code', 78), str(error)) from None
-        print(settings.describe(policy), file=sys.stderr)
-        args.max_workers = policy.max_workers
-        args.resolved_policy = policy
-        args.policy_root = root
-        if policy.effort == 'auto':
-            args.effort = DEFAULT_EFFORT
-            print('DeepSeek effort auto: no concrete frontier selection reached the runner; using medium fallback.', file=sys.stderr)
-        else:
-            args.effort = policy.effort
-        if policy.effective_access == 'full-access' or copy is not None or getattr(args, 'coord_task', None):
-            return managed.run(args, policy, sys.modules.get(__name__) or _worker_api(), copy)
-    elif any(getattr(args, name, None) for name in ('delegation_level', 'access', 'effort', 'workspace')):
-        raise WorkerError(78, 'Delegation configuration support is unavailable; reinstall DeepSeek Team.')
+    from . import activation, settings, workspace
+    try:
+        copy = workspace.load(args.state_dir, args.workspace) if getattr(args, 'workspace', None) else None
+        root = settings.project_root(copy.source if copy else Path.cwd(), required=copy is not None)
+        if not activation.resolve(root).enabled:
+            raise WorkerError(69, activation.DISABLED_GUIDANCE)
+        policy = settings.resolve(
+            root,
+            delegation_level=getattr(args, 'delegation_level', None),
+            access=getattr(args, 'access', None),
+            effort=getattr(args, 'effort', None),
+            max_workers=getattr(args, 'max_workers', None),
+        )
+    except (settings.SettingsError, workspace.WorkspaceError) as error:
+        raise WorkerError(getattr(error, 'code', 78), str(error)) from None
+    print(settings.describe(policy), file=sys.stderr)
+    args.max_workers = policy.max_workers
+    args.resolved_policy = policy
+    args.policy_root = root
+    if policy.effort == 'auto':
+        args.effort = DEFAULT_EFFORT
+        print('DeepSeek effort auto: no concrete frontier selection reached the runner; using medium fallback.', file=sys.stderr)
+    else:
+        args.effort = policy.effort
+    if policy.effective_access == 'full-access' or copy is not None or getattr(args, 'coord_task', None):
+        from . import managed
+        return managed.run(args, policy, sys.modules[__name__], copy)
     return run_worker(args)
 
 
@@ -430,13 +394,13 @@ def run_worker(args):
             if runtime == 'codex':
                 transient_config(home)
             env = child_environment(home, key, runtime, effort)
-            if sandbox is not None and runtime == 'codex':
+            if runtime == 'codex':
                 try:
                     env = sandbox.prepare_codex_environment(home, env, backend)
                 except sandbox.SandboxError as error:
                     raise WorkerError(error.code, error.message) from None
             base_command = command(binary, runtime, effort)
-            if sandbox is not None and runtime == 'claude':
+            if runtime == 'claude':
                 try:
                     base_command = sandbox.wrap_command(
                         base_command, cwd=Path.cwd(), session_home=home,
@@ -473,37 +437,21 @@ def run_worker(args):
         os.close(slot)
 
 
-def _delegation_level_options():
-    """Share settings.parse_level/LEVELS, tolerating direct legacy execution."""
-    sibling = Path(__file__).resolve().with_name('settings.py')
-    if sibling.exists():
-        package_parent = str(sibling.parent.parent)
-        if package_parent not in sys.path:
-            sys.path.insert(0, package_parent)
-        try:
-            from codex_deepseek_team import settings
-        except ImportError:
-            pass
-        else:
-            return settings.parse_level, settings.LEVELS
-    return int, (25, 50, 75)
-
-
 def parse_args():
+    from . import settings
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('task', nargs='?', help='Task; stdin is preferred for private content.')
     parser.add_argument('--runtime', choices=['codex', 'claude', 'auto'], default='codex',
                         help='CLI harness for the DeepSeek worker; default: codex.')
-    parser.add_argument('--os-sandbox', choices=['required', 'off'], default='required',
-                        help='required: enforce Bubblewrap/AppArmor containment (default); off: explicit unsafe compatibility bypass.')
+    parser.add_argument('--os-sandbox', choices=['required'], default='required',
+                        help='Enforce the required Bubblewrap/AppArmor containment.')
     parser.add_argument('--effort', choices=EFFORT_LEVELS,
                         help='One-job DeepSeek Flash effort override. Omit to use saved policy; policy default is auto.')
     parser.add_argument('--timeout', type=float, default=0,
                         help='0: wait without a total deadline (default); 1..900: total seconds including queue and retries.')
     parser.add_argument('--attempts', type=int, choices=[1, 2, 3],
                         help='Read-only: 2 by default. Managed full-access uses one attempt and explicit resume.')
-    level_type, level_choices = _delegation_level_options()
-    parser.add_argument('--delegation-level', type=level_type, choices=level_choices,
+    parser.add_argument('--delegation-level', type=settings.parse_level, choices=settings.LEVELS,
                         help='auto adapts per task; 25/50/75 force a fixed profile.')
     parser.add_argument('--access', choices=['auto', 'read-only', 'full-access'])
     parser.add_argument('--max-workers', type=int, choices=range(1, 65), metavar='1..64',
@@ -525,8 +473,6 @@ def parse_args():
         parser.error('--coord-task and --coord-assignment must be supplied together')
     if args.resume_after_failure and not args.workspace:
         parser.error('--resume-after-failure requires an owned --workspace ID')
-    if args.access == 'full-access' and args.os_sandbox == 'off':
-        parser.error('full-access requires the OS sandbox; --os-sandbox off is incompatible')
     if args.access == 'full-access' and args.attempts not in (None, 1):
         parser.error('full-access never retries automatically; --attempts must be 1')
     if args.attempts is None:

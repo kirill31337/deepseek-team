@@ -1,7 +1,6 @@
 """Generic local diagnostics and optional synthetic DeepSeek smoke tests."""
 import argparse
 import hashlib
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -14,16 +13,17 @@ import time
 import urllib.error
 import urllib.request
 
-HERE = Path(__file__).resolve().parent
-spec = importlib.util.spec_from_file_location('worker', HERE / 'worker.py')
-worker = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(worker)
+from . import activation, settings, worker
+
+PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 
 
 def call(task, cwd=None, runtime='codex', os_sandbox='required'):
-    return subprocess.run([sys.executable, str(HERE / 'worker.py'), '--runtime', runtime,
+    return subprocess.run([sys.executable, '-P', '-m', 'codex_deepseek_team.worker',
+                           '--runtime', runtime, '--access', 'read-only',
                            '--os-sandbox', os_sandbox],
-                          input=task, text=True, capture_output=True, cwd=cwd)
+                          input=task, text=True, capture_output=True, cwd=cwd,
+                          env=dict(os.environ, PYTHONPATH=str(PACKAGE_ROOT)))
 
 
 def repository_fingerprint(root=None):
@@ -66,18 +66,12 @@ def stream_model(lines):
 
 
 def _delegation_disabled():
-    # Keep direct doctor.py execution working as well as package entry points.
-    if os.environ.get('DEEPSEEK_TEAM_DISABLED') == '1' or os.environ.get('CODEX_DEEPSEEK_DISABLED') == '1':
+    if os.environ.get('DEEPSEEK_TEAM_DISABLED') == '1':
         return True
-    if (HERE / 'activation.py').exists():
-        if str(HERE.parent) not in sys.path:
-            sys.path.insert(0, str(HERE.parent))
-        from codex_deepseek_team import activation, settings
-        try:
-            return not activation.resolve().enabled
-        except settings.SettingsError as error:
-            raise worker.WorkerError(78, str(error)) from None
-    return False
+    try:
+        return not activation.resolve().enabled
+    except settings.SettingsError as error:
+        raise worker.WorkerError(78, str(error)) from None
 
 
 def api_probe():
@@ -221,8 +215,9 @@ def live_tests(runtimes=('codex',), os_sandbox='required'):
         print('Live check blocked: set a DeepSeek key with deepseek-team auth set.')
         return 78
     code, out, err = worker.execute(
-        [sys.executable, str(Path(__file__).resolve()), '--api-probe'],
-        worker.child_environment(worker.codex_home(), key), '', 120)
+        [sys.executable, '-P', '-m', 'codex_deepseek_team.doctor', '--api-probe'],
+        dict(worker.child_environment(worker.codex_home(), key),
+             PYTHONPATH=str(PACKAGE_ROOT)), '', 120)
     if out.strip():
         print(worker.redact(out.strip(), key))
     if code:
@@ -254,9 +249,9 @@ def main(argv=None):
     group.add_argument('--offline', action='store_true', help='Local checks only (default); no network or key reads.')
     group.add_argument('--live', action='store_true', help='Also verify DeepSeek API routing and synthetic worker(s); API charges apply.')
     parser.add_argument('--runtime', choices=['codex', 'claude', 'both', 'auto'], default='codex',
-                        help='Runtime(s) to verify; default codex preserves legacy behavior.')
-    parser.add_argument('--os-sandbox', choices=['required', 'off'], default='required',
-                        help='required: verify Bubblewrap/AppArmor containment (default); off: explicitly skip only this OS-layer check.')
+                        help='Runtime(s) to verify; default: codex.')
+    parser.add_argument('--os-sandbox', choices=['required'], default='required',
+                        help='Verify the required Bubblewrap/AppArmor containment.')
     parser.add_argument('--delegation-level', type=delegation_settings.parse_level,
                         choices=delegation_settings.LEVELS,
                         help='Per-diagnostic override; auto adapts per task, 25/50/75 force a fixed profile.')
@@ -272,17 +267,11 @@ def main(argv=None):
         if args.live and not policy.enabled:
             print('Live check disabled by DeepSeek delegation switch.')
             return 69
-        if policy.effective_access == 'full-access' and args.os_sandbox == 'off':
-            raise worker.WorkerError(
-                64, 'Effective full-access requires the OS sandbox; diagnostics cannot validate it with --os-sandbox off.')
-        if args.os_sandbox == 'required':
-            sandbox, backend = worker.resolve_os_sandbox('required')
-            print(f'OS sandbox: PASS ({backend.source}, {backend.bwrap})')
-            restriction = sandbox.apparmor_restriction()
-            if restriction is not None:
-                print(f'kernel.apparmor_restrict_unprivileged_userns={restriction}')
-        else:
-            print('OS sandbox check: SKIPPED by explicit --os-sandbox off.')
+        sandbox, backend = worker.resolve_os_sandbox('required')
+        print(f'OS sandbox: PASS ({backend.source}, {backend.bwrap})')
+        restriction = sandbox.apparmor_restriction()
+        if restriction is not None:
+            print(f'kernel.apparmor_restrict_unprivileged_userns={restriction}')
         runtimes = selected_runtimes(args.runtime)
         for runtime in runtimes:
             check_policy_runtime(runtime, policy)

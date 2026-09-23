@@ -24,7 +24,6 @@ class ServiceTests(unittest.TestCase):
         self.env.start()
         self.addCleanup(self.env.stop)
         self.service = RoutingService(self.root)
-        self.service.configure({'admission_policy': 'evidence', 'recovery_cooldown_seconds': 3600})
         self.features = validate_features(dict(kind='implementation', domain='python', operation='fix',
             localization='known', coupling='local', verification='tests', clarity='clear', risk='low', scope_size='small'))
 
@@ -106,8 +105,8 @@ class ServiceTests(unittest.TestCase):
             self.service.observe(dict(row, id='different', case_id='different-case'))
 
     def test_decisions_persist_bounded_evidence_references(self):
-        prediction = dict(action='abstain', reason_codes=[], posterior={'evidence_ids': [str(n) for n in range(1000)]}, economics={})
-        with patch('codex_deepseek_team.routing.routing_estimator.recommend', return_value=prediction):
+        prediction = dict(posterior={'evidence_ids': [str(n) for n in range(1000)]}, economics={})
+        with patch('codex_deepseek_team.routing.routing_estimator.forecast', return_value=prediction):
             result = self.service.predict(self.features)
         saved = self.service.decision(result['id'])
         self.assertEqual(len(saved['posterior']['evidence_ids']), 128)

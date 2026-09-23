@@ -12,7 +12,7 @@ import tempfile
 from . import settings
 from .config import sync_directory
 
-DISABLE_VARIABLES = ('DEEPSEEK_TEAM_DISABLED', 'CODEX_DEEPSEEK_DISABLED')
+DISABLE_VARIABLE = 'DEEPSEEK_TEAM_DISABLED'
 DISABLED_GUIDANCE = (
     'DeepSeek Team is disabled for this project. Continue locally without DeepSeek '
     'delegation or coordination-plan requirements. Do not re-enable it unless the '
@@ -72,9 +72,8 @@ def _saved(root: Path | None) -> tuple[bool, str]:
 def resolve(root: Path | None = None) -> Activation:
     root = settings.project_root(root)
     saved, source = _saved(root)
-    for name in DISABLE_VARIABLES:
-        if os.environ.get(name) == '1':
-            return Activation(False, saved, 'environment:' + name)
+    if os.environ.get(DISABLE_VARIABLE) == '1':
+        return Activation(False, saved, 'environment:' + DISABLE_VARIABLE)
     return Activation(saved, saved, source)
 
 

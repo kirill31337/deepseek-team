@@ -1,5 +1,7 @@
 # Hybrid delegation routing
 
+> Historical record: this document describes an earlier implementation or verification run. Commands, defaults and compatibility claims here are not current instructions. See [README](https://github.com/kirill31337/deepseek-team/blob/main/README.md) and the current routing guide for supported behavior.
+
 ## Authorized outcome
 
 Implement the user's complete hybrid delegation system: public reproducible evidence supplies a bounded prior; actual project assignments supply contextual learning; a conservative, explainable policy can select an executor. This is production package functionality, not a model fine-tuning job or a promised benchmark score. The user explicitly requested implementation without another planning round.

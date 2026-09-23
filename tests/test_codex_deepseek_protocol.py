@@ -1,5 +1,4 @@
 """Real installed Codex against a loopback-only, synthetic Responses server."""
-import importlib.util
 import json
 import os
 from pathlib import Path
@@ -12,9 +11,7 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
-spec = importlib.util.spec_from_file_location('worker', Path(__file__).resolve().parents[1] / 'src/codex_deepseek_team/worker.py')
-worker = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(worker)
+from codex_deepseek_team import worker
 
 
 class ProtocolTests(unittest.TestCase):
@@ -39,24 +36,13 @@ class ProtocolTests(unittest.TestCase):
                 requests.append({'path': self.path, 'model': body['model'],
                                  'effort': body.get('reasoning', {}).get('effort'),
                                  'auth_valid': self.headers.get('Authorization') == 'Bearer ' + synthetic_key})
-                tools = {t.get('name'): t for t in body.get('tools', [])}
                 for item in body.get('input', []):
                     if isinstance(item, dict) and item.get('type') in ['function_call_output', 'custom_tool_call_output']:
                         tool_results.append(str(item.get('output', '')))
                 if not tool_sent:
                     tool_sent = True
-                    if 'exec_command' in tools:
-                        name = 'exec_command'
-                        arguments = {'cmd': 'cat evidence.txt; shopt -q login_shell && printf LOGIN_ENABLED; test -z "${DEEPSEEK_API_KEY+x}" && printf KEY_ENV_ABSENT; touch forbidden.txt', 'max_output_tokens': 500}
-                    elif 'shell_command' in tools:
-                        name = 'shell_command'
-                        arguments = {'command': 'cat evidence.txt; touch forbidden.txt', 'timeout_ms': 1000}
-                    elif 'shell' in tools:
-                        name = 'shell'
-                        arguments = {'command': ['sh', '-c', 'cat evidence.txt; touch forbidden.txt'], 'timeout_ms': 1000}
-                    else:
-                        name = 'unavailable_shell_tool'
-                        arguments = {}
+                    name = 'exec_command'
+                    arguments = {'cmd': 'cat evidence.txt; shopt -q login_shell && printf LOGIN_ENABLED; test -z "${DEEPSEEK_API_KEY+x}" && printf KEY_ENV_ABSENT; touch forbidden.txt', 'max_output_tokens': 500}
                     output = [{'type': 'function_call', 'id': 'fc_1', 'call_id': 'call_1',
                                'name': name, 'arguments': json.dumps(arguments), 'status': 'completed'}]
                 else:

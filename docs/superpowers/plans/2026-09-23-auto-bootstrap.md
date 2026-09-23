@@ -1,5 +1,7 @@
 # Automatic routing stages implementation plan
 
+> Historical record: this document describes an earlier implementation or verification run. Commands, defaults and compatibility claims here are not current instructions. See [README](https://github.com/kirill31337/deepseek-team/blob/main/README.md) and the current routing guide for supported behavior.
+
 **Goal:** Auto automatically learns by actively delegating safe ordinary work, uses comparable outcomes when available, and backs off only for supported problems. The user approved these three stages and explicitly requires no manual stage switch.
 
 **Architecture:** Keep the conservative pure quality/economics estimator. Add a pure stage assessment and extend the existing transactional admission scheduler with bootstrap admission, sharing durable ticket lifecycle, outcome handling and a project-wide cap. Bootstrap and cost calibration retain one comparable coordinator opportunity per ten eligible cases; recovery retains its existing separate stride and one-slot limit. Every phase respects access, explicit executors and disabled/manual policies.

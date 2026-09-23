@@ -1,6 +1,6 @@
 # Publishing DeepSeek Team
 
-The distribution is **codex-deepseek-team**. It installs `deepseek-team` and the compatible `codex-deepseek-team` command. Preparing the workflow does not create a PyPI project: the account owner must register its Trusted Publisher first. Never include API keys, local configuration or raw model logs in the repository.
+The distribution is **codex-deepseek-team**. It installs the `deepseek-team` command. Preparing the workflow does not create a PyPI project: the account owner must register its Trusted Publisher first. Never include API keys, local configuration or raw model logs in the repository.
 
 ## One-time owner setup
 
@@ -36,15 +36,9 @@ for installer in pip pipx uv; do
 done
 ```
 
-Use a clean `dist` directory for each release. The script creates private temporary homes, checks both installed commands and package resources, replaces the installation, and uninstalls it while checking retained user-state sentinels. It does not run workers, read your credential or configure your real coordinators. Without `--previous-wheel` this is **same-version replacement**, not an upgrade claim. To verify a real upgrade, supply an older release wheel:
+Use a clean `dist` directory for each release. The script creates private temporary homes, checks the installed `deepseek-team` command and package resources, replaces the current-version installation, and uninstalls it while checking retained user-state sentinels. It does not run workers, read your credential or configure your real coordinators. These are current-version installation, replacement and removal checks.
 
-```bash
-python3 scripts/check_installation.py --installer pipx \
-  --previous-wheel /path/to/codex_deepseek_team-0.7.1-py3-none-any.whl \
-  --wheel dist/codex_deepseek_team-0.8.0-py3-none-any.whl
-```
-
-Repeat with pip and uv. The CI installer matrix covers Python 3.11 and 3.13; the unit/build matrix also covers 3.12. These checks validate package lifecycle, not provider credentials or complete host sandbox installation. Use `deepseek-team setup` on a supported Linux host for local readiness.
+The CI installer matrix covers Python 3.11 and 3.13; the unit/build matrix also covers 3.12. These checks validate package lifecycle, not provider credentials or complete host sandbox installation. Use `deepseek-team setup` on a supported Linux host for local readiness.
 
 ## TestPyPI rehearsal
 

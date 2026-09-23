@@ -1,128 +1,39 @@
-# Worker boundary hardening
+# Current coordinator and worker boundaries
 
-## 0.5.0 — coordinator process enforcement (2026-09-22)
+DeepSeek Team separates coordinator process enforcement from worker isolation. The coordinator owns architecture, security decisions, final verification, integration, secrets/signing, commits, publishing and production actions. DeepSeek workers use `deepseek-flash`, remain leaf workers, and cannot delegate or publish.
 
-0.5.0 adds a coordinator-process guardrail on top of the existing worker sandbox. These are separate boundaries and must not be conflated.
+## Coordinator lifecycle
 
-For **Codex**, DeepSeek Team installs one stable user-level lifecycle hook definition. It is active only when the current repository already contains the package-owned managed Codex block created by explicit `deepseek-team init --coordinator codex`. Codex owns native hook trust; DeepSeek Team neither bypasses nor infers that decision.
+Both Codex and Claude Code use the persistent coordination ledger in explicitly attached projects. `SessionStart` and `UserPromptSubmit` restore task state; `PreToolUse` checks supported mutations against the registered distribution, scope and pending worker ownership. `Stop` requests continuation for pending assignments, undispositioned results or missing coordinator/native results. Repeated Stop leaves unfinished work recorded without an endless veto loop. An unplanned turn with no recorded work can close without claiming implementation completion.
 
-The supported technical enforcement points are:
+Every coordinator or native-agent deliverable needs an explicit current accepted or cancelled result. A later recognized mutation in its scope requires renewed acceptance. Feedback observations alone do not complete a deliverable.
 
-- `SessionStart` / `UserPromptSubmit`: inject or restore the persistent task ledger, including after compaction;
-- `PreToolUse`: deny supported coordinator mutation calls before execution when no compliant distribution exists, when scope is unplanned, or when a pending worker assignment owns the path;
-- `Stop`: block silent completion while assignments are pending or completed worker results have not been dispositioned.
+These are process guardrails, not universal interception of arbitrary programs or future runtime tools. Claude plan-mode files use the native configured plans directory; native-subagent events are outside its coordinator gate. Codex owns native hook trust, reviewed through `/hooks`; the package does not bypass or infer it. Runtime settings can disable hooks and `hooks status` cannot establish what a running session loaded.
 
-These hooks are **not** claimed to intercept every possible Codex implementation path. Specialized or future tool surfaces that do not traverse the supported hook path remain an environment limitation and must be re-verified against upstream Codex. The release CI therefore runs a real Codex new-session scenario and checks an observed PreToolUse denial before the attempted file mutation reaches disk.
+Native coordinator agents run under the coordinator's own model, permissions and sandbox. They require a concrete delegation reason for planned work and do not substitute for required DeepSeek implementation assignments at manual 50/75 profiles.
 
-For **Claude Code**, 0.5.0 does not claim equivalent coordinator-side technical gating. Managed instructions and the persistent ledger/worker accounting are supplied, while coordinator compliance with work distribution remains instruction-driven. Worker filesystem/network permissions remain technically enforced by the existing sandbox.
+## Required Linux isolation
 
-Coordinator-native subagents are deliberately a **coordinator capability**, not a DeepSeek-worker capability. A planned native-agent deliverable requires a concrete `delegation_reason`, cannot own protected coordinator responsibilities, and does not satisfy DeepSeek worker requirements in the 50/75 profiles. Native subagents execute under Codex/Claude's own native agent model, permissions and sandboxing; DeepSeek Team does not wrap them in the DeepSeek worker Bubblewrap boundary. Conversely, DeepSeek workers keep agent tools disabled and remain leaf workers.
+Every DeepSeek worker requires a working Linux OS sandbox before credential access. AppArmor user-namespace restrictions remain enabled. Ubuntu can use the package-owned named `deepseek-team-bwrap` profile; the profile permits namespace creation while Bubblewrap enforces the filesystem/process boundary.
 
-DeepSeek workers stay fixed to `deepseek-flash`. Effort policy defaults to `auto`, where the frontier coordinator selects `low`/`medium`/`high` per assignment. A user may persist a forced `low`, `medium` or `high` value at project or global scope; setting it back to `auto` restores frontier selection. The resolved concrete effort is propagated consistently through the Codex or Claude harness and recorded for coordinated managed assignments. When an `auto` worker reaches the runner without a concrete frontier selection, `medium` is only an execution fallback.
+Read-only Codex uses its native sandbox with the private Bubblewrap launcher. Read-only Claude runs inside an outer Bubblewrap namespace; its network namespace remains available for the direct provider connection. Runtime tool permissions enforce the read-only tool surface.
 
-### Persistent coordination state
+Managed full-access copies for both runtimes use a sparse outer Bubblewrap namespace. Only the owned copy, required runtime prefixes, temporary HOME and per-run controls are exposed. Git administrative files are read-only. The network namespace is private: a fixed provider relay supplies the supported model API over a per-run Unix socket and local bridge. The actual provider credential stays host-side; this is not an arbitrary network proxy. Sibling copies and the user's source checkout are not exposed.
 
-The ledger is stored under the user's private DeepSeek Team state directory, outside the repository. It records only the minimum process state needed for continuity: session/task/deliverable/assignment ids, executor/scope/acceptance/dependencies/checks, native delegation reasons, selected DeepSeek effort, workspace id, coordinator-prepared inputs, worker-only delta, result summary, checks, result disposition and structured constraints.
+Full-access authorizes development inside the owned copy, not host SDKs, databases, services or secrets. The coordinator prepares missing dependencies explicitly. Declared requirements are probed inside the real sandbox before credential access, and declared checks run there after the worker. Stubs are not equivalent to real project verification.
 
-It is not a scheduler. It does not scan arbitrary projects, auto-attach repositories, commit, push, publish or deploy. Existing workspace records remain the source of truth for owned development copies.
+## Queue, access and retained work
 
-At 75/full-access, free-form reasons such as "quality ownership" or "release work" do not technically satisfy the distribution gate. Technical retention reasons such as missing dependencies must be recorded from the runner/preflight. Signing/secrets remain coordinator-only through a structured sensitive marker. Semantic inseparability is not presented as a deterministic proof: genuinely small work uses the explicit small-task classification and is structurally restricted to one concrete scope.
+Fresh Auto access is read-only. Explicit permissions, manual profiles and project `off` remain authoritative. Independent implementation needs explicit full-access. Admission is immediate for eligible bounded work, with truthful quality feedback and measured economic vetoes; unknown costs are never claimed as savings.
 
-### Workspace readiness and attribution
+The worker queue separates assignment from execution. It defaults to eight concurrent workers and waits FIFO; busy slots do not reassign work to the coordinator. Queued launches recheck enabled state, access, routing authorization and project HEAD before secrets or provider launch. Workspace ownership locks prevent concurrent writes to one copy. Waiting and total timeout are unlimited by default; an explicit timeout includes queue time.
 
-A coordinated assignment checks:
+A failed implementation retains its workspace and diff. Inspect them before explicit continuation; implementation never retries automatically. Orphaned assignments require stopped-process evidence and an exclusive workspace-lock check before explicit abandonment. Neither silence nor elapsed time alone proves the worker failed.
 
-1. workspace base HEAD matches the task base;
-2. declared paths/commands/check executables exist;
-3. the same requirements are observable **inside the actual sparse Bubblewrap namespace**;
-4. only then may the provider credential be read.
+## Private state and credentials
 
-A host-only JDK/SDK/tool therefore does not become available merely because access is full-access. Missing dependencies must be prepared explicitly inside the owned copy. Stubs are not treated as equivalent project verification.
+Coordination state and routing state live outside Git. Routing uses format 3 in `routing-v3.sqlite3`; unsupported current-database versions are rejected. Older database files are neither read nor migrated and remain untouched. Completion uses current explicit result records.
 
-If selected dirty source is needed, `workspace import --include FILE` copies only explicitly named ordinary non-secret files. The imported baseline is recorded as coordinator-prepared input. The runner snapshots content immediately before worker execution and records only the delta after that snapshot as worker changes, avoiding false worker authorship for prepared source.
+The DeepSeek key remains at `~/.config/codex-deepseek/api-key`, with a private directory and mode 600 file; `DEEPSEEK_API_KEY` can supply it instead. Never commit credentials, local configuration or raw model logs. Preserve the primary coordinator model, authentication and unrelated settings during setup and removal.
 
-Declared post-worker checks run inside the same sparse/no-network sandbox and are stored with exit codes. Worker result summaries and review findings survive compaction/continuation through the ledger; the coordinator must record an explicit disposition before the task can finish.
-
-## 0.4.0 — configurable delegation and managed development copies (2026-09-21)
-
-The 25/50/75 delegation levels are policy for **how the coordinator distributes work**, not a security primitive and not a measured utilization percentage. Security-relevant access is resolved separately as `auto | read-only | full-access` with precedence `CLI > project > global > defaults`. The resolved policy is snapshotted for each new job.
-
-`read-only` remains enforced by launch permissions. In managed-copy mode the whole runtime is inside a Bubblewrap namespace with the project copy mounted read-only; model instructions are additional guidance, not the write barrier.
-
-`full-access` means development access to one package-owned copy only. It is **not** host full access. The managed boundary for both Codex and Claude uses:
-
-- a sparse mount namespace rather than a read-only bind of the host root;
-- only required system/runtime files plus the assigned copy, temporary HOME and control directory;
-- `--unshare-user --unshare-pid --unshare-ipc --unshare-uts --unshare-net`;
-- dropped capabilities and disabled nested user namespaces;
-- the working tree writable, but its `.git` administrative directory remounted read-only;
-- no visibility of the original checkout or sibling workers;
-- no direct network route to provider or host services;
-- a per-run Unix-socket provider capability with a fixed DeepSeek destination and endpoint allowlist;
-- the real DeepSeek credential retained only in the host-side relay.
-
-The runtime may create/edit/delete project files and run local tests/builds inside that copy. Publication, deployment, production services, secrets and Git integration/commits remain coordinator-owned.
-
-Owned workspaces are created from committed HEAD. Source dirty/untracked/ignored files are neither cleaned nor silently copied. Reopening a copy verifies its identity and Git administrative digest; another worker cannot take an active copy because an exclusive owner lock is required. A failed/interrupted copy is retained and cannot be resumed without explicit `--resume-after-failure`; no automatic implementation retry is performed over uncertain state.
-
-Managed AGENTS.md/CLAUDE.md text describes the current policy but is not treated as containment. The worker and doctor independently resolve policy and verify the actual runtime/sandbox surface before access is granted.
-
-## 0.3.0 — Bubblewrap + Ubuntu AppArmor (2026-09-16)
-
-DeepSeek Team now requires a usable Linux Bubblewrap backend before a worker reads the DeepSeek credential. There is no automatic unsandboxed fallback. An explicit `--os-sandbox off` exists only for diagnosis, prints a warning, and is never emitted by managed `AGENTS.md` / `CLAUDE.md` instructions.
-
-### Ubuntu user namespaces
-
-Ubuntu can mediate unprivileged user namespace creation through AppArmor. DeepSeek Team does **not** disable `kernel.apparmor_restrict_unprivileged_userns` and does not replace a distro `/usr/bin/bwrap` attachment policy. It ships a named profile, `deepseek-team-bwrap`, with no executable attachment and selects it explicitly through `aa-exec` only when a direct Bubblewrap probe is blocked by the Ubuntu AppArmor userns restriction.
-
-The profile is intentionally unconfined for ordinary resources and grants `userns`. Its role is to permit the initial namespace; Bubblewrap defines the actual process/mount/capability policy. Installation/removal is conservative:
-
-- a different, symlinked or non-regular `/etc/apparmor.d/deepseek-team-bwrap` is refused;
-- an exact package profile can be reloaded with `apparmor_parser -r`;
-- removal is allowed only when installed bytes still exactly match the package copy;
-- administrator-modified policy is never deleted automatically;
-- no sysctl is changed.
-
-### Codex: preserve the native Linux sandbox
-
-Current Codex on Linux already builds its own Bubblewrap sandbox. DeepSeek Team therefore does not put read-only Codex workers inside a second user namespace. It probes a working direct/AppArmor-aware `bwrap` backend, creates a private temporary `bwrap` shim and places it first on the worker `PATH`. Codex then constructs its native `read-only` sandbox through that verified executable.
-
-Because the AppArmor profile grants permission to create the **initial** user namespace, the private shim also guarantees Bubblewrap `--disable-userns` exactly once. If Codex already supplies the flag it is preserved without duplication; otherwise the shim injects it. This prevents processes inside the completed Codex sandbox from using the inherited AppArmor `userns` permission to create further user namespaces.
-
-The shim contains only the executable/profile prefix and this fixed hardening rule; provider credentials remain in the sanitized child environment and are never written into the script or argv.
-
-### Claude Code: outer Bubblewrap
-
-The isolated read-only Claude worker harness runs inside an outer Bubblewrap namespace. The policy uses a read-only root, fresh user/PID/IPC/UTS namespaces, dropped capabilities, private temporary directories, a temporary writable worker HOME, and a read-only worktree. The real user HOME is hidden and only runtime roots needed to start the CLI are re-exposed read-only; common credential locations are then masked again. The outer sandbox passes `--disable-userns`, so the Claude payload cannot create another user namespace after setup.
-
-The outer Claude policy intentionally keeps the host network namespace because the CLI must reach the DeepSeek API. This feature does not claim network isolation. Claude still exposes no Bash/web/agent tools to the worker and explicitly denies MCP tools.
-
-### What this does not prove
-
-Bubblewrap/AppArmor significantly strengthen the host boundary, but this package is not a replacement for a separate OS user/container/VM for arbitrary hostile source trees. The worktree is intentionally visible to the worker, and runtime files required to start the coordinator can be exposed read-only. A secret committed or stored inside an allowed source tree should be treated as readable project data.
-
-## 0.1/0.2 — Git and output integrity (2026-09-15)
-
-### Runtime and output integrity
-
-Environment API keys receive the same ASCII/length/whitespace checks as saved keys. The state directory and worker locks must be private, current-user-owned regular filesystem objects; symlinked directories, FIFO locks, hardlinked locks and public locks are rejected without mutating them.
-
-Malformed nonblank JSON events, invalid event types and invalid UTF-8 output are rejected without publishing candidate answers. Unknown named event types and blank lines remain forward-compatible. Failures never publish partial answers or raw malformed model output.
-
-## Verification commands
-
-```bash
-deepseek-team sandbox status
-deepseek-team doctor --runtime both --offline
-PYTHONPATH=src python3 -m unittest discover -s tests -v
-```
-
-`doctor --live` remains a separate, billable end-to-end check requiring a configured DeepSeek credential. Unit/CI tests use synthetic credentials and transports and must not be represented as proof of a live provider request.
-
-## References
-
-- Git index flags: https://git-scm.com/docs/git-ls-files
-- Git attributes: https://git-scm.com/docs/gitattributes
-- Git configuration: https://git-scm.com/docs/git-config
-- Bubblewrap: https://github.com/containers/bubblewrap
-- AppArmor unprivileged user namespaces: https://documentation.ubuntu.com/security/security-features/privilege-restriction/apparmor/
+These controls are not a complete confidentiality boundary for hostile repositories or coordinator binaries. Repository files available to the model can contain secrets. Use a dedicated OS user, container or VM when stronger isolation is required. Offline fixtures verify local behavior; only an explicitly authorized live provider check exercises real inference.

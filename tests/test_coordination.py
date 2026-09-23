@@ -10,9 +10,9 @@ from unittest import mock
 from codex_deepseek_team import project, settings, workspace
 
 try:
-    from codex_deepseek_team import coordination, codex_hooks
+    from codex_deepseek_team import coordination, coordinator_hooks
 except ImportError:
-    coordination = codex_hooks = None
+    coordination = coordinator_hooks = None
 
 
 class CoordinationCase(unittest.TestCase):
@@ -269,7 +269,7 @@ class StateAndDistributionTests(CoordinationCase):
             ],
         })
         project.attach(self.repo, coordinator="codex")
-        denied = codex_hooks.handle({
+        denied = coordinator_hooks.handle({
             "session_id": "sess-1", "turn_id": "turn-1", "cwd": str(self.repo),
             "hook_event_name": "PreToolUse", "tool_name": "apply_patch",
             "tool_use_id": "tool-small",
@@ -412,7 +412,7 @@ class CodexHookTests(CoordinationCase):
             "hook_event_name": name, "model": "gpt-5.6", "permission_mode": "default",
         }
         payload.update(extra)
-        return codex_hooks.handle(payload)
+        return coordinator_hooks.handle(payload)
 
     def test_new_prompt_creates_task_and_sessionstart_restores_it_after_compaction(self):
         out = self.hook("UserPromptSubmit", prompt="implement substantial feature")
@@ -453,7 +453,7 @@ class CodexHookTests(CoordinationCase):
         follow = dict(session_id="sess-1", turn_id="turn-2", cwd=str(self.repo),
                       hook_event_name="UserPromptSubmit", prompt=blocked["reason"],
                       model="gpt", permission_mode="default")
-        codex_hooks.handle(follow)
+        coordinator_hooks.handle(follow)
         same = coordination.latest_task(self.repo, "sess-1")
         self.assertEqual(same["id"], task["id"])
         self.assertEqual(same["assignments"][0]["result_summary"], "important finding")
@@ -557,7 +557,7 @@ class ProjectBindingTests(CoordinationCase):
         self.assertFalse(project.is_attached(self.repo, "codex"))
 
     def test_global_hook_is_inert_for_unattached_project(self):
-        result = codex_hooks.handle({
+        result = coordinator_hooks.handle({
             "session_id": "s", "turn_id": "t", "cwd": str(self.repo),
             "hook_event_name": "UserPromptSubmit", "prompt": "implement",
             "model": "gpt", "permission_mode": "default",

@@ -12,7 +12,7 @@ import unittest
 from codex_deepseek_team import worker
 
 
-SOURCE = Path(__file__).resolve().parents[1] / 'src/codex_deepseek_team/worker.py'
+from test_codex_deepseek_worker import PACKAGE_ROOT, TEST_WORKER_LAUNCHER
 FAKE = r'''#!/usr/bin/env python3
 import hashlib, json, os, pathlib, sys
 if '--version' in sys.argv:
@@ -61,6 +61,8 @@ class ClaudeRuntimeTests(unittest.TestCase):
         self.key = secrets.token_hex(24)
         self.env = dict(os.environ,
                         HOME=str(self.root / 'parent-home'),
+                        XDG_CONFIG_HOME=str(self.root / 'parent-home/.config'),
+                        PYTHONPATH=str(PACKAGE_ROOT),
                         CODEX_HOME=str(self.root / 'missing-codex-home'),
                         DEEPSEEK_API_KEY=self.key,
                         ANTHROPIC_API_KEY='parent-anthropic-secret',
@@ -72,7 +74,7 @@ class ClaudeRuntimeTests(unittest.TestCase):
 
     def run_worker(self, mode='ok', task='claude task', extra=()):
         return subprocess.run(
-            [sys.executable, str(SOURCE), '--runtime', 'claude', '--os-sandbox', 'off',
+            [sys.executable, '-c', TEST_WORKER_LAUNCHER, '--runtime', 'claude', '--access', 'read-only',
              '--claude', str(self.root / f'claude-{mode}'),
              '--state-dir', str(self.state), *extra],
             input=task, text=True, capture_output=True, env=self.env,

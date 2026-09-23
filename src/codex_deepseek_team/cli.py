@@ -76,18 +76,15 @@ def main(argv=None):
     setup.add_argument('--runtime', choices=['codex', 'claude', 'both', 'auto'], default='auto',
                        help='Coordinator runtime(s) to prepare; default auto detects installed CLIs.')
     setup.add_argument('--no-key', action='store_true', help='Defer authentication without reading or prompting for a key.')
-    setup_mode = setup.add_mutually_exclusive_group()
-    setup_mode.add_argument('--with-sandbox', action='store_true',
-                            help='Explicitly allow Ubuntu package/AppArmor setup with administrator privileges.')
-    setup_mode.add_argument('--configure-only', action='store_true',
-                            help='Only save configuration (legacy behavior); do not verify runtime/sandbox readiness.')
+    setup.add_argument('--with-sandbox', action='store_true',
+                       help='Explicitly allow Ubuntu package/AppArmor setup with administrator privileges.')
     reset = commands.add_parser('reset', help='Remove only package-owned coordinator configuration; retain keys and primary auth.')
     reset.add_argument('--runtime', choices=['codex', 'claude', 'both', 'auto'], default='codex')
     for name, help_text in [('init', 'Attach delegation instructions to a Git repository.'),
                             ('detach', 'Remove the managed instructions and preserve user content.')]:
         sub = commands.add_parser(name, help=help_text)
         sub.add_argument('--coordinator', choices=['codex', 'claude', 'both'], default='codex',
-                         help='Instruction file(s) to manage; default codex preserves legacy behavior.')
+                         help='Instruction file(s) to manage; default codex.')
         sub.add_argument('path', nargs='?', type=Path, default=Path.cwd())
     auth = commands.add_parser('auth', help='Manage the private user-level DeepSeek credential.')
     auth_commands = auth.add_subparsers(dest='auth_command', required=True)
@@ -100,7 +97,7 @@ def main(argv=None):
     for name in ('install', 'status', 'remove'):
         hook_action = hooks_commands.add_parser(name)
         hook_action.add_argument('--runtime', choices=['codex', 'claude', 'both', 'auto'], default='codex',
-                                 help='Coordinator hooks to manage; default codex preserves existing commands.')
+                                 help='Coordinator hooks to manage; default codex.')
     sandbox_cmd = commands.add_parser('sandbox', help='Inspect or manage Linux Bubblewrap/AppArmor isolation.')
     sandbox_commands = sandbox_cmd.add_subparsers(dest='sandbox_command', required=True)
     sandbox_commands.add_parser('status', help='Probe Bubblewrap and the effective AppArmor/userns backend.')
@@ -129,7 +126,7 @@ def main(argv=None):
         elif args.command == 'setup':
             from . import onboarding
             return onboarding.run(_runtimes(args.runtime), no_key=args.no_key,
-                                  with_sandbox=args.with_sandbox, configure_only=args.configure_only)
+                                  with_sandbox=args.with_sandbox)
         elif args.command == 'reset':
             runtimes = _runtimes(args.runtime)
             if 'codex' in runtimes:

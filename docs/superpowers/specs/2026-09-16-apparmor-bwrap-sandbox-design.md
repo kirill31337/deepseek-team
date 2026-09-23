@@ -1,5 +1,7 @@
 # AppArmor + Bubblewrap Worker Isolation Design
 
+> Historical record: this document describes an earlier implementation or verification run. Commands, defaults and compatibility claims here are not current instructions. See [README](https://github.com/kirill31337/deepseek-team/blob/main/README.md) and the current routing guide for supported behavior.
+
 ## Goal
 
 Add a fail-closed Linux OS isolation layer to DeepSeek workers with first-class Ubuntu AppArmor support, while preserving the coordinator-native sandbox architecture of both Codex and Claude Code and the shared Git writer verifier.

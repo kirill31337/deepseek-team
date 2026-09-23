@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exercise install, replacement/upgrade, and uninstall with a real installer."""
+"""Exercise current-package installation, replacement, and removal with a real installer."""
 from __future__ import annotations
 
 import argparse
@@ -15,7 +15,7 @@ import zipfile
 
 
 DIST_NAME = 'codex-deepseek-team'
-ENTRYPOINTS = ('codex-deepseek-team', 'deepseek-team')
+ENTRYPOINTS = ('deepseek-team',)
 RESOURCES = (
     'codex_deepseek_team/data/delegation.md',
     'codex_deepseek_team/data/apparmor/deepseek-team-bwrap',
@@ -197,7 +197,7 @@ class Installer:
                 args.append('--force')
             args.append(str(wheel))
         _run(args, env=self.env, cwd=self.cwd,
-             phase=f'{self.name} {"replacement/update" if replacement else "install"}')
+             phase=f'{self.name} {"replacement" if replacement else "install"}')
 
     def uninstall(self) -> None:
         if self.name == 'pip':
@@ -217,6 +217,10 @@ import sys
 distribution = metadata.distribution(sys.argv[1])
 if distribution.version != sys.argv[2]:
     raise SystemExit(f'installed version {distribution.version!r}, expected {sys.argv[2]!r}')
+entrypoints = {entry.name: entry.value for entry in distribution.entry_points
+               if entry.group == 'console_scripts'}
+if entrypoints != {'deepseek-team': 'codex_deepseek_team.cli:main'}:
+    raise SystemExit(f'unexpected console scripts: {entrypoints!r}')
 prefix = Path(sys.prefix).resolve()
 for relative in sys.argv[3:]:
     resource = Path(distribution.locate_file(relative)).resolve()
@@ -253,15 +257,22 @@ def create_sentinels(root: Path, env: dict[str, str]) -> dict[Path, bytes]:
     sentinels = {
         Path(env['HOME']) / '.installation-check-user-file': b'user file\n',
         Path(env['XDG_CONFIG_HOME']) / 'deepseek-team' / 'config.toml':
-            b'[delegation]\ndelegation_level = "auto"\n',
+            b'delegation_level = "auto"\n',
+        Path(env['HOME']) / '.config/codex-deepseek/api-key': b'synthetic-private-key\n',
+        Path(env['HOME']) / '.local/state/codex-deepseek/history.json': b'{"history":"preserve"}\n',
         Path(env['CODEX_HOME']) / 'config.toml': b'model = "user-choice"\n',
+        Path(env['CODEX_HOME']) / 'auth.json': b'{"authentication":"preserve"}\n',
+        Path(env['CODEX_HOME']) / 'hooks.json': b'{"hooks":{}}\n',
         Path(env['CLAUDE_CONFIG_DIR']) / 'settings.json': b'{"theme":"user-choice"}\n',
+        Path(env['CLAUDE_CONFIG_DIR']) / '.credentials.json': b'{"authentication":"preserve"}\n',
+        root / 'project' / 'AGENTS.md': b'# User project instructions\n',
         root / 'project' / '.deepseek-team.toml':
             b'delegation_level = "auto"\naccess = "read-only"\n',
     }
     for path, content in sentinels.items():
-        path.parent.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         path.write_bytes(content)
+        path.chmod(0o600)
     return sentinels
 
 
@@ -288,7 +299,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--installer', required=True, choices=('pip', 'pipx', 'uv'))
     parser.add_argument('--wheel', required=True, type=wheel_path)
-    parser.add_argument('--previous-wheel', type=wheel_path)
     return parser.parse_args(argv)
 
 
@@ -296,15 +306,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
         _name, current_version = wheel_identity(args.wheel)
-        if args.previous_wheel:
-            _previous_name, initial_version = wheel_identity(args.previous_wheel)
-            initial_wheel = args.previous_wheel
-        else:
-            initial_version = current_version
-            initial_wheel = args.wheel
-
         executable = manager_executable(args.installer)
-        mode = 'true upgrade' if initial_version != current_version else 'same-version replacement'
         with tempfile.TemporaryDirectory(prefix=f'deepseek-team-{args.installer}-') as temporary:
             root = Path(temporary)
             env = isolated_environment(root)
@@ -320,13 +322,13 @@ def main(argv: list[str] | None = None) -> int:
             installer = Installer(args.installer, executable, root, env, cwd)
             env['PATH'] = str(installer.bin_dir) + os.pathsep + env.get('PATH', '')
 
-            installer.install(initial_wheel, replacement=False)
-            verify_install(installer, initial_version)
+            installer.install(args.wheel, replacement=False)
+            verify_install(installer, current_version)
             assert_sentinels(sentinels, 'initial install')
 
             installer.install(args.wheel, replacement=True)
             verify_install(installer, current_version)
-            assert_sentinels(sentinels, 'replacement/update')
+            assert_sentinels(sentinels, 'replacement')
 
             published = installer.commands
             installer.uninstall()
@@ -335,8 +337,8 @@ def main(argv: list[str] | None = None) -> int:
                     raise CheckError(f'{args.installer} uninstall left entrypoint behind: {command.name}')
             assert_sentinels(sentinels, 'uninstall')
 
-        print(f'PASS: {args.installer} {mode} lifecycle; installed version {current_version}; '
-              'both aliases/resources verified and external configuration preserved')
+        print(f'PASS: {args.installer} install/replacement/uninstall lifecycle; installed version {current_version}; '
+              'command/resources verified and external configuration preserved')
         return 0
     except CheckError as error:
         print(f'installation check failed: {error}', file=sys.stderr)

@@ -1,5 +1,7 @@
 # Installation product readiness implementation plan
 
+> Historical record: this document describes an earlier implementation or verification run. Commands, defaults and compatibility claims here are not current instructions. See [README](https://github.com/kirill31337/deepseek-team/blob/main/README.md) and the current routing guide for supported behavior.
+
 **Goal:** Make the existing Linux CLI straightforward to install, configure, update and remove, and prepare its first PyPI publication.
 
 **Design:** Keep `codex-deepseek-team` as the distribution name and both existing commands. Install once per user using pipx, uv or a venv; explicitly attach each target repository. `setup` defaults to detected runtimes, checks local prerequisites, preserves configuration and credentials, and reports remaining native hook trust. Only `--with-sandbox` permits Ubuntu system changes. `--configure-only` retains the previous configuration-only operation for automation and never claims readiness.

@@ -1,5 +1,7 @@
 # AppArmor + Bubblewrap Worker Isolation Implementation Plan
 
+> Historical record: this document describes an earlier implementation or verification run. Commands, defaults and compatibility claims here are not current instructions. See [README](https://github.com/kirill31337/deepseek-team/blob/main/README.md) and the current routing guide for supported behavior.
+
 > **For agentic workers:** use superpowers:executing-plans/TDD and verify before completion.
 
 **Goal:** require a working Bubblewrap/AppArmor isolation path for DeepSeek workers on Linux, with conservative Ubuntu setup and no global weakening of AppArmor user-namespace policy.

@@ -26,9 +26,9 @@ outcomes continue to teach the router. Match its runtime/model/effort/context to
 actual assignment, and keep unknown task attributes unknown. Protected coordinator
 responsibilities keep an explicit coordinator executor.
 
-**Auto delegates useful bounded work immediately by default** (`admission_policy=immediate`). Small or medium tasks with low or medium risk, known or partial localization, local or component coupling, clear requirements and declared tests or a reproducer can be assigned from the first session. Manual verification is allowed for read, review, research, diagnostic, test-plan and documentation tasks with explicit acceptance criteria. Implementation requires executable checks and `full-access`.
+**Auto delegates useful bounded work immediately by default**. Small or medium tasks with low or medium risk, known or partial localization, local or component coupling, clear requirements and declared tests or a reproducer can be assigned from the first session. Manual verification is allowed for read, review, research, diagnostic, test-plan and documentation tasks with explicit acceptance criteria. Implementation requires executable checks and `full-access`.
 
-There is no cold-start history wait, three-assignment cap, periodic coordinator holdout or recovery stride. Unknown costs stay unknown and do not block eligible work; supported poor measured economics still veto delegation. One rework is recorded without a family pause. A rejection or three distinct rework cases within the cooldown window pause the family, by default for 300 seconds; saved cooldown values are respected. Immediate admission resumes after the pause without a trial quota. Failed implementation never retries automatically.
+Unknown costs stay unknown and do not block eligible work; supported poor measured economics still veto delegation. One rework is recorded without a family pause. A rejection or three distinct rework cases within the cooldown window pause the family for the configured `failure_cooldown_seconds` (300 seconds by default). Immediate admission resumes after the pause. Failed implementation never retries automatically.
 
 Fresh Auto access remains **read-only**. To delegate implementation, explicitly opt in:
 
@@ -36,10 +36,9 @@ Fresh Auto access remains **read-only**. To delegate implementation, explicitly 
 deepseek-team config set --project --access full-access
 ```
 
-The coordinator decomposes meaningful independent slices, reviews actual diffs and declared checks, and reports accepted work and rework without repeating the worker's investigation or inventing percentage savings. Architecture, security, integration, final verification, commits and production remain coordinator-owned. Saved manual profiles, explicit permissions and `off` retain priority. The previous bootstrap/adaptive/recovery policy is opt-in through `deepseek-team routing configure --admission-policy evidence`.
+The coordinator decomposes meaningful independent slices, reviews actual diffs and declared checks, and reports accepted work and rework without repeating the worker's investigation or inventing percentage savings. Architecture, security, integration, final verification, commits and production remain coordinator-owned. Saved manual profiles, explicit permissions and `off` retain priority.
 
-Keep the required Linux OS sandbox enabled for managed workers. Never add `--os-sandbox off`
-to ordinary coordination flows and do not weaken Ubuntu AppArmor
+Every worker requires the Linux OS sandbox. Do not weaken Ubuntu AppArmor
 user-namespace restrictions to make delegation pass.
 
 ### Model, effort and native subagents
@@ -114,7 +113,7 @@ JSON
 
 This example explicitly chooses a worker for a manual profile. With profile Auto,
 set its executor to `auto` and inspect the resolved plan. Start a worker only when
-the plan returns a worker assignment; retain an abstention with the coordinator.
+the plan returns a worker assignment; retain a coordinator decision with the coordinator.
 Use the assignment id returned by the plan:
 
 ```bash
@@ -134,8 +133,8 @@ deepseek-team coordination use --task TASK_ID --assignment ASSIGNMENT_ID \
 
 Record verified coordinator and native-agent outcomes with `coordination result --task TASK_ID
 --deliverable DELIVERABLE_ID --outcome accepted --evidence "checks passed"`.
-Every such deliverable needs an accepted or explicitly cancelled outcome before
-completion. A later recognized mutation in its scope requires fresh acceptance.
+Every such deliverable needs an explicit current accepted or cancelled result before
+completion; recorded feedback alone does not establish completion. A later recognized mutation in its scope requires fresh acceptance.
 Native-agent outcomes do not train the coordinator routing estimates.
 Both result commands accept `--cost-usd` for the measured total, including review
 and rework; omit unknown costs rather than inventing a subscription dollar value.

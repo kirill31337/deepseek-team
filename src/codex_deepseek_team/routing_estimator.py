@@ -1,4 +1,4 @@
-"""Pure contextual Beta forecasts and conservative delegation policy.
+"""Pure contextual Beta forecasts and chronological evaluation.
 
 Feature cards describe the candidate worker execution conditions. Coordinator
 observations carry that same candidate card, allowing like-for-like task costs
@@ -13,8 +13,7 @@ import itertools
 import math
 import time
 
-from .routing_models import (PROTECTED_KINDS, WRITE_KINDS, RoutingError,
-                             validate_config, validate_features)
+from .routing_models import RoutingError, validate_config, validate_features
 
 _IDENTITY = ("runtime", "model", "effort", "context_version")
 _ANCHORS = ("kind", "domain", "operation")
@@ -225,58 +224,14 @@ def _economics(weighted):
     return result
 
 
-def recommend(features, observations, config, *, access="read-only", enabled=True, now=None) -> dict:
-    """Suggest an executor without granting access or executing the suggestion.
-
-Shadow/advisory modes can return a worker recommendation for inspection. Only
-an integrating service in auto mode may actually resolve executor:auto to it.
-"""
+def forecast(features, observations, config, *, now=None) -> dict:
+    """Forecast worker quality and measured costs without choosing an executor."""
     features, config, now = validate_features(features), validate_config(config), _timestamp(now)
     observations = list(observations)
     weighted = _weighted(features, observations, config, now)
     posterior = _posterior(weighted, config)
     economics = _economics(_weighted(features, observations, config, now, for_cost=True))
-    return _policy(features, posterior, economics, config, access, enabled)
-
-
-def _policy(features, posterior, economics, config, access, enabled, *, quality_supported=None):
-    def result(action, *reasons):
-        return {"action": action, "reason_codes": list(reasons), "posterior": posterior,
-                "economics": economics}
-    if not enabled or config["mode"] == "off":
-        return result("coordinator", "routing_disabled")
-    if features["kind"] in PROTECTED_KINDS or features["risk"] == "protected":
-        return result("coordinator", "protected_coordinator_task")
-    if access not in ("read-only", "full-access"):
-        return result("coordinator", "invalid_access")
-    if features["kind"] in WRITE_KINDS and access != "full-access":
-        return result("coordinator", "write_access_required")
-    reasons = []
-    if features["risk"] in ("unknown", "high"):
-        reasons.append("unsupported_risk")
-    if features["verification"] not in ("tests", "reproducer"):
-        reasons.append("inadequate_verification")
-    if any(features[key] == "unknown" for key in _CONTEXT):
-        reasons.append("unknown_context")
-    if features["clarity"] != "clear":
-        reasons.append("unclear_task")
-    if posterior["local_effective"] < config["min_local_evidence"] or posterior["matched_local"] == 0:
-        reasons.append("insufficient_local_evidence")
-    if quality_supported is None:
-        quality_supported = posterior["lower"] >= config["min_success_probability"]
-    if not quality_supported:
-        reasons.append("quality_bound_below_threshold")
-    support = max(1., config["min_local_evidence"])
-    cost_known = all(economics[action + "_cost_effective"] >= support
-                     for action in ("worker", "coordinator"))
-    if config["require_cost_evidence"] and not cost_known:
-        reasons.append("insufficient_cost_evidence")
-    if reasons:
-        return result("abstain", *reasons)
-    if cost_known and (economics["savings_fraction"] is None or
-                       economics["savings_fraction"] < config["minimum_savings_fraction"]):
-        return result("coordinator", "insufficient_measured_savings")
-    return result("worker", "quality_and_cost_supported" if cost_known else "cost_evidence_disabled")
+    return {"posterior": posterior, "economics": economics}
 
 
 class _RunningSum:
@@ -465,13 +420,7 @@ identity and task family, rather than all preceding cases. No outcomes are prelo
         posterior = _posterior(_cap_external(quality, self.config), self.config,
                                intervals=False, evidence_ids=False)
         economics = _economics(costs)
-        # F(threshold) <= lower-tail mass is exactly equivalent to the lower
-        # credible bound meeting threshold. Evaluation doesn't expose intervals,
-        # so one CDF replaces two numerical quantile inversions per prediction.
-        quality_supported = _beta_cdf(self.config["min_success_probability"],
-                                      posterior["alpha"], posterior["beta"]) <= (1. - self.config["confidence"]) / 2.
-        return _policy(features, posterior, economics, self.config, "full-access", True,
-                       quality_supported=quality_supported)
+        return {"posterior": posterior, "economics": economics}
 
 
 def evaluate(observations, config, *, now=None) -> dict:
@@ -480,8 +429,8 @@ def evaluate(observations, config, *, now=None) -> dict:
 Repeated cases (across executors, sources and context versions) form one group.
 No member can teach the forecast for another member of its own group. Rows at
 the same timestamp are scored together before learning any of their outcomes.
-Only worker outcomes score worker forecasts; policy outcomes require an actual
-observed action equal to the recommendation, with no counterfactual estimates.
+Only worker outcomes score worker forecasts. Outcome and cost summaries report
+the executor actually observed, without simulating a routing policy.
 
 Forecasts retain their original timestamp/probability. Their reported targets
 and costs are corrected retrospectively using events known by the evaluation
@@ -502,7 +451,7 @@ so a later failure cannot influence an earlier forecast.
     rows = [row for row in rows if row["observed_at"] == first_case_time[row["case_id"]]]
     scoring_ids = {row["id"] for row in rows if row["origin"] == "local"}
     evidence = _ChronologicalEvidence(config)
-    predictions, policy_rows = [], []
+    predictions, observed_rows = [], []
     seen_local_cases = set()
     for timestamp, batch_iterator in itertools.groupby(all_rows, key=lambda r: r["observed_at"]):
         batch = list(batch_iterator)
@@ -516,17 +465,17 @@ so a later failure cannot influence an earlier forecast.
             cache_key = (tuple(sorted(row["features"].items())), excluded_case)
             if cache_key not in forecasts:
                 forecasts[cache_key] = evidence.forecast(row["features"], excluded_case, timestamp)
-            decision = forecasts[cache_key]
-            probability = decision["posterior"]["mean"]
+            prediction = forecasts[cache_key]
+            probability = prediction["posterior"]["mean"]
             target = targets[_case_key(row)]
             predictions.append({"id": row["id"], "case_id": row["case_id"],
                                 "observed_at": row["observed_at"], "probability": probability,
-                                "action": decision["action"], "observed_action": row["action"],
+                                "observed_action": row["action"],
+                                "economics": prediction["economics"],
                                 "outcome": target["outcome"], "outcome_id": target["id"],
                                 "outcome_observed_at": target["observed_at"]})
-            if decision["action"] == row["action"]:
-                policy_rows.append(dict(row, outcome=target["outcome"],
-                                        cost_usd=totals[_case_key(row)].get("cost_usd")))
+            observed_rows.append(dict(row, outcome=target["outcome"],
+                                      cost_usd=totals[_case_key(row)].get("cost_usd")))
         evidence.learn(batch, timestamp)
     scored = [p for p in predictions if p["observed_action"] == "worker"]
     bins = [[] for _ in range(10)]
@@ -541,16 +490,22 @@ so a later failure cannot influence an earlier forecast.
                     "mean_probability": math.fsum(p for p, _ in bucket) / len(bucket) if bucket else None,
                     "observed_acceptance": sum(y for _, y in bucket) / len(bucket) if bucket else None}
                    for i, bucket in enumerate(bins)]
-    costs = [row["cost_usd"] for row in policy_rows if row.get("cost_usd") is not None]
-    return {"evaluated_cases": len(scored), "policy_cases": len(predictions),
+    observed_outcomes = {}
+    for action in ("worker", "coordinator"):
+        actual = [row for row in observed_rows if row["action"] == action]
+        costs = [row["cost_usd"] for row in actual if row.get("cost_usd") is not None]
+        observed_outcomes[action] = {
+            "cases": len(actual),
+            "accepted": sum(row["outcome"] == "accepted" for row in actual),
+            "rework": sum(row["outcome"] == "rework" for row in actual),
+            "rejected": sum(row["outcome"] == "rejected" for row in actual),
+            "cost_cases": len(costs),
+            "total_cost_usd": math.fsum(costs),
+            "mean_cost_usd": math.fsum(c / len(costs) for c in costs) if costs else None,
+        }
+    return {"evaluated_cases": len(scored), "observed_cases": len(predictions),
             "brier_score": math.fsum(brier) / len(scored) if scored else None,
             "log_loss": math.fsum(loss) / len(scored) if scored else None,
             "calibration": calibration,
-            "coverage": sum(p["action"] != "abstain" for p in predictions) / len(predictions) if predictions else 0.,
-            "observed_policy": {"matched_cases": len(policy_rows),
-                                "accepted": sum(r["outcome"] == "accepted" for r in policy_rows),
-                                "rework": sum(r["outcome"] == "rework" for r in policy_rows),
-                                "rejected": sum(r["outcome"] == "rejected" for r in policy_rows),
-                                "cost_cases": len(costs),
-                                "mean_cost_usd": math.fsum(c / len(costs) for c in costs) if costs else None},
+            "observed_outcomes": observed_outcomes,
             "predictions": predictions}

@@ -59,13 +59,11 @@ class DoctorSandboxTests(unittest.TestCase):
         self.assertEqual(calls, ['sandbox', 'runtime'])
         self.assertIn('direct', output.getvalue())
 
-    def test_doctor_explicit_off_skips_sandbox_probe(self):
-        with mock.patch.object(doctor.worker, 'resolve_os_sandbox') as os_check, \
-             mock.patch.object(doctor, 'selected_runtimes', return_value=()), \
-             mock.patch('sys.stdout', new_callable=io.StringIO):
-            code = doctor.main(['--offline', '--runtime', 'codex', '--access', 'read-only', '--os-sandbox', 'off'])
-        self.assertEqual(code, 0)
-        os_check.assert_not_called()
+    def test_doctor_rejects_sandbox_bypass_before_runtime_checks(self):
+        with mock.patch('sys.stderr', new_callable=io.StringIO), \
+             self.assertRaises(SystemExit) as rejected:
+            doctor.main(['--offline', '--os-sandbox', 'off'])
+        self.assertEqual(rejected.exception.code, 2)
 
     def test_doctor_reports_codex_coordination_layers_without_claiming_trust(self):
         backend = sandbox.SandboxBackend(('/usr/bin/bwrap',), '/usr/bin/bwrap', 'direct')
@@ -101,6 +99,9 @@ class DoctorSandboxTests(unittest.TestCase):
         args = run.call_args.args[0]
         self.assertIn('--os-sandbox', args)
         self.assertEqual(args[args.index('--os-sandbox') + 1], 'required')
+        self.assertEqual(args[:4], [doctor.sys.executable, '-P', '-m', 'codex_deepseek_team.worker'])
+        self.assertIn('--access', args)
+        self.assertEqual(args[args.index('--access') + 1], 'read-only')
 
 
 if __name__ == '__main__':

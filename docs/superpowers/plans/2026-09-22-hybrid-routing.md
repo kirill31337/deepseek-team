@@ -1,5 +1,7 @@
 # Hybrid Routing Implementation Plan
 
+> Historical record: this document describes an earlier implementation or verification run. Commands, defaults and compatibility claims here are not current instructions. See [README](https://github.com/kirill31337/deepseek-team/blob/main/README.md) and the current routing guide for supported behavior.
+
 > **For agentic workers:** Use the supplied task contracts; coordinator integrates and verifies. Workers must not stage, commit, publish, or delegate.
 
 **Goal:** Ship evidence-backed hybrid delegation with persistent learning, conservative automatic decisions and safe recovery from uncertain evidence, explicit source ingestion, cost accounting, budget reservations and chronological evaluation.

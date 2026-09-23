@@ -1,11 +1,17 @@
+import contextlib
+import io
 import os
 from pathlib import Path
 import secrets
+import shlex
 import subprocess
 import sys
 import tempfile
 import tomllib
 import unittest
+from unittest import mock
+
+from codex_deepseek_team import cli, sandbox
 
 
 class CliTests(unittest.TestCase):
@@ -14,19 +20,35 @@ class CliTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.env = dict(os.environ, HOME=str(self.root), CODEX_HOME=str(self.root / 'codex'),
+                        XDG_CONFIG_HOME=str(self.root / 'config'),
                         PYTHONPATH=str(Path(__file__).resolve().parents[1] / 'src'))
         self.env.pop('DEEPSEEK_API_KEY', None)
-        self.env.pop('CODEX_DEEPSEEK_DISABLED', None)
+        self.env.pop('DEEPSEEK_TEAM_DISABLED', None)
         binary = self.root / 'bin'
         binary.mkdir()
         codex = binary / 'codex'
         codex.write_text('#!/bin/sh\ncase "$1" in\n--version) echo codex-cli-test;;\nexec) echo "--strict-config --ephemeral --json --sandbox --ignore-rules";;\nesac\n')
         codex.chmod(0o755)
+        entrypoint = binary / 'deepseek-team'
+        entrypoint.write_text('#!/bin/sh\nexec ' + shlex.quote(sys.executable) +
+                              ' -m codex_deepseek_team "$@"\n')
+        entrypoint.chmod(0o755)
         self.env['PATH'] = str(binary) + os.pathsep + self.env['PATH']
 
     def cli(self, *args, input=''):
         return subprocess.run([sys.executable, '-m', 'codex_deepseek_team', *args],
                               input=input, text=True, capture_output=True, env=self.env, timeout=15, cwd=self.root)
+
+    def local_cli(self, *args):
+        output, errors = io.StringIO(), io.StringIO()
+        backend = sandbox.SandboxBackend(('/test/bwrap',), '/test/bwrap', 'direct')
+        with mock.patch.dict(os.environ, self.env, clear=True), \
+             mock.patch.object(sandbox, 'probe_backend', return_value=backend) as probe, \
+             contextlib.chdir(self.root), \
+             contextlib.redirect_stdout(output), contextlib.redirect_stderr(errors):
+            code = cli.main(list(args))
+        probe.assert_called()
+        return subprocess.CompletedProcess(args, code, output.getvalue(), errors.getvalue())
 
     def test_setup_reset_and_offline_doctor_preserve_custom_primary(self):
         home = self.root / 'codex'
@@ -34,10 +56,10 @@ class CliTests(unittest.TestCase):
         path = home / 'config.toml'
         original = b'model="another-coordinator"\nmodel_provider="openai"\n'
         path.write_bytes(original)
-        r = self.cli('setup', '--configure-only', '--runtime', 'codex', '--no-key')
+        r = self.local_cli('setup', '--runtime', 'codex', '--no-key')
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(tomllib.loads(path.read_text())['model'], 'another-coordinator')
-        r = self.cli('doctor', '--offline', '--os-sandbox', 'off')
+        r = self.local_cli('doctor', '--offline')
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn('another-coordinator', r.stdout)
         self.assertEqual(self.cli('reset').returncode, 0)

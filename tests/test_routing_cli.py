@@ -28,7 +28,7 @@ class FakeRoutingService:
 
     def config(self):
         self.calls.append(('config',))
-        return {'mode': 'auto', 'require_cost_evidence': True}
+        return {'mode': 'auto', 'failure_cooldown_seconds': 300.}
 
     def configure(self, changes):
         self.calls.append(('configure', changes))
@@ -40,7 +40,7 @@ class FakeRoutingService:
 
     def predict(self, features, access=None, record=True):
         self.calls.append(('predict', features, access, record))
-        return {'action': 'abstain', 'reason_codes': ['insufficient_evidence']}
+        return {'action': 'coordinator', 'reason_codes': ['write_access_required']}
 
     def observe(self, record):
         self.calls.append(('observe', record))
@@ -48,18 +48,18 @@ class FakeRoutingService:
 
     def evaluate(self):
         self.calls.append(('evaluate',))
-        return {'cases': 2, 'coverage': 0.5}
+        return {'evaluated_cases': 2, 'brier_score': 0.25}
 
     def export(self):
         self.calls.append(('export',))
-        return {'schema_version': 1, 'observations': []}
+        return {'schema_version': 3, 'observations': []}
 
     def export_to(self, stream):
         self.calls.append(('export_to',))
         if self.export_failure:
             stream.write('{"partial":')
             raise routing_cli.RoutingError('Synthetic export interruption.')
-        json.dump({'schema_version': 1, 'observations': []}, stream,
+        json.dump({'schema_version': 3, 'observations': []}, stream,
                   indent=2, sort_keys=True, allow_nan=False)
         stream.write('\n')
 
@@ -75,13 +75,6 @@ class FakeRoutingService:
         self.calls.append(('release_experiment', identifier))
         return {'id': identifier, 'status': 'released'}
 
-    def recovery_status(self):
-        self.calls.append(('recovery_status',))
-        return {'pending': 1, 'tickets': [{'id': 'recovery-1', 'status': 'pending'}]}
-
-    def release_recovery(self, identifier):
-        self.calls.append(('release_recovery', identifier))
-        return {'id': identifier, 'status': 'released'}
 
 
 class RoutingCliTests(unittest.TestCase):
@@ -109,14 +102,13 @@ class RoutingCliTests(unittest.TestCase):
         code, output, errors = self.invoke([
             'routing', 'configure', '--path', '/tmp/project', '--mode', 'auto',
             '--min-local-evidence', '3', '--external-weight-cap', '4.5',
-            '--recovery-rate', '0.2', '--recovery-cooldown-seconds', '7200',
-            '--no-require-cost-evidence',
+            '--failure-cooldown-seconds', '7200',
         ])
         self.assertEqual((code, errors), (0, ''))
         self.assertEqual(json.loads(output), {
             'mode': 'auto', 'min_local_evidence': 3.0,
-            'external_weight_cap': 4.5, 'require_cost_evidence': False,
-            'recovery_rate': 0.2, 'recovery_cooldown_seconds': 7200.0,
+            'external_weight_cap': 4.5,
+            'failure_cooldown_seconds': 7200.0,
         })
 
     def test_recommend_reads_one_json_object_from_stdin(self):
@@ -126,7 +118,7 @@ class RoutingCliTests(unittest.TestCase):
             json.dumps(features),
         )
         self.assertEqual((code, errors), (0, ''))
-        self.assertEqual(json.loads(output)['action'], 'abstain')
+        self.assertEqual(json.loads(output)['action'], 'coordinator')
         self.assertEqual(FakeRoutingService.instances[-1].calls,
                          [('predict', features, 'read-only', True)])
 
@@ -223,7 +215,7 @@ class RoutingCliTests(unittest.TestCase):
             'routing', 'export', '--path', '/tmp/project',
         ])
         self.assertEqual((code, errors), (0, ''))
-        self.assertEqual(json.loads(output), {'schema_version': 1, 'observations': []})
+        self.assertEqual(json.loads(output), {'schema_version': 3, 'observations': []})
         self.assertEqual(FakeRoutingService.instances[-1].calls, [('export_to',)])
 
     def test_export_atomically_writes_private_file_and_keeps_stdout_structured(self):
@@ -236,7 +228,7 @@ class RoutingCliTests(unittest.TestCase):
             saved = json.loads(destination.read_text(encoding='utf-8'))
             mode = destination.stat().st_mode & 0o777
         self.assertEqual((code, errors), (0, ''))
-        self.assertEqual(saved, {'schema_version': 1, 'observations': []})
+        self.assertEqual(saved, {'schema_version': 3, 'observations': []})
         self.assertEqual(mode, 0o600)
         self.assertEqual(json.loads(output), {'output': str(destination)})
         self.assertEqual(FakeRoutingService.instances[-1].calls, [('export_to',)])
@@ -309,26 +301,6 @@ class RoutingCliTests(unittest.TestCase):
                 self.assertEqual((code, errors), (0, ''))
                 self.assertEqual(json.loads(output)['status'], expected)
 
-    def test_recovery_status_uses_explicit_project_and_emits_service_result(self):
-        code, output, errors = self.invoke([
-            'routing', 'recovery', 'status', '--path', '/tmp/project',
-        ])
-        self.assertEqual((code, errors), (0, ''))
-        self.assertEqual(json.loads(output), {
-            'pending': 1, 'tickets': [{'id': 'recovery-1', 'status': 'pending'}],
-        })
-        service = FakeRoutingService.instances[-1]
-        self.assertEqual(service.root, Path('/tmp/project'))
-        self.assertEqual(service.calls, [('recovery_status',)])
-
-    def test_recovery_release_passes_ticket_identity_to_service(self):
-        code, output, errors = self.invoke([
-            'routing', 'recovery', 'release', 'recovery-1', '--path', '/tmp/project',
-        ])
-        self.assertEqual((code, errors), (0, ''))
-        self.assertEqual(json.loads(output), {'id': 'recovery-1', 'status': 'released'})
-        self.assertEqual(FakeRoutingService.instances[-1].calls,
-                         [('release_recovery', 'recovery-1')])
 
 
 class CoordinationCliTests(unittest.TestCase):
@@ -440,7 +412,7 @@ class RoutingCliServiceIntegrationTests(unittest.TestCase):
         ])
         self.assertEqual((code, errors), (0, ''))
         exported = json.loads(output)
-        self.assertEqual(exported['schema_version'], 1)
+        self.assertEqual(exported['schema_version'], 3)
         self.assertEqual(exported['format'], 'deepseek-team-routing-export')
         self.assertEqual(exported['observations'], [])
         self.assertEqual(exported['sources'], [])

@@ -111,7 +111,7 @@ def probe_backend(*, which=shutil.which, runner=subprocess.run,
             78,
             'Bubblewrap is blocked by Ubuntu AppArmor user-namespace policy and the '
             f'{PROFILE_NAME} fallback is unavailable. Run '
-            '`deepseek-team sandbox install-apparmor` (or `python3 install.py '
+            '`deepseek-team sandbox install-apparmor` (or `deepseek-team setup '
             '--with-sandbox`). Do not disable kernel.apparmor_restrict_unprivileged_userns globally.'
         )
     raise SandboxError(

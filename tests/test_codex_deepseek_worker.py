@@ -1,7 +1,6 @@
 """Offline regression tests; credentials and transport are synthetic."""
 import concurrent.futures
 import hashlib
-import importlib.util
 import io
 import json
 import os
@@ -15,10 +14,21 @@ import unittest
 from unittest import mock
 
 
-SOURCE = Path(__file__).resolve().parents[1] / 'src/codex_deepseek_team/worker.py'
-spec = importlib.util.spec_from_file_location('worker', SOURCE)
-worker = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(worker)
+from codex_deepseek_team import sandbox, worker
+
+
+PACKAGE_ROOT = Path(__file__).resolve().parents[1] / 'src'
+# Synthetic CLI processes exercise queues, credentials, retries and cleanup. Keep
+# their sandbox doubles in tests; the OS-boundary suites use real containment.
+TEST_WORKER_LAUNCHER = """
+import sys
+from unittest import mock
+from codex_deepseek_team import sandbox, worker
+with mock.patch.object(sandbox, 'probe_backend', return_value=object()), \\
+     mock.patch.object(sandbox, 'prepare_codex_environment', side_effect=lambda home, env, backend: env), \\
+     mock.patch.object(sandbox, 'wrap_command', side_effect=lambda command, **kwargs: command):
+    sys.exit(worker.main())
+"""
 FAKE = '''#!/usr/bin/env python3
 import hashlib, json, os, pathlib, subprocess, sys, time
 if "--help" in sys.argv:
@@ -97,6 +107,8 @@ wire_api = "responses"
             fake.chmod(0o700)
         self.env = dict(os.environ, DEEPSEEK_API_KEY=secrets.token_hex(24),
                         HOME=str(self.user),
+                        XDG_CONFIG_HOME=str(self.user / '.config'),
+                        PYTHONPATH=str(PACKAGE_ROOT),
                         CODEX_HOME=str(self.user),
                         OPENAI_API_KEY=secrets.token_hex(24))
         self.env.pop('CODEX_DEEPSEEK_DISABLED', None)
@@ -106,7 +118,7 @@ wire_api = "responses"
         env = dict(self.env)
         env.update(kwargs.pop('env', {}))
         return subprocess.run(
-            [sys.executable, str(SOURCE), '--os-sandbox', 'off',
+            [sys.executable, '-c', TEST_WORKER_LAUNCHER, '--access', 'read-only',
              '--codex', str(self.root / f'codex-{mode}'),
              '--state-dir', str(self.state), *kwargs.pop('args', [])],
             input=task, text=True, capture_output=True, env=env,
@@ -205,9 +217,14 @@ wire_api = "responses"
         path, _ = self.saved_key()
         path.chmod(0o644)
         self.env.pop('DEEPSEEK_API_KEY')
-        r = self.run_worker(env={'CODEX_DEEPSEEK_DISABLED': '1'})
+        r = self.run_worker(env={'DEEPSEEK_TEAM_DISABLED': '1'})
         self.assertEqual(r.returncode, 69)
         self.assertEqual(self.calls(), [])
+
+    def test_obsolete_disable_variable_does_not_prevent_worker_execution(self):
+        result = self.run_worker(env={'CODEX_DEEPSEEK_DISABLED': '1'})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), 'fixture task')
 
     def test_explicit_routing_isolation_and_no_reasoning_output(self):
         r = self.run_worker()
@@ -328,10 +345,12 @@ wire_api = "responses"
         # A real child takes one second, while the deadline clock sees 1000.
         # The old 180-second default kills it instead of returning its answer.
         clock = time.monotonic
-        argv = ['worker', '--access', 'read-only', '--os-sandbox', 'off', '--codex', str(self.root / 'codex-sleep'),
+        argv = ['worker', '--access', 'read-only', '--codex', str(self.root / 'codex-sleep'),
                 '--state-dir', str(self.state), 'delayed answer']
         with mock.patch.dict(os.environ, self.env, clear=True), \
              mock.patch.object(sys, 'argv', argv), \
+             mock.patch.object(sandbox, 'probe_backend', return_value=object()), \
+             mock.patch.object(sandbox, 'prepare_codex_environment', side_effect=lambda home, env, backend: env), \
              mock.patch.object(subprocess, '_time', side_effect=lambda: clock() * 1000), \
              mock.patch('sys.stdout', new_callable=io.StringIO) as output, \
              mock.patch('sys.stderr', new_callable=io.StringIO) as errors:
@@ -347,7 +366,7 @@ wire_api = "responses"
 
     def test_unlimited_worker_can_be_cancelled_and_cleans_up(self):
         process = subprocess.Popen(
-            [sys.executable, str(SOURCE), '--os-sandbox', 'off',
+            [sys.executable, '-c', TEST_WORKER_LAUNCHER, '--access', 'read-only',
              '--codex', str(self.root / 'codex-timeout'),
              '--state-dir', str(self.state), 'fixture task'],
             text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=self.env,

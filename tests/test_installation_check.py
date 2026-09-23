@@ -1,5 +1,7 @@
 """Focused tests for the real-installer lifecycle checker."""
+import contextlib
 import importlib.util
+import io
 import os
 from pathlib import Path
 import tempfile
@@ -37,7 +39,6 @@ class InstallationCheckTests(unittest.TestCase):
                 'HTTPS_PROXY': 'https://user:secret@proxy.invalid',
                 'DEEPSEEK_TEAM_STATE_DIR': '/real/state',
                 'DEEPSEEK_TEAM_DISABLED': '1',
-                'CODEX_DEEPSEEK_DISABLED': '1',
                 'CODEX_HOME': '/real/codex',
                 'CLAUDE_CONFIG_DIR': '/real/claude',
                 'PIPX_HOME': '/real/pipx',
@@ -58,8 +59,7 @@ class InstallationCheckTests(unittest.TestCase):
                     'PYTHONPATH', 'DEEPSEEK_API_KEY', 'ANTHROPIC_API_KEY',
                     'ANTHROPIC_AUTH_TOKEN', 'OPENAI_API_KEY',
                     'AWS_ACCESS_KEY_ID', 'GITHUB_TOKEN', 'HTTPS_PROXY',
-                    'DEEPSEEK_TEAM_STATE_DIR', 'DEEPSEEK_TEAM_DISABLED',
-                    'CODEX_DEEPSEEK_DISABLED'):
+                    'DEEPSEEK_TEAM_STATE_DIR', 'DEEPSEEK_TEAM_DISABLED'):
                 self.assertNotIn(name, isolated)
 
     def test_relative_wheel_is_resolved_to_an_absolute_existing_file(self):
@@ -73,6 +73,47 @@ class InstallationCheckTests(unittest.TestCase):
 
             self.assertEqual(resolved, wheel.resolve())
             self.assertTrue(resolved.is_absolute())
+
+    def test_only_current_wheel_is_accepted(self):
+        checker = load_checker()
+        with tempfile.TemporaryDirectory() as temporary:
+            wheel = Path(temporary) / 'package.whl'
+            wheel.touch()
+            with contextlib.redirect_stderr(io.StringIO()) as errors, \
+                 self.assertRaises(SystemExit) as result:
+                checker.parse_args(['--installer', 'pip', '--wheel', str(wheel),
+                                    '--previous-wheel', str(wheel)])
+            self.assertEqual(result.exception.code, 2)
+            self.assertIn('unrecognized arguments: --previous-wheel', errors.getvalue())
+
+    def test_external_state_sentinels_cover_credentials_configuration_and_history(self):
+        checker = load_checker()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            env = checker.isolated_environment(root, {})
+            sentinels = checker.create_sentinels(root, env)
+            expected = [
+                Path(env['HOME']) / '.config/codex-deepseek/api-key',
+                Path(env['HOME']) / '.local/state/codex-deepseek/history.json',
+                Path(env['CODEX_HOME']) / 'config.toml',
+                Path(env['CODEX_HOME']) / 'auth.json',
+                Path(env['CODEX_HOME']) / 'hooks.json',
+                Path(env['CLAUDE_CONFIG_DIR']) / 'settings.json',
+                Path(env['CLAUDE_CONFIG_DIR']) / '.credentials.json',
+                root / 'project' / 'AGENTS.md',
+                root / 'project' / '.deepseek-team.toml',
+            ]
+            for path in expected:
+                self.assertIn(path, sentinels)
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(expected[0].parent.stat().st_mode & 0o777, 0o700)
+            checker.assert_sentinels(sentinels, 'installation')
+            expected[0].write_bytes(b'changed fixture')
+            with self.assertRaisesRegex(checker.CheckError, 'sentinel changed'):
+                checker.assert_sentinels(sentinels, 'replacement')
+            expected[0].unlink()
+            with self.assertRaisesRegex(checker.CheckError, 'sentinel was removed'):
+                checker.assert_sentinels(sentinels, 'uninstall')
 
 
 if __name__ == '__main__':

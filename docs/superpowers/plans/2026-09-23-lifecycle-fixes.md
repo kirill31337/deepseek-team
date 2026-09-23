@@ -1,5 +1,7 @@
 # Lifecycle completion fixes
 
+> Historical record: this document describes an earlier implementation or verification run. Commands, defaults and compatibility claims here are not current instructions. See [README](https://github.com/kirill31337/deepseek-team/blob/main/README.md) and the current routing guide for supported behavior.
+
 Approved scope: four reproduced defects in draft turns, repeated Stop behavior,
 coordinator/native result accounting, and shell mutation classification. The
 Android delivery issue has no established cause in this package.

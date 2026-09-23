@@ -101,14 +101,12 @@ class SetupTests(unittest.TestCase):
         self.assertEqual(code, 78, output)
         self.assertIn('incomplete', output.lower())
 
-    def test_configure_only_preserves_legacy_operation_without_tools(self):
+    def test_removed_configure_only_flag_cannot_bypass_readiness(self):
         self.available.clear()
-        self.probe.side_effect = AssertionError('sandbox must not be probed')
-        self.diagnostic.side_effect = AssertionError('readiness must not be checked')
         code, output = self.call('--configure-only', '--runtime', 'codex', '--no-key')
-        self.assertEqual(code, 0, output)
-        self.assertTrue((self.codex / 'config.toml').exists())
-        self.assertIn('not checked', output.lower())
+        self.assertEqual(code, 2, output)
+        self.assertIn('unrecognized arguments: --configure-only', output)
+        self.assertFalse(self.codex.exists())
 
     def test_setup_preserves_primary_auth_and_saved_key_on_repetition(self):
         self.codex.mkdir()
@@ -202,11 +200,6 @@ class SetupTests(unittest.TestCase):
             code, output = self.call('--with-sandbox')
         self.assertEqual(code, 78, output)
         self.assertIn('package installation failed', output)
-        self.assertFalse(self.codex.exists())
-
-    def test_configure_only_cannot_authorize_system_changes(self):
-        code, output = self.call('--configure-only', '--with-sandbox', '--no-key')
-        self.assertEqual(code, 2, output)
         self.assertFalse(self.codex.exists())
 
 

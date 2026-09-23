@@ -1,4 +1,4 @@
-include LICENSE README.md install.py
+include LICENSE README.md
 include README.ru.md docs/ROUTING.md docs/ROUTING.ru.md
 include docs/PUBLISHING.md
 recursive-include docs/releases *.md

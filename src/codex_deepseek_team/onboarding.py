@@ -110,31 +110,25 @@ def _credential(no_key):
     return False
 
 
-def run(runtimes, *, no_key=False, with_sandbox=False, configure_only=False):
+def run(runtimes, *, no_key=False, with_sandbox=False):
     """Configure selected runtimes without inferring hook trust or attaching a project."""
-    if not configure_only:
-        _prerequisites(runtimes, with_sandbox)
+    _prerequisites(runtimes, with_sandbox)
     _configure(runtimes)
-    if configure_only:
-        print('Configuration saved; runtime and sandbox readiness were not checked (--configure-only).')
-    else:
-        runtime_arg = 'both' if len(runtimes) == 2 else runtimes[0]
-        code = doctor.main(['--runtime', runtime_arg, '--offline'])
-        if code:
-            print('Setup incomplete: resolve the local diagnostic above and rerun setup.')
-            return code
-        for runtime in runtimes:
-            healthy = (config.codex_hooks_status(worker.codex_home()) if runtime == 'codex'
-                       else claude_config.status())
-            if not healthy:
-                print(f'Setup incomplete: {runtime} hooks are missing or disabled. '
-                      'Review your hook settings and /hooks, then rerun setup.')
-                return 78
+    runtime_arg = 'both' if len(runtimes) == 2 else runtimes[0]
+    code = doctor.main(['--runtime', runtime_arg, '--offline'])
+    if code:
+        print('Setup incomplete: resolve the local diagnostic above and rerun setup.')
+        return code
+    for runtime in runtimes:
+        healthy = (config.codex_hooks_status(worker.codex_home()) if runtime == 'codex'
+                   else claude_config.status())
+        if not healthy:
+            print(f'Setup incomplete: {runtime} hooks are missing or disabled. '
+                  'Review your hook settings and /hooks, then rerun setup.')
+            return 78
     if not _credential(no_key):
         return 78
-    coordinator = 'both' if len(runtimes) == 2 else runtimes[0]
-    if not configure_only:
-        print('Local setup checks passed. Native hook trust/session loading still requires /hooks.')
-    print(f'Attach your project explicitly: deepseek-team init --coordinator {coordinator} /path/to/project')
-    print(f'Then in that project: deepseek-team doctor --runtime {coordinator} --offline')
+    print('Local setup checks passed. Native hook trust/session loading still requires /hooks.')
+    print(f'Attach your project explicitly: deepseek-team init --coordinator {runtime_arg} /path/to/project')
+    print(f'Then in that project: deepseek-team doctor --runtime {runtime_arg} --offline')
     return 0

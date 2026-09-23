@@ -45,7 +45,7 @@ class WorkerOsSandboxTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             args = self.make_args(directory)
             with mock.patch.object(worker, 'resolve_runtime', return_value=('claude', '/usr/bin/claude')), \
-                 mock.patch.object(worker, 'resolve_os_sandbox', create=True,
+                 mock.patch.object(worker, 'resolve_os_sandbox',
                                    side_effect=worker.WorkerError(78, 'sandbox unavailable')), \
                  mock.patch.object(worker, 'load_api_key', side_effect=AssertionError('key read too early')) as key:
                 with self.assertRaises(worker.WorkerError) as caught:
@@ -61,7 +61,7 @@ class WorkerOsSandboxTests(unittest.TestCase):
             fd = os.open(os.devnull, os.O_RDONLY)
             self.addCleanup(lambda: _safe_close(fd))
             with mock.patch.object(worker, 'resolve_runtime', return_value=('claude', '/usr/bin/claude')), \
-                 mock.patch.object(worker, 'resolve_os_sandbox', create=True, return_value=(fake, backend)), \
+                 mock.patch.object(worker, 'resolve_os_sandbox', return_value=(fake, backend)), \
                  mock.patch.object(worker, 'load_api_key', return_value='KEY'), \
                  mock.patch.object(worker, 'acquire_slot', return_value=fd), \
                  mock.patch.object(worker, 'execute', return_value=(0, '{"type":"result","is_error":false,"result":"ok"}', '')) as execute:
@@ -83,7 +83,7 @@ class WorkerOsSandboxTests(unittest.TestCase):
             fd = os.open(os.devnull, os.O_RDONLY)
             self.addCleanup(lambda: _safe_close(fd))
             with mock.patch.object(worker, 'resolve_runtime', return_value=('codex', '/usr/bin/codex')), \
-                 mock.patch.object(worker, 'resolve_os_sandbox', create=True, return_value=(fake, backend)), \
+                 mock.patch.object(worker, 'resolve_os_sandbox', return_value=(fake, backend)), \
                  mock.patch.object(worker, 'provider_config', return_value={}), \
                  mock.patch.object(worker, 'load_api_key', return_value='KEY'), \
                  mock.patch.object(worker, 'acquire_slot', return_value=fd), \
@@ -95,14 +95,21 @@ class WorkerOsSandboxTests(unittest.TestCase):
             self.assertEqual(len(fake.codex_calls), 1)
             self.assertTrue(execute.call_args.args[1]['PATH'].endswith(os.pathsep + os.environ.get('PATH', '')) or 'bwrap-bin' in execute.call_args.args[1]['PATH'])
 
-    def test_parse_args_requires_os_sandbox_by_default_and_accepts_explicit_off(self):
+    def test_parse_args_requires_os_sandbox_and_rejects_explicit_off(self):
         with mock.patch.object(os, 'environ', dict(os.environ)), \
              mock.patch('sys.argv', ['worker.py', 'task']):
             parsed = worker.parse_args()
         self.assertEqual(parsed.os_sandbox, 'required')
-        with mock.patch('sys.argv', ['worker.py', '--os-sandbox', 'off', 'task']):
-            parsed = worker.parse_args()
-        self.assertEqual(parsed.os_sandbox, 'off')
+        with mock.patch('sys.argv', ['worker', '--os-sandbox', 'off', 'task']), \
+             mock.patch('sys.stderr', new_callable=io.StringIO), \
+             self.assertRaises(SystemExit) as rejected:
+            worker.parse_args()
+        self.assertEqual(rejected.exception.code, 2)
+
+    def test_os_sandbox_resolver_rejects_bypass_without_probing(self):
+        with self.assertRaises(worker.WorkerError) as rejected:
+            worker.resolve_os_sandbox('off')
+        self.assertEqual(rejected.exception.code, 64)
 
 
 def _safe_close(fd):

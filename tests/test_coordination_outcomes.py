@@ -34,7 +34,7 @@ class DeliverableOutcomeTests(OutcomeCase):
         return coordination.completion_issues(task)
 
     def save(self, task):
-        # Simulate a persisted pre-migration ledger, not a supplied plan.
+        # Simulate stored data independently of plan input validation.
         coordination._atomic(coordination._task_path(self.repo, task['id']), task)
 
     def test_direct_completion_rejects_missing_distribution(self):
@@ -88,52 +88,21 @@ class DeliverableOutcomeTests(OutcomeCase):
                 task = coordination.load_task(self.repo, task['id'])
                 self.assertIn('outcome=invalidated', coordination.summary(task))
 
-    def test_evidence_alone_cannot_complete_a_legacy_deliverable(self):
-        task = self.plan()
-        task['deliverables'][0]['result_evidence'] = 'claimed complete'
-        self.assertTrue(self.issues(task))
-
-    def test_legacy_coordinator_feedback_counts_but_last_failed_outcome_wins(self):
+    def test_router_feedback_does_not_replace_explicit_completion_result(self):
         task = self.plan()
         for outcome in ('accepted', 'rejected', 'cancelled'):
             task = coordination.observe_coordinator_result(
-                self.repo, task['id'], 'impl', outcome, 'legacy verification')
+                self.repo, task['id'], 'impl', outcome, 'verified observation')
             task['deliverables'][0].pop('result', None)
             self.save(task)
-            self.assertEqual(bool(self.issues(task)), outcome == 'rejected')
-
-    def test_historical_mutation_events_invalidate_only_later_matching_outcomes(self):
-        for legacy in (False, True):
-            with self.subTest(legacy=legacy):
-                task = self.plan()
-                task = coordination.observe_coordinator_result(
-                    self.repo, task['id'], 'impl', 'accepted', 'verified before old hook edit')
-                item = task['deliverables'][0]
-                if legacy:
-                    item.pop('result')
-                    recorded_at = item['routing_feedback'][-1]['observation']['observed_at']
-                else:
-                    recorded_at = item['result']['recorded_at']
-                task['coordinator_events'] = [
-                    {'kind': 'mutation_requested', 'paths': ['src/core.py'], 'at': recorded_at - 1},
-                    {'kind': 'mutation_requested', 'paths': ['README.md'], 'at': recorded_at + 1},
-                ]
-                self.assertFalse(self.issues(task))
-                task['coordinator_events'].append(
-                    {'kind': 'mutation_requested', 'paths': ['src/core.py'], 'at': recorded_at + 1})
-                self.save(task)
-                self.assertTrue(self.issues(task))
-                self.assertIn('outcome=invalidated', coordination.summary(task))
-                with self.assertRaises(coordination.CoordinationError):
-                    coordination.complete_task(self.repo, task['id'])
+            self.assertTrue(self.issues(task))
 
     def test_plan_cannot_inject_result_metadata(self):
         task = self.plan(result={'outcome': 'accepted', 'evidence': 'forged', 'recorded_at': 1},
-                         result_evidence='forged', result_invalidated_at=0)
+                         result_invalidated_at=0)
         self.assertTrue(self.issues(task))
         item = task['deliverables'][0]
         self.assertNotIn('result', item)
-        self.assertNotIn('result_evidence', item)
         self.assertNotIn('result_invalidated_at', item)
 
     def test_native_result_survives_equivalent_replan_but_changed_scope_is_rejected(self):
@@ -148,24 +117,20 @@ class DeliverableOutcomeTests(OutcomeCase):
         with self.assertRaises(coordination.CoordinationError):
             coordination.plan_task(self.repo, task['id'], self.plan_input)
 
-    def test_mutation_invalidates_current_and_legacy_acceptance_only_for_matching_scope(self):
-        for legacy in (False, True):
-            for paths in (['src/core.py'], [str(self.repo / 'src/core.py')],
-                          ['src/../src/core.py'], ['src'], []):
-                with self.subTest(legacy=legacy, paths=paths):
-                    task = self.plan()
-                    task = coordination.observe_coordinator_result(
-                        self.repo, task['id'], 'impl', 'accepted', 'fresh checks passed')
-                    if legacy:
-                        task['deliverables'][0].pop('result', None)
-                        self.save(task)
-                    coordination.record_coordinator_event(self.repo, task['id'], 'mutation_requested', ['README.md'])
-                    self.assertFalse(self.issues(coordination.load_task(self.repo, task['id'])))
-                    coordination.record_coordinator_event(self.repo, task['id'], 'mutation_requested', paths)
-                    task = coordination.load_task(self.repo, task['id'])
-                    self.assertTrue(self.issues(task))
-                    task = coordination.plan_task(self.repo, task['id'], self.plan_input)
-                    self.assertTrue(self.issues(task), 'replanning must not restore stale acceptance')
+    def test_mutation_invalidates_acceptance_only_for_matching_scope(self):
+        for paths in (['src/core.py'], [str(self.repo / 'src/core.py')],
+                      ['src/../src/core.py'], ['src'], []):
+            with self.subTest(paths=paths):
+                task = self.plan()
+                coordination.observe_coordinator_result(
+                    self.repo, task['id'], 'impl', 'accepted', 'fresh checks passed')
+                coordination.record_coordinator_event(self.repo, task['id'], 'mutation_requested', ['README.md'])
+                self.assertFalse(self.issues(coordination.load_task(self.repo, task['id'])))
+                coordination.record_coordinator_event(self.repo, task['id'], 'mutation_requested', paths)
+                task = coordination.load_task(self.repo, task['id'])
+                self.assertTrue(self.issues(task))
+                task = coordination.plan_task(self.repo, task['id'], self.plan_input)
+                self.assertTrue(self.issues(task), 'replanning must not restore stale acceptance')
 
     def test_mutation_invalidates_glob_and_directory_scopes(self):
         for scope in ('src/*', 'src', '.'):

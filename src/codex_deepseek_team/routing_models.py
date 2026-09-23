@@ -35,12 +35,12 @@ FEATURE_DEFAULTS = dict.fromkeys(FEATURE_VALUES, 'unknown')
 FEATURE_DEFAULTS.update(kind='implementation', runtime='codex', effort='medium',
                         model='deepseek-flash', context_version='default')
 DEFAULT_CONFIG = {
-    'mode': 'auto', 'admission_policy': 'immediate', 'confidence': .95, 'min_success_probability': .8,
+    'mode': 'auto', 'confidence': .95,
     'min_local_evidence': 5., 'external_weight_cap': 5., 'source_weight_cap': 2.,
     'half_life_days': 90., 'max_evidence_age_days': 365., 'min_similarity': .6,
-    'minimum_savings_fraction': .1, 'require_cost_evidence': True,
+    'minimum_savings_fraction': .1,
     'monthly_experiment_budget_usd': 0., 'per_experiment_limit_usd': 0.,
-    'recovery_rate': .1, 'recovery_cooldown_seconds': 300.,
+    'failure_cooldown_seconds': 300.,
 }
 MAX_JSON_BYTES = 8 * 1024 * 1024
 MAX_OBSERVATIONS = 50000
@@ -79,15 +79,10 @@ def validate_config(value: dict, base=None) -> dict:
     result.update(value)
     if result['mode'] not in ('off', 'shadow', 'advisory', 'auto'):
         raise RoutingError('Routing mode must be off, shadow, advisory or auto.')
-    if result['admission_policy'] not in ('immediate', 'evidence'):
-        raise RoutingError('Admission policy must be immediate or evidence.')
-    if type(result['require_cost_evidence']) is not bool:
-        raise RoutingError('require_cost_evidence must be boolean.')
-    for key in set(DEFAULT_CONFIG) - {'mode', 'admission_policy', 'require_cost_evidence'}:
+    for key in set(DEFAULT_CONFIG) - {'mode'}:
         result[key] = number(result[key], key)
-    for key in ('confidence', 'min_success_probability'):
-        if not 0 < result[key] < 1:
-            raise RoutingError(f'{key} must be strictly between zero and one.')
+    if not 0 < result['confidence'] < 1:
+        raise RoutingError('confidence must be strictly between zero and one.')
     for key in ('min_similarity', 'minimum_savings_fraction'):
         if not 0 <= result[key] <= 1:
             raise RoutingError(f'{key} must be between zero and one.')
@@ -97,8 +92,8 @@ def validate_config(value: dict, base=None) -> dict:
     for key in ('external_weight_cap', 'source_weight_cap', 'min_local_evidence'):
         if result[key] > 10000:
             raise RoutingError(f'{key} exceeds the supported evidence bound.')
-    if result['recovery_rate'] > .25 or result['recovery_cooldown_seconds'] > 2592000:
-        raise RoutingError('Recovery rate is limited to 0..0.25 and cooldown to 0..2592000 seconds.')
+    if result['failure_cooldown_seconds'] > 2592000:
+        raise RoutingError('Failure cooldown is limited to 0..2592000 seconds.')
     return result
 
 

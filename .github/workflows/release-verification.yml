@@ -3,22 +3,20 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
-  install-upgrade:
+  current-package:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      - name: Install current Codex
-        run: npm install -g @openai/codex@0.155.1
       - name: Resolve candidate version
         id: package
         run: |
@@ -30,55 +28,81 @@ jobs:
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
               output.write('version=' + version + '\n')
           PY
-      - name: Build release candidate
-        env:
-          PACKAGE_VERSION: ${{ steps.package.outputs.version }}
+      - name: Build and verify current package lifecycle
         run: |
-          python -m pip install build
+          python -m pip install build twine pipx uv
           python -m build
-          python -m venv "$RUNNER_TEMP/clean"
-          "$RUNNER_TEMP/clean/bin/pip" install "dist/codex_deepseek_team-$PACKAGE_VERSION-py3-none-any.whl"
-          test "$("$RUNNER_TEMP/clean/bin/deepseek-team" --version)" = "deepseek-team $PACKAGE_VERSION"
-      - name: Verify standard installer upgrade from 0.5
-        env:
-          PACKAGE_VERSION: ${{ steps.package.outputs.version }}
-        shell: bash
+          python -m twine check --strict dist/*
+          for installer in pip pipx uv; do
+            python scripts/check_installation.py --installer "$installer" --wheel dist/*.whl
+          done
+      - name: Verify installed coordinator hooks and preserve external state
         run: |
-          set -euo pipefail
-          export HOME="$RUNNER_TEMP/home"
-          export CODEX_HOME="$HOME/.codex"
-          mkdir -p "$HOME" "$CODEX_HOME"
-          OLD="$RUNNER_TEMP/v050"
-          PREFIX="$RUNNER_TEMP/prefix"
-          BIN="$RUNNER_TEMP/bin"
-          PROJECT="$RUNNER_TEMP/project"
-          git worktree add --detach "$OLD" v0.5.0
-          mkdir -p "$PROJECT"
-          git -C "$PROJECT" init -q
-          printf 'VALUE = 1\n' > "$PROJECT/a.py"
-          git -C "$PROJECT" add a.py
-          git -C "$PROJECT" -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm base
-          python "$OLD/install.py" --prefix "$PREFIX" --bin-dir "$BIN"
-          "$BIN/deepseek-team" config set --project --path "$PROJECT" --delegation-level 75 --access full-access
-          "$BIN/deepseek-team" init --coordinator codex "$PROJECT"
-          printf 'synthetic-upgrade-key' | "$BIN/deepseek-team" auth set --stdin
-          BEFORE_AGENTS="$(sha256sum "$PROJECT/AGENTS.md" | awk '{print $1}')"
-          BEFORE_SETTINGS="$(cat "$PROJECT/.deepseek-team.toml")"
-          BEFORE_KEY="$(sha256sum "$HOME/.config/codex-deepseek/api-key" | awk '{print $1}')"
-          python install.py --prefix "$PREFIX" --bin-dir "$BIN"
-          test "$("$BIN/deepseek-team" --version)" = "deepseek-team $PACKAGE_VERSION"
-          "$BIN/deepseek-team" hooks status
-          "$BIN/deepseek-team" auth status
-          "$BIN/deepseek-team" config show --effective --path "$PROJECT" --json | grep -q '"effort": "auto"'
-          test "$(sha256sum "$PROJECT/AGENTS.md" | awk '{print $1}')" = "$BEFORE_AGENTS"
-          test "$(cat "$PROJECT/.deepseek-team.toml")" = "$BEFORE_SETTINGS"
-          test "$(sha256sum "$HOME/.config/codex-deepseek/api-key" | awk '{print $1}')" = "$BEFORE_KEY"
-          export DEEPSEEK_TEAM_STATE_DIR="$RUNNER_TEMP/state"
-          OUT="$(printf '%s' '{"session_id":"upgrade-session","turn_id":"turn-1","cwd":"'"$PROJECT"'","hook_event_name":"UserPromptSubmit","prompt":"implement feature","model":"fixture","permission_mode":"default"}' | "$BIN/deepseek-team" coordinator-hook)"
-          printf '%s\n' "$OUT" | grep -q 'coordination task task-'
-          DENY="$(printf '%s' '{"session_id":"upgrade-session","turn_id":"turn-1","cwd":"'"$PROJECT"'","hook_event_name":"PreToolUse","tool_name":"apply_patch","tool_use_id":"t1","tool_input":{"command":"*** Update File: a.py\\n@@\\n"},"model":"fixture","permission_mode":"default"}' | "$BIN/deepseek-team" coordinator-hook)"
-          printf '%s\n' "$DENY" | grep -q '"permissionDecision": "deny"'
-          git worktree remove --force "$OLD"
+          python - <<'PY'
+          import importlib.util
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import tempfile
+
+          spec = importlib.util.spec_from_file_location('installation_check', 'scripts/check_installation.py')
+          checker = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(checker)
+          wheel, = Path('dist').resolve().glob('*.whl')
+          _, version = checker.wheel_identity(wheel)
+          with tempfile.TemporaryDirectory(prefix='deepseek-team-hooks-') as temporary:
+              root = Path(temporary)
+              env = checker.isolated_environment(root)
+              Path(env['TMPDIR']).mkdir(parents=True)
+              sentinels = checker.create_sentinels(root, env)
+              project = root / 'project'
+              installer = checker.Installer('pip', checker.manager_executable('pip'), root, env, project)
+              env['PATH'] = str(installer.bin_dir) + os.pathsep + env.get('PATH', '')
+              installer.install(wheel, replacement=False)
+              checker.verify_install(installer, version)
+              checker.assert_sentinels(sentinels, 'install')
+              team = str(installer.bin_dir / 'deepseek-team')
+              def run(*args, payload=None):
+                  result = subprocess.run(args, env=env, cwd=project, text=True,
+                                          input=json.dumps(payload) if payload is not None else None,
+                                          capture_output=True, check=False)
+                  if result.returncode:
+                      raise SystemExit(f'Installed command failed: {args[1:]}\n{result.stderr or result.stdout}')
+                  return result.stdout
+              run('git', 'init', '-q', str(project))
+              run('git', '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+                  'commit', '--allow-empty', '-qm', 'fixture')
+              run(team, 'hooks', 'install', '--runtime', 'both')
+              run(team, 'hooks', 'status', '--runtime', 'both')
+              run(team, 'init', '--coordinator', 'both', str(project))
+              run(team, 'auth', 'status')
+              for runtime in ('codex', 'claude'):
+                  payload = dict(session_id='installed-' + runtime, turn_id='turn-1',
+                                 cwd=str(project), hook_event_name='UserPromptSubmit',
+                                 prompt='Implement fixture', permission_mode='default')
+                  output = run(team, 'coordinator-hook', '--runtime', runtime, payload=payload)
+                  assert 'coordination task task-' in output, output
+                  payload.update(hook_event_name='PreToolUse', tool_name='Write',
+                                 tool_input={'file_path': str(project / 'a.py')})
+                  output = json.loads(run(team, 'coordinator-hook', '--runtime', runtime, payload=payload))
+                  assert output['hookSpecificOutput']['permissionDecision'] == 'deny', output
+              preserved = dict(sentinels)
+              preserved[project / 'CLAUDE.md'] = b''
+              for directory in (Path(env['HOME']), Path(env['CODEX_HOME']),
+                                Path(env['CLAUDE_CONFIG_DIR'])):
+                  preserved.update({path: b'' for path in directory.rglob('*') if path.is_file()})
+              preserved = {path: path.read_bytes() for path in preserved}
+              installer.install(wheel, replacement=True)
+              checker.verify_install(installer, version)
+              checker.assert_sentinels(preserved, 'replacement')
+              run(team, 'hooks', 'status', '--runtime', 'both')
+              run(team, 'auth', 'status')
+              installer.uninstall()
+              assert not installer.commands[0].exists()
+              checker.assert_sentinels(preserved, 'uninstall')
+          print('PASS: installed native hook protocol and external-state preservation')
+          PY
       - name: Upload release candidate artifacts
         uses: actions/upload-artifact@v4
         with:

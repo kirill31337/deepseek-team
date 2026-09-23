@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-from codex_deepseek_team import activation, codex_hooks, config, coordination, doctor, project, settings, worker, workspace
+from codex_deepseek_team import activation, coordinator_hooks, config, coordination, doctor, project, settings, worker, workspace
 
 
 class ActivationTests(unittest.TestCase):
@@ -79,7 +79,7 @@ class ActivationTests(unittest.TestCase):
         self.assertEqual(before, {p.name: p.read_bytes() for p in self.repo.iterdir() if p.is_file()})
 
     def test_environment_disable_has_priority_over_saved_on(self):
-        for name in ('DEEPSEEK_TEAM_DISABLED', 'CODEX_DEEPSEEK_DISABLED'):
+        for name in ('DEEPSEEK_TEAM_DISABLED',):
             with self.subTest(name=name), mock.patch.dict(os.environ, {name: '1'}):
                 result = self.switch('on')
                 status = self.status()
@@ -88,6 +88,10 @@ class ActivationTests(unittest.TestCase):
                 self.assertIn(name, status['source'])
                 self.assertIn(name, result.stdout)
         self.assertTrue(self.status()['enabled'])
+
+    def test_obsolete_environment_variable_does_not_change_activation(self):
+        with mock.patch.dict(os.environ, {'CODEX_DEEPSEEK_DISABLED': '1'}):
+            self.assertTrue(activation.resolve(self.repo).enabled)
 
     def test_config_instructions_disable_both_coordinators(self):
         self.switch('off')
@@ -132,11 +136,11 @@ class ActivationTests(unittest.TestCase):
     def test_disabled_hooks_bypass_pending_gate_without_modifying_ledger(self):
         project.attach(self.repo, 'codex')
         payload = {'cwd': str(self.repo), 'session_id': 's', 'turn_id': 't', 'prompt': 'task'}
-        codex_hooks.handle(dict(payload, hook_event_name='UserPromptSubmit'))
+        coordinator_hooks.handle(dict(payload, hook_event_name='UserPromptSubmit'))
         task = coordination.latest_task(self.repo, 's')
         self.switch('off')
         for event in ('SessionStart', 'UserPromptSubmit', 'PreToolUse', 'Stop'):
-            result = codex_hooks.handle(dict(payload, hook_event_name=event,
+            result = coordinator_hooks.handle(dict(payload, hook_event_name=event,
                                             tool_name='Write', tool_input={'file_path': 'a.py'}))
             self.assertNotIn('decision', result)
             self.assertNotIn('permissionDecision', result.get('hookSpecificOutput', {}))
@@ -145,14 +149,14 @@ class ActivationTests(unittest.TestCase):
                 self.assertIn('disabled', result['hookSpecificOutput']['additionalContext'].lower())
         self.assertEqual(task, coordination.latest_task(self.repo, 's'))
         self.switch('on')
-        result = codex_hooks.handle(dict(payload, hook_event_name='PreToolUse',
+        result = coordinator_hooks.handle(dict(payload, hook_event_name='PreToolUse',
                                         tool_name='Write', tool_input={'file_path': 'a.py'}))
         self.assertEqual(result['hookSpecificOutput']['permissionDecision'], 'deny')
 
     def test_environment_disable_also_bypasses_hook_gates(self):
         project.attach(self.repo, 'codex')
         with mock.patch.dict(os.environ, {'DEEPSEEK_TEAM_DISABLED': '1'}):
-            result = codex_hooks.handle({'cwd': str(self.repo), 'session_id': 's',
+            result = coordinator_hooks.handle({'cwd': str(self.repo), 'session_id': 's',
                                         'hook_event_name': 'UserPromptSubmit'})
         self.assertIn('disabled', result['hookSpecificOutput']['additionalContext'].lower())
         self.assertIsNone(coordination.latest_task(self.repo, 's'))
@@ -215,9 +219,9 @@ class ActivationTests(unittest.TestCase):
     def test_hook_can_run_off_command_while_distribution_is_blocked(self):
         project.attach(self.repo, 'codex')
         payload = {'cwd': str(self.repo), 'session_id': 's', 'turn_id': 't', 'prompt': 'task'}
-        codex_hooks.handle(dict(payload, hook_event_name='UserPromptSubmit'))
+        coordinator_hooks.handle(dict(payload, hook_event_name='UserPromptSubmit'))
         for command in ('deepseek-team off', 'deepseek-team off /tmp/project'):
-            result = codex_hooks.handle(dict(payload, hook_event_name='PreToolUse',
+            result = coordinator_hooks.handle(dict(payload, hook_event_name='PreToolUse',
                                             tool_name='Bash', tool_input={'command': command}))
             self.assertEqual(result, {})
 
@@ -237,7 +241,7 @@ class ActivationTests(unittest.TestCase):
     def test_corrupt_state_has_clean_direct_diagnostic_error(self):
         self.switch('off')
         activation.state_file(self.repo).write_text('{broken')
-        result = subprocess.run([sys.executable, str(Path(doctor.__file__)), '--api-probe'],
+        result = subprocess.run([sys.executable, '-m', 'codex_deepseek_team.doctor', '--api-probe'],
                                 cwd=self.repo, text=True, capture_output=True, timeout=15)
         self.assertEqual(result.returncode, 78, result.stderr)
         self.assertNotIn('Traceback', result.stderr)

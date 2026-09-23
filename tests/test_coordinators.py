@@ -36,7 +36,7 @@ class CoordinatorProjectTests(unittest.TestCase):
         self.assertIn('worker --runtime claude', claude)
         for content in (agents, claude):
             self.assertIn('OS sandbox', content)
-            self.assertIn('Never add `--os-sandbox off`', content)
+            self.assertIn('Every worker requires the Linux OS sandbox.', content)
             self.assertNotIn('worker --os-sandbox off', content)
             self.assertNotIn('--runtime codex --os-sandbox off', content)
             self.assertNotIn('--runtime claude --os-sandbox off', content)

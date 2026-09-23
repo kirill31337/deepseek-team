@@ -1,5 +1,7 @@
 # Universal Codex / Claude + DeepSeek design
 
+> Historical record: this document describes an earlier implementation or verification run. Commands, defaults and compatibility claims here are not current instructions. See [README](https://github.com/kirill31337/deepseek-team/blob/main/README.md) and the current routing guide for supported behavior.
+
 ## Goal
 
 Keep one Linux package that lets either Codex or Claude Code coordinate bounded DeepSeek workers, including isolated code creation/editing, without requiring Claude users to install Codex or changing either coordinator's primary authentication.

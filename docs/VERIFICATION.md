@@ -1,5 +1,7 @@
 # Version 0.5.0 verification
 
+> Historical record: this document describes an earlier implementation or verification run. Commands, defaults and compatibility claims here are not current instructions. See [README](https://github.com/kirill31337/deepseek-team/blob/main/README.md) and the current routing guide for supported behavior.
+
 Date: 2026-09-22. Release scope: persistent coordinator task state, observable delegation-process enforcement for Codex, managed worker accounting/readiness, selective source preparation, and preserved 25/50/75 access semantics.
 
 ## Final release-candidate gate

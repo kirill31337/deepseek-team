@@ -166,9 +166,8 @@ class PolicyResolutionTests(RepoCase):
         self.assertIn('executor', text)
         self.assertIn('routing status', text)
         self.assertIn('routing configure', text)
-        self.assertIn('default admission_policy is immediate', text)
+        self.assertIn('Admission is immediate', text)
         self.assertIn('There is no initial trial quota or periodic coordinator holdout', text)
-        self.assertIn('admission_policy=evidence retains bootstrap/adaptive/recovery', text)
         self.assertIn('Read-only auto does not delegate writing tasks', text)
         self.assertIn('no automatic paid exploration', text.lower())
         self.assertIn('Protected coordinator responsibilities', text)
@@ -418,11 +417,11 @@ class DoctorPolicyTests(RepoCase):
         with mock.patch.object(doctor, 'resolve_policy', return_value=policy), \
              mock.patch.object(doctor, 'check_policy_runtime') as runtime_check, \
              mock.patch('sys.stderr', new_callable=io.StringIO) as errors:
-            code = doctor.main(['--offline', '--runtime', 'codex',
-                                '--os-sandbox', 'off'])
-        self.assertEqual(code, 64)
+            with self.assertRaises(SystemExit) as rejected:
+                doctor.main(['--offline', '--runtime', 'codex', '--os-sandbox', 'off'])
+        self.assertEqual(rejected.exception.code, 2)
         runtime_check.assert_not_called()
-        self.assertIn('full-access', errors.getvalue())
+        self.assertIn('invalid choice', errors.getvalue())
 
 
 if __name__ == '__main__':

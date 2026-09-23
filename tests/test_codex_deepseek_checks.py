@@ -1,5 +1,5 @@
 """Check diagnostics without exposing server bodies or credentials."""
-import importlib.util
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -14,9 +14,7 @@ import io
 from unittest import mock
 
 
-spec = importlib.util.spec_from_file_location('check', Path(__file__).resolve().parents[1] / 'src/codex_deepseek_team/doctor.py')
-check = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(check)
+from codex_deepseek_team import doctor as check, sandbox
 
 
 class CheckTests(unittest.TestCase):
@@ -33,9 +31,10 @@ class CheckTests(unittest.TestCase):
             with mock.patch.dict(os.environ, {'CODEX_HOME': directory}), \
                  mock.patch('subprocess.check_output', side_effect=['codex-cli fixture', '--strict-config --ephemeral --json --sandbox --ignore-rules']), \
                  mock.patch.object(check.worker, 'load_api_key') as key, \
+                 mock.patch.object(sandbox, 'probe_backend', return_value=sandbox.SandboxBackend(('/usr/bin/bwrap',), '/usr/bin/bwrap', 'direct')), \
                  mock.patch('urllib.request.build_opener') as network, \
                  mock.patch('sys.stdout', new_callable=io.StringIO) as output:
-                self.assertEqual(check.main(['--offline', '--access', 'read-only', '--os-sandbox', 'off']), 0)
+                self.assertEqual(check.main(['--offline', '--access', 'read-only']), 0)
                 self.assertIn('example-primary', output.getvalue())
                 key.assert_not_called()
                 network.assert_not_called()
@@ -53,17 +52,47 @@ class CheckTests(unittest.TestCase):
     def test_live_worker_call_waits_for_delayed_final_answer(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / 'worker.py').write_text(
+            (root / 'codex_deepseek_team').mkdir()
+            (root / 'codex_deepseek_team/__init__.py').touch()
+            (root / 'codex_deepseek_team/worker.py').write_text(
                 'import time\ntime.sleep(1)\nprint("delayed answer")\n')
+            launch = root / 'launch'
+            launch.mkdir()
+            (launch / 'codex_deepseek_team.py').write_text('raise RuntimeError("untrusted project code")\n')
             clock = time.monotonic
-            with mock.patch.object(check, 'HERE', root), \
-                 mock.patch.object(subprocess, '_time', side_effect=lambda: clock() * 1000):
-                result = check.call('synthetic task', os_sandbox='off')
+            with mock.patch.object(check, 'PACKAGE_ROOT', root), \
+                 mock.patch.object(subprocess, '_time', side_effect=lambda: clock() * 1000), \
+                 mock.patch.dict(os.environ, {'HOME': directory, 'CODEX_HOME': directory, 'DEEPSEEK_API_KEY': ''}):
+                result = check.call('synthetic task', cwd=launch)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.strip(), 'delayed answer')
 
+    def test_live_probe_runs_as_package_module_in_a_separate_process(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / 'codex_deepseek_team'
+            package.mkdir()
+            (package / '__init__.py').touch()
+            (package / 'doctor.py').write_text(
+                'import os, sys\n'
+                'assert sys.argv[1:] == ["--api-probe"]\n'
+                'assert "PARENT_SECRET" not in os.environ\n'
+                'print("synthetic module probe")\n'
+                'sys.exit(70)\n')
+            launch = root / 'launch'
+            launch.mkdir()
+            (launch / 'codex_deepseek_team.py').write_text('raise RuntimeError("untrusted project code")\n')
+            with contextlib.chdir(launch), \
+                 mock.patch.object(check, 'PACKAGE_ROOT', root), \
+                 mock.patch.object(check, '_delegation_disabled', return_value=False), \
+                 mock.patch.object(check.worker, 'load_api_key', return_value='invalid synthetic key'), \
+                 mock.patch.dict(os.environ, {'PARENT_SECRET': 'private'}), \
+                 mock.patch('sys.stdout', new_callable=io.StringIO) as output:
+                self.assertEqual(check.live_tests(), 70)
+            self.assertIn('synthetic module probe', output.getvalue())
+
     def test_disabled_probe_does_not_read_credentials_or_use_network(self):
-        with mock.patch.dict(os.environ, {'CODEX_DEEPSEEK_DISABLED': '1'}), \
+        with mock.patch.dict(os.environ, {'DEEPSEEK_TEAM_DISABLED': '1'}), \
              mock.patch.object(check.worker, 'load_api_key', return_value='') as load_key, \
              mock.patch('urllib.request.build_opener') as transport, \
              mock.patch('sys.stdout', new_callable=io.StringIO):

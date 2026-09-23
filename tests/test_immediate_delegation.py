@@ -34,7 +34,7 @@ class ImmediateDelegationTests(unittest.TestCase):
             clarity='clear', risk='low', scope_size='small', context_version='immediate-v1'))
 
     def predict(self, key='one', **changes):
-        return self.service.predict(dict(self.features, **changes), recovery=True,
+        return self.service.predict(dict(self.features, **changes), verification_ready=True,
             binding=dict(task_id='task', deliverable_id=key, plan_hash='plan'))
 
     def observe(self, case, outcome='rework', *, ago=0, suffix='', **changes):
@@ -47,7 +47,7 @@ class ImmediateDelegationTests(unittest.TestCase):
         self.assertEqual([d['action'] for d in decisions], ['worker'] * 12)
         self.assertTrue(all('recovery' not in d for d in decisions))
         self.assertTrue(all(d['economics']['expected_savings_usd'] is None for d in decisions))
-        self.assertEqual(self.service.recovery_status()['pending_count'], 0)
+        self.assertEqual(self.service.status()['admission']['active_cooldowns'], [])
 
     def test_bounded_component_work_does_not_need_prior_successes(self):
         decision = self.predict(scope_size='medium', coupling='component',
@@ -113,45 +113,16 @@ class ImmediateDelegationTests(unittest.TestCase):
         decision = self.predict()
         self.observe('bad', 'rejected')
         with self.assertRaises(RoutingError):
-            self.service.start_recovery(decision['id'])
+            self.service.validate_start(decision['id'])
         self.service.configure({'mode': 'off'})
         with self.assertRaises(RoutingError):
-            self.service.start_recovery(decision['id'])
+            self.service.validate_start(decision['id'])
 
     def test_explicit_read_only_never_admits_writing(self):
         settings.set_values(self.root / settings.PROJECT_FILE, access='read-only')
         self.assertNotEqual(self.predict()['action'], 'worker')
         self.assertEqual(self.predict('review', kind='review', operation='review',
                                       verification='manual')['action'], 'worker')
-
-    def test_evidence_admission_remains_an_explicit_option(self):
-        self.service.configure({'admission_policy': 'evidence'})
-        self.assertEqual([self.predict(str(n))['action'] for n in range(4)],
-                         ['worker', 'worker', 'worker', 'abstain'])
-
-    def test_queue_validation_rejects_released_or_expired_evidence_tickets(self):
-        self.service.configure({'admission_policy': 'evidence'})
-        decision = self.predict('ticket')
-        self.service.start_recovery(decision['id'], validate_only=True)
-        self.assertEqual(self.service.recovery_status()['pending_count'], 1)
-        with patch('codex_deepseek_team.routing.time.time', return_value=time.time()+3601):
-            with self.assertRaisesRegex(RoutingError, 'ticket'):
-                self.service.start_recovery(decision['id'], validate_only=True)
-        self.service.release_recovery(decision['recovery']['ticket_id'])
-        with self.assertRaisesRegex(RoutingError, 'ticket'):
-            self.service.start_recovery(decision['id'], validate_only=True)
-
-    def test_existing_trial_uses_current_immediate_failure_policy(self):
-        self.service.configure({'admission_policy': 'evidence'})
-        decision = self.predict('old-trial')
-        self.service.start_recovery(decision['id'])
-        self.service.configure({'admission_policy': 'immediate'})
-        self.service.observe(dict(id='old-trial-rework', case_id='old-trial',
-            origin='local', action='worker', features=self.features, outcome='rework',
-            observed_at=time.time(), decision_id=decision['id']))
-        self.assertEqual(self.service.recovery_status()['running_count'], 0)
-        self.assertEqual(self.predict('new-immediate')['action'], 'worker')
-        self.assertEqual(self.service.observations()[0]['outcome'], 'rework')
 
     def test_queue_visibility_preserves_assignment_and_routing_identity(self):
         task = coordination.open_task(self.root, session_id='queued', turn_id='1',

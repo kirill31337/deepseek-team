@@ -22,7 +22,9 @@ class RoutingModelsTests(unittest.TestCase):
     def test_configuration_is_merged_and_validated(self):
         config = m.validate_config({'mode': 'auto'})
         self.assertEqual(config['mode'], 'auto')
-        self.assertTrue(config['require_cost_evidence'])
+        self.assertEqual(config['failure_cooldown_seconds'], 300.)
+        self.assertNotIn('require_cost_evidence', config)
+        self.assertNotIn('min_success_probability', config)
         with self.assertRaises(m.RoutingError):
             m.validate_config({'mode': 'enabled'})
 
