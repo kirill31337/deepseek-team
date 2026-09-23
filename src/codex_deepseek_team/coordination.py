@@ -24,6 +24,7 @@ from typing import Any
 
 from . import settings
 from .config import sync_directory
+from .effort import DEFAULT_EFFORT, normalize_effort, normalize_policy_effort
 from .routing import RoutingService
 from .routing_models import RoutingError, fingerprint, number, validate_features
 
@@ -359,16 +360,21 @@ def _prepare_routing(root, task, items, service):
         ids.add(item['id'])
         raw = item.get('features', {})
         defaults = {'kind': item['kind'], 'runtime': task.get('runtime', 'codex'),
-                    'effort': task['policy'].get('effort') if task['policy'].get('effort') in ('low', 'medium', 'high') else 'medium'}
+                    'effort': normalize_effort(task['policy'].get('effort')) or DEFAULT_EFFORT}
         if not isinstance(raw, dict):
             raise CoordinationError('features must be a structured feature card.', 64)
         item['features'] = validate_features({**defaults, **raw})
         if item['features']['kind'] != item['kind']:
             raise CoordinationError('Feature kind must match deliverable kind.', 64)
         prior = previous.get(item['id'])
-        if item['id'] in started and prior and 'features' in prior:
-            if _definition(item) != _definition(prior) or item['executor'] not in (prior['executor'], 'auto'):
+        if item['id'] in started and prior and isinstance(prior.get('features'), dict):
+            # A saved ledger may still carry the legacy 'medium' spelling; compare the
+            # canonical feature card but keep the stored spelling so its routing
+            # decision binding stays valid without a destructive rewrite.
+            canonical_prior = dict(prior, features=validate_features(prior['features']))
+            if _definition(item) != _definition(canonical_prior) or item['executor'] not in (prior['executor'], 'auto'):
                 raise CoordinationError('Started deliverable scope and features are immutable; use a new deliverable id.', 64)
+            item['features'] = prior['features']
             item['executor'] = prior['executor']
             item['routing'] = prior.get('routing')
             for key in ('routing_feedback', 'result', 'result_invalidated_at'):
@@ -561,7 +567,10 @@ def _effective_task_access(task, current):
     sources = policy.get('sources', {})
     explicit_cli = (sources.get('access') == 'cli' or
                     (policy.get('access') == 'auto' and sources.get('delegation_level') == 'cli'))
-    unchanged_cli_override = explicit_cli and current.as_dict() == task.get('saved_policy')
+    saved = task.get('saved_policy')
+    if isinstance(saved, dict) and 'effort' in saved:
+        saved = dict(saved, effort=normalize_policy_effort(saved['effort']))
+    unchanged_cli_override = explicit_cli and current.as_dict() == saved
     if current.effective_access == 'read-only' and not unchanged_cli_override:
         return 'read-only'
     return policy['effective_access']
@@ -594,6 +603,11 @@ def assignment_queue_state(root: Path, task_id: str, assignment_id: str, state: 
 def assignment_started(root: Path, task_id: str, assignment_id: str,
                        workspace_id: str, runtime: str,
                        prepared_changes: list[str], effort: str | None = None) -> dict:
+    if effort is not None:
+        canonical_effort = normalize_effort(effort)
+        if canonical_effort is None:
+            raise CoordinationError('Worker effort must be low, high or max (legacy medium maps to high).', 64)
+        effort = canonical_effort
     with _lock(root), _routing_batch(root) as service:
         task = load_task(root, task_id)
         row = _assignment(task, assignment_id)
@@ -603,9 +617,12 @@ def assignment_started(root: Path, task_id: str, assignment_id: str,
             # The managed runner holds the workspace's exclusive OS lock. An
             # exact explicit continuation can reconcile a crash between the
             # ledger rename and SQLite commit without starting another case.
-            expected = dict(workspace_id=workspace_id, runtime=runtime, effort=effort,
+            expected = dict(workspace_id=workspace_id, runtime=runtime,
                             prepared_changes=sorted(set(prepared_changes)))
-            if any(row.get(key) != value for key, value in expected.items()):
+            # A running row may predate canonical effort levels ('medium' == 'high').
+            effort_matches = (normalize_effort(row.get('effort')) == effort
+                              or (effort is None and row.get('effort') is None))
+            if any(row.get(key) != value for key, value in expected.items()) or not effort_matches:
                 raise CoordinationError('Running assignment continuation must match its original workspace and execution conditions.', 64)
             if row.get('routing_decision_id'):
                 try:
@@ -631,9 +648,11 @@ def assignment_started(root: Path, task_id: str, assignment_id: str,
                 'started_at', 'finished_at', 'checks', 'disposition', 'error_kind', 'exit_code',
                 'routing_features', 'routing_decision_id')})
         if item.get('features'):
-            features = dict(item['features'], runtime=runtime, effort=effort or 'medium', model='deepseek-flash')
+            declared = validate_features(item['features'])
+            features = validate_features(dict(item['features'], runtime=runtime,
+                                              effort=effort or DEFAULT_EFFORT, model='deepseek-flash'))
             auto = (item.get('routing') or {}).get('requested_executor') == 'auto'
-            if auto and features != item['features']:
+            if auto and features != declared:
                 raise CoordinationError('Worker runtime/effort must match its automatic routing decision; replan before starting.', 64)
             try:
                 decision = (service.decision(item['routing']['decision_id']) if auto else

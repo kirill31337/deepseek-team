@@ -10,6 +10,18 @@ class RoutingModelsTests(unittest.TestCase):
         with self.assertRaises(m.RoutingError):
             m.validate_features({'prompt': 'private code'})
 
+    def test_effort_default_is_high_and_legacy_medium_normalizes(self):
+        self.assertEqual(m.FEATURE_DEFAULTS['effort'], 'high')
+        self.assertEqual(m.validate_features({})['effort'], 'high')
+        for level in ('low', 'high', 'max'):
+            with self.subTest(level=level):
+                self.assertEqual(m.validate_features({'effort': level})['effort'], level)
+        self.assertEqual(m.validate_features({'effort': 'medium'})['effort'], 'high')
+        with self.assertRaises(m.RoutingError):
+            m.validate_features({'effort': 'xhigh'})
+        self.assertEqual(m.normalized_features({'effort': 'medium', 'kind': 'review'}),
+                         {'effort': 'high', 'kind': 'review'})
+
     def test_invalid_numbers_and_boolean_numbers_rejected(self):
         for value in (math.nan, math.inf, -1, True, 10 ** 1000):
             with self.subTest(value=value), self.assertRaises(m.RoutingError):

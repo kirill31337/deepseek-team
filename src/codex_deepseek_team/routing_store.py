@@ -12,7 +12,7 @@ import stat
 import time
 
 from .routing_models import (MAX_JSON_BYTES, MAX_OBSERVATIONS, RoutingError, canonical,
-                             fingerprint, read_json)
+                             fingerprint, normalized_record_features, read_json)
 
 
 TABLES = frozenset(('observations', 'sources', 'decisions'))
@@ -34,6 +34,16 @@ def evidence_key(row):
     features = row['features']
     return fingerprint([row['origin'], row['case_id'], row['action'],
                         *(features[key] for key in ('runtime', 'model', 'effort', 'context_version'))])
+
+
+def evidence_keys(row):
+    """Include the pre-upgrade key without rewriting historical evidence indexes."""
+    canonical_row = normalized_record_features(row)
+    keys = [evidence_key(canonical_row)]
+    if canonical_row['features']['effort'] == 'high':
+        legacy = dict(canonical_row, features=dict(canonical_row['features'], effort='medium'))
+        keys.append(evidence_key(legacy))
+    return keys
 
 
 def _private_file(fd):
@@ -184,13 +194,14 @@ class RoutingStore:
         if table not in TABLES:
             raise RoutingError('Unknown routing record type.')
         row = db.execute(f'SELECT value FROM {table} WHERE id=?', (record_id,)).fetchone()
-        return None if row is None else read_json(row[0])
+        return None if row is None else normalized_record_features(read_json(row[0]))
 
     @staticmethod
     def all(db, table):
         if table not in TABLES:
             raise RoutingError('Unknown routing record type.')
-        return [read_json(row[0]) for row in db.execute(f'SELECT value FROM {table} ORDER BY id')]
+        return [normalized_record_features(read_json(row[0]))
+                for row in db.execute(f'SELECT value FROM {table} ORDER BY id')]
 
     @classmethod
     def put(cls, db, table, record_id, value):

@@ -77,6 +77,13 @@ class PosteriorTests(unittest.TestCase):
         p = estimate(features(), [observation(action="coordinator")], config(), now=NOW)
         self.assertEqual(p["mean"], .5)
 
+    def test_legacy_medium_record_matches_a_canonical_high_card(self):
+        legacy = observation(0, features=features(effort="medium"))
+        self.assertEqual(estimate(features(effort="high"), [legacy], config(), now=NOW)["local_effective"], 1.)
+        self.assertEqual(estimate(features(effort="max"), [legacy], config(), now=NOW)["local_effective"], 0.)
+        # A legacy record cannot outrank an explicitly different canonical level.
+        self.assertEqual(estimate(features(effort="low"), [legacy], config(), now=NOW)["local_effective"], 0.)
+
     def test_half_life_reliability_and_age_are_applied(self):
         row = observation(observed_at=NOW - 90 * 86400, reliability=.5)
         p = estimate(features(), [row], config(), now=NOW)

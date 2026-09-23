@@ -12,12 +12,16 @@ import tempfile
 import tomllib
 from types import MappingProxyType
 from typing import Mapping
+from .effort import EFFORT_POLICY_CHOICES, EFFORT_POLICY_LEVELS, normalize_policy_effort
 from .worker_slots import DEFAULT_MAX_WORKERS, MAX_MAX_WORKERS
 
 PROJECT_FILE = '.deepseek-team.toml'
 LEVELS = ('auto', 25, 50, 75)
 ACCESS = ('auto', 'read-only', 'full-access')
-EFFORT = ('auto', 'low', 'medium', 'high')
+# Effective saved levels; canonical concrete levels plus auto.
+EFFORT = EFFORT_POLICY_LEVELS
+# CLI/config surface also accepts the legacy 'medium' alias for 'high'.
+EFFORT_CHOICES = EFFORT_POLICY_CHOICES
 DEFAULTS = {'delegation_level': 'auto', 'access': 'auto', 'effort': 'auto',
             'max_workers': DEFAULT_MAX_WORKERS}
 
@@ -119,11 +123,18 @@ def _validate(values: dict) -> None:
             raise SettingsError('delegation_level must be auto, 25, 50 or 75.')
     if 'access' in values and values['access'] not in ACCESS:
         raise SettingsError('access must be auto, read-only or full-access.')
-    if 'effort' in values and values['effort'] not in EFFORT:
-        raise SettingsError('effort must be auto, low, medium or high.')
+    if 'effort' in values and normalize_policy_effort(values['effort']) is None:
+        raise SettingsError('effort must be auto, low, high or max (legacy medium maps to high).')
     if 'max_workers' in values and (type(values['max_workers']) is not int
                                   or not 1 <= values['max_workers'] <= MAX_MAX_WORKERS):
         raise SettingsError('max_workers must be an integer from 1 through 64.')
+
+
+def _canonicalize_effort(values: dict) -> dict:
+    """Normalize an accepted legacy effort spelling before any comparison or write."""
+    if 'effort' in values:
+        values['effort'] = normalize_policy_effort(values['effort'])
+    return values
 
 
 def _read(path: Path) -> bytes | None:
@@ -150,7 +161,7 @@ def read_values(path: Path) -> dict:
     except (ValueError, UnicodeError):
         raise SettingsError(f'Invalid delegation TOML: {path}; file preserved.') from None
     _validate(values)
-    return values
+    return _canonicalize_effort(values)
 
 
 def resolve(root: Path | None = None, *, delegation_level: str | int | None = None,
@@ -172,6 +183,7 @@ def resolve(root: Path | None = None, *, delegation_level: str | int | None = No
         'delegation_level': delegation_level, 'access': access, 'effort': effort, 'max_workers': max_workers,
     }.items() if v is not None}
     _validate(overrides)
+    _canonicalize_effort(overrides)
     for key, value in overrides.items():
         values[key], sources[key] = value, 'cli'
     from . import activation
@@ -188,6 +200,7 @@ def set_values(path: Path, *, delegation_level: str | int | None = None,
         'delegation_level': delegation_level, 'access': access, 'effort': effort, 'max_workers': max_workers,
     }.items() if v is not None}
     _validate(changes)
+    _canonicalize_effort(changes)
     if not changes:
         raise SettingsError('Specify --delegation-level, --access, --effort and/or --max-workers.')
     path = Path(path)
@@ -247,7 +260,8 @@ def describe(policy: Policy) -> str:
         f'access: {policy.access} (source={policy.sources["access"]})',
         f'effective_access: {policy.effective_access} (source={data["effective_access_source"]})',
         f'effort: {policy.effort} (source={policy.sources.get("effort", "default")}; '
-        + ('frontier chooses low/medium/high per assignment' if policy.effort == 'auto' else 'forced for new DeepSeek jobs') + ')',
+        + ('frontier chooses low/high/max per assignment; legacy medium is accepted as high'
+           if policy.effort == 'auto' else 'forced for new DeepSeek jobs') + ')',
         f'max_workers: {policy.max_workers} (source={policy.sources.get("max_workers", "default")}); '
         'additional workers wait in FIFO order; total_timeout: unlimited by default',
     ))
@@ -294,16 +308,17 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
     if policy.effort == 'auto':
         effort_guidance = (
             'DeepSeek Team workers always use deepseek-flash. Effort policy is auto, so before each '
-            'DeepSeek assignment the frontier coordinator must choose --effort low, --effort medium '
-            'or --effort high from the assigned task without asking the user: low for bounded/mechanical '
-            'work, medium for the normal case, and high for difficult debugging, cross-file reasoning '
-            'or adversarial review. If a DeepSeek worker is launched directly without a frontier-selected '
-            'effort, the runner uses medium as an execution fallback only.\n'
+            'DeepSeek assignment the frontier coordinator must choose --effort low, --effort high '
+            'or --effort max from the assigned task without asking the user: low for bounded/mechanical '
+            'work, high for the normal case, and max for difficult debugging, cross-file reasoning '
+            'or adversarial review. The legacy spelling --effort medium is still accepted and treated '
+            'exactly as high. If a DeepSeek worker is launched directly without a frontier-selected '
+            'effort, the runner uses high as an execution fallback only.\n'
         )
-        effort_example = 'medium'
+        effort_example = 'high'
         effort_note = (
-            'Because effort policy is auto, replace medium with low or high when the assigned task '
-            'warrants it. '
+            'Because effort policy is auto, replace high with low or max when the assigned task '
+            'warrants it (medium is the accepted legacy alias for high). '
         )
     else:
         effort_guidance = (

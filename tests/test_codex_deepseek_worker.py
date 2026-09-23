@@ -234,7 +234,7 @@ wire_api = "responses"
         args = c['args']
         self.assertIn('model_provider="deepseek"', args)
         self.assertIn('deepseek-flash', args)
-        self.assertIn('model_reasoning_effort="medium"', args)
+        self.assertIn('model_reasoning_effort="high"', args)
         self.assertIn('read-only', args)
         self.assertIn('--ephemeral', args)
         self.assertNotIn('fixture task', args)
@@ -263,6 +263,39 @@ wire_api = "responses"
         c, = self.calls()
         self.assertIn('deepseek-flash', c['args'])
         self.assertIn('model_reasoning_effort="high"', c['args'])
+
+    def test_frontier_can_select_canonical_max_effort(self):
+        r = self.run_worker(args=['--effort', 'max'])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        c, = self.calls()
+        self.assertIn('model_reasoning_effort="max"', c['args'])
+
+    def test_legacy_medium_override_is_normalized_to_high(self):
+        r = self.run_worker(args=['--effort', 'medium'])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        c, = self.calls()
+        self.assertIn('model_reasoning_effort="high"', c['args'])
+        self.assertNotIn('model_reasoning_effort="medium"', c['args'])
+
+    def test_saved_legacy_medium_config_normalizes_to_high(self):
+        config = self.user / '.config/deepseek-team/config.toml'
+        config.parent.mkdir(parents=True)
+        config.write_text('effort = "medium"\n')
+        r = self.run_worker(env={'XDG_CONFIG_HOME': str(self.user / '.config')})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        c, = self.calls()
+        self.assertIn('model_reasoning_effort="high"', c['args'])
+        self.assertIn('effort: high', r.stderr)
+
+    def test_saved_forced_max_effort_reaches_codex(self):
+        config = self.user / '.config/deepseek-team/config.toml'
+        config.parent.mkdir(parents=True)
+        config.write_text('effort = "max"\n')
+        r = self.run_worker(env={'XDG_CONFIG_HOME': str(self.user / '.config')})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        c, = self.calls()
+        self.assertIn('model_reasoning_effort="max"', c['args'])
+        self.assertIn('effort: max', r.stderr)
 
     def test_key_is_redacted_from_both_streams(self):
         r = self.run_worker(mode='secret')

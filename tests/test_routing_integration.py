@@ -31,7 +31,7 @@ class IntegrationTests(unittest.TestCase):
         self.service.configure({'failure_cooldown_seconds': 300})
         self.features = dict(kind='implementation', domain='python', operation='fix', localization='known',
             coupling='local', verification='tests', clarity='clear', risk='low', scope_size='small',
-            runtime='codex', model='deepseek-flash', effort='medium', context_version='default')
+            runtime='codex', model='deepseek-flash', effort='high', context_version='default')
 
     def task(self, policy=None, turn='1'):
         return coordination.open_task(self.root, session_id='test', turn_id=turn, prompt='redacted task', policy=policy or self.policy)
@@ -72,11 +72,34 @@ class IntegrationTests(unittest.TestCase):
         self.seed()
         task = self.task()
         result = self.plan(task)
-        for runtime, effort in (('claude', 'medium'), ('codex', 'high')):
+        # Mismatched runtime or a different canonical level must never start the worker.
+        for runtime, effort in (('claude', 'high'), ('codex', 'low'), ('codex', 'max')):
             with self.subTest(runtime=runtime, effort=effort), self.assertRaises(coordination.CoordinationError):
                 coordination.assignment_started(self.root, task['id'], result['assignments'][0]['id'],
                                                  'workspace', runtime, [], effort=effort)
         self.assertEqual(coordination.load_task(self.root, task['id']), result)
+
+    def test_legacy_saved_policy_preserves_unchanged_explicit_access(self):
+        current = settings.Policy(25, 'read-only', dict(
+            delegation_level='default', access='project:fixture',
+            effort='project:fixture', max_workers='default'), effort='high')
+        saved = dict(current.as_dict(), effort='medium')
+        override = dict(saved, access='full-access', effective_access='full-access',
+                        sources=dict(saved['sources'], access='cli'))
+        task = {'policy': override, 'saved_policy': saved}
+        self.assertEqual(coordination._effective_task_access(task, current), 'full-access')
+        changed = settings.Policy(25, 'read-only', current.sources, effort='low')
+        self.assertEqual(coordination._effective_task_access(task, changed), 'read-only')
+
+    def test_legacy_medium_selection_matches_its_high_auto_decision(self):
+        self.seed()
+        task = self.task()
+        result = self.plan(task)
+        aid = result['assignments'][0]['id']
+        # The legacy alias is normalized to high before the run-time comparison.
+        started = coordination.assignment_started(self.root, task['id'], aid, 'workspace', 'codex', [], effort='medium')
+        self.assertEqual(started['assignments'][0]['effort'], 'high')
+        self.assertEqual(started['assignments'][0]['routing_features']['effort'], 'high')
 
     def test_exact_continuation_keeps_unchanged_explicit_access_override(self):
         settings.set_values(self.root / settings.PROJECT_FILE, delegation_level=25, access='read-only')

@@ -19,7 +19,11 @@ class ProtocolTests(unittest.TestCase):
     def test_real_cli_responses_routing_and_readonly_tools(self):
         self.exercise_cli()
 
-    def exercise_cli(self):
+    @unittest.skipUnless(shutil.which('codex'), 'Codex CLI is not installed')
+    def test_real_cli_max_effort_reaches_responses_api(self):
+        self.exercise_cli(effort='max')
+
+    def exercise_cli(self, effort='low'):
         requests = []
         tool_results = []
         tool_sent = False
@@ -79,7 +83,7 @@ class ProtocolTests(unittest.TestCase):
                 config = home / 'config.toml'
                 config.write_text(config.read_text().replace(worker.PROVIDER['base_url'], f'http://127.0.0.1:{server.server_port}/'))
                 env = worker.child_environment(home, synthetic_key)
-                args = worker.command(shutil.which('codex'), effort='low')
+                args = worker.command(shutil.which('codex'), effort=effort)
                 args[-1:-1] = ['--skip-git-repo-check', '-C', str(repo)]
                 code, out, err = worker.execute(args, env, 'Exercise the scoped file operation.', 30)
                 message, errors, completed = worker.result_events(out)
@@ -87,7 +91,7 @@ class ProtocolTests(unittest.TestCase):
                 self.assertTrue(completed, err + errors)
                 self.assertIn('PROTOCOL_OK', message)
                 self.assertGreaterEqual(len(requests), 2, 'No actual tool roundtrip')
-                self.assertTrue(all(r == {'path': '/responses', 'model': 'deepseek-flash', 'effort': 'low', 'auth_valid': True} for r in requests))
+                self.assertTrue(all(r == {'path': '/responses', 'model': 'deepseek-flash', 'effort': effort, 'auth_valid': True} for r in requests))
                 self.assertTrue(any('READ_ONLY_EVIDENCE' in result for result in tool_results), str(tool_results))
                 self.assertFalse(any('LOGIN_ENABLED' in result for result in tool_results), 'Worker shell loaded login profiles')
                 self.assertTrue(any('KEY_ENV_ABSENT' in result for result in tool_results), 'API key reached worker shell')

@@ -257,8 +257,9 @@ def main(argv=None):
                         help='Per-diagnostic override; auto adapts per task, 25/50/75 force a fixed profile.')
     parser.add_argument('--access', choices=['auto', 'read-only', 'full-access'],
                         help='Per-diagnostic access override; independent of delegation level.')
-    parser.add_argument('--effort', choices=['auto', 'low', 'medium', 'high'],
-                        help='Per-diagnostic effort-policy override; default resolves saved policy.')
+    parser.add_argument('--effort', choices=delegation_settings.EFFORT_CHOICES,
+                        help='Per-diagnostic effort-policy override (auto/(low|high|max)); '
+                             'legacy medium is accepted as high. Default resolves saved policy.')
     args = parser.parse_args(argv)
     try:
         policy = resolve_policy(delegation_level=args.delegation_level,

@@ -217,11 +217,54 @@ class PolicyResolutionTests(RepoCase):
     def test_invalid_values_fail_closed(self):
         with self.assertRaises(settings.SettingsError):
             settings.resolve(self.repo, delegation_level=40)
-        with self.assertRaises(settings.SettingsError):
-            settings.resolve(self.repo, effort='max')
+        for bad_effort in ('xhigh', 'MAX', 'High', ' ultra', True, 3):
+            with self.subTest(effort=bad_effort), self.assertRaises(settings.SettingsError):
+                settings.resolve(self.repo, effort=bad_effort)
         (self.repo / settings.PROJECT_FILE).write_text('delegation_level = 60\n')
         with self.assertRaises(settings.SettingsError):
             settings.resolve(self.repo)
+
+    def test_canonical_max_level_is_accepted_and_resolved(self):
+        settings.set_values(self.repo / settings.PROJECT_FILE, effort='max')
+        policy = settings.resolve(self.repo)
+        self.assertEqual(policy.effort, 'max')
+        self.assertEqual(policy.as_dict()['effort_mode'], 'forced')
+        text = settings.instructions(policy, 'codex')
+        self.assertIn('persistently forced to max', text)
+        self.assertIn('--effort max', text)
+
+    def test_legacy_medium_alias_normalizes_to_high_without_rewriting_the_file(self):
+        file = self.repo / settings.PROJECT_FILE
+        file.write_text('effort = "medium"\n')
+        policy = settings.resolve(self.repo)
+        self.assertEqual(policy.effort, 'high')
+        self.assertEqual(policy.as_dict()['effort_mode'], 'forced')
+        # A saved legacy spelling stays on disk until a writer actually changes it.
+        self.assertIn('effort = "medium"', file.read_text())
+        settings.set_values(file, effort='medium')
+        self.assertIn('effort = "medium"', file.read_text())
+        settings.set_values(file, effort='low')
+        self.assertIn('effort = "low"', file.read_text())
+
+    def test_config_cli_accepts_legacy_medium_and_saves_high(self):
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(delegation_cli.main([
+                'config', 'set', '--project', '--path', str(self.repo), '--effort', 'medium',
+            ]), 0)
+        self.assertIn('effort = "high"', (self.repo / settings.PROJECT_FILE).read_text())
+        self.assertEqual(settings.resolve(self.repo).effort, 'high')
+        with redirect_stdout(out := io.StringIO()):
+            self.assertEqual(delegation_cli.main([
+                'config', 'show', '--effective', '--path', str(self.repo), '--json',
+            ]), 0)
+        self.assertEqual(json.loads(out.getvalue())['effort'], 'high')
+
+    def test_auto_instructions_recommend_low_high_max_and_explain_legacy_medium(self):
+        policy = settings.resolve(self.repo, effort='auto')
+        text = settings.instructions(policy, 'codex')
+        self.assertIn('--effort low, --effort high or --effort max', text)
+        self.assertIn('--effort medium is still accepted', text)
+        self.assertIn('high as an execution fallback', text)
 
     def test_config_cli_sets_fields_independently_and_show_reports_sources(self):
         out = io.StringIO()
@@ -337,6 +380,14 @@ class WorkerLevelParserTests(unittest.TestCase):
         with mock.patch.object(sys, 'argv', ['deepseek-team worker', *argv]):
             return worker.parse_args()
 
+    def test_worker_parser_accepts_canonical_levels_and_legacy_medium(self):
+        for level in ('low', 'high', 'max', 'medium'):
+            with self.subTest(level=level):
+                self.assertEqual(self.parse('--effort', level).effort, level)
+        for bad in ('xhigh', 'none'):
+            with self.subTest(level=bad), self.assertRaises(SystemExit):
+                self.parse('--effort', bad)
+
     def test_worker_accepts_auto_and_numeric_levels(self):
         self.assertEqual(self.parse('--delegation-level', 'auto').delegation_level, 'auto')
         self.assertEqual(self.parse('--delegation-level', '25').delegation_level, 25)
@@ -346,6 +397,29 @@ class WorkerLevelParserTests(unittest.TestCase):
         for value in ('AUTO', '30', 'auto '):
             with self.subTest(value=value), self.assertRaises(SystemExit):
                 self.parse('--delegation-level', value)
+
+
+class ManagedCommandEffortTests(RepoCase):
+    def test_default_effort_levels_are_canonical(self):
+        from codex_deepseek_team import effort as effort_module
+        self.assertEqual(worker.DEFAULT_EFFORT, 'high')
+        self.assertEqual(effort_module.DEFAULT_EFFORT, 'high')
+        self.assertEqual(effort_module.normalize_effort('medium'), 'high')
+        self.assertEqual(worker.EFFORT_LEVELS, ('low', 'high', 'max', 'medium'))
+        self.assertEqual(settings.EFFORT, ('auto', 'low', 'high', 'max'))
+        self.assertIn('medium', settings.EFFORT_CHOICES)
+
+    def test_managed_codex_command_emits_canonical_effort(self):
+        for effort, expected in (('max', 'max'), ('medium', 'high'), ('low', 'low'), ('high', 'high')):
+            with self.subTest(effort=effort):
+                args = development.runtime_command('/usr/bin/codex', 'codex', writable=True, effort=effort)
+                self.assertIn(f'model_reasoning_effort="{expected}"', args)
+
+    def test_managed_child_environment_emits_canonical_effort_for_claude(self):
+        for effort, expected in (('max', 'max'), ('medium', 'high'), ('low', 'low')):
+            with self.subTest(effort=effort):
+                env = worker.child_environment(self.home, 'synthetic', 'claude', effort)
+                self.assertEqual(env['CLAUDE_CODE_EFFORT_LEVEL'], expected)
 
 
 class ManagedBlockTests(RepoCase):

@@ -102,7 +102,7 @@ class ClaudeRuntimeTests(unittest.TestCase):
         self.assertEqual(call['base_url'], 'https://api.deepseek.com/anthropic')
         self.assertEqual(call['model'], 'deepseek-flash[1m]')
         self.assertEqual(call['haiku_model'], 'deepseek-flash')
-        self.assertEqual(call['effort'], 'medium')
+        self.assertEqual(call['effort'], 'high')
         self.assertEqual(call['compact_window'], '786432')
         self.assertEqual(call['auth_digest'], hashlib.sha256(self.key.encode()).hexdigest())
         self.assertFalse(call['parent_api_key'])
@@ -119,6 +119,18 @@ class ClaudeRuntimeTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         call, = self.calls()
         self.assertEqual(call['model'], 'deepseek-flash[1m]')
+        self.assertEqual(call['effort'], 'high')
+
+    def test_frontier_can_select_canonical_max_effort_for_claude_harness(self):
+        result = self.run_worker(task='hard review', extra=('--effort', 'max'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        call, = self.calls()
+        self.assertEqual(call['effort'], 'max')
+
+    def test_legacy_medium_override_reaches_claude_as_high(self):
+        result = self.run_worker(task='normal review', extra=('--effort', 'medium'))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        call, = self.calls()
         self.assertEqual(call['effort'], 'high')
 
     def test_claude_runtime_does_not_require_codex_provider_config(self):

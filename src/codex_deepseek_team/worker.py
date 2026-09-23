@@ -16,13 +16,12 @@ import time
 import tomllib
 
 from . import sandbox
+from .effort import DEFAULT_EFFORT, EFFORT_LEVELS, normalize_effort
 
 
 MODEL = 'deepseek-flash'
 CLAUDE_MODEL = 'deepseek-flash[1m]'
 CLAUDE_BASE_URL = 'https://api.deepseek.com/anthropic'
-EFFORT_LEVELS = ('low', 'medium', 'high')
-DEFAULT_EFFORT = 'medium'
 PROVIDER = {
     'name': 'DeepSeek', 'base_url': 'https://api.deepseek.com/',
     'env_key': 'DEEPSEEK_API_KEY', 'wire_api': 'responses',
@@ -56,9 +55,10 @@ class WorkerError(Exception):
 
 
 def effort_level(value):
-    if value not in EFFORT_LEVELS:
-        raise WorkerError(64, 'DeepSeek effort must be low, medium or high.')
-    return value
+    canonical = normalize_effort(value)
+    if canonical is None:
+        raise WorkerError(64, 'DeepSeek effort must be low, high or max (legacy medium maps to high).')
+    return canonical
 
 
 def codex_home():
@@ -362,7 +362,7 @@ def run(args):
     args.policy_root = root
     if policy.effort == 'auto':
         args.effort = DEFAULT_EFFORT
-        print('DeepSeek effort auto: no concrete frontier selection reached the runner; using medium fallback.', file=sys.stderr)
+        print('DeepSeek effort auto: no concrete frontier selection reached the runner; using high fallback.', file=sys.stderr)
     else:
         args.effort = policy.effort
     if policy.effective_access == 'full-access' or copy is not None or getattr(args, 'coord_task', None):
@@ -446,7 +446,9 @@ def parse_args():
     parser.add_argument('--os-sandbox', choices=['required'], default='required',
                         help='Enforce the required Bubblewrap/AppArmor containment.')
     parser.add_argument('--effort', choices=EFFORT_LEVELS,
-                        help='One-job DeepSeek Flash effort override. Omit to use saved policy; policy default is auto.')
+                        help='One-job DeepSeek Flash effort override: low, high or max '
+                             '(legacy medium is accepted and treated as high). '
+                             'Omit to use saved policy; policy default is auto.')
     parser.add_argument('--timeout', type=float, default=0,
                         help='0: wait without a total deadline (default); 1..900: total seconds including queue and retries.')
     parser.add_argument('--attempts', type=int, choices=[1, 2, 3],

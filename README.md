@@ -22,9 +22,9 @@ Requires Linux, Python 3.11+ and [pipx](https://pipx.pypa.io/latest/how-to/insta
 
 *Workflow illustration with `full-access` enabled.*
 
-This README describes version **0.8.1** of the `deepseek-team` package, which installs the single `deepseek-team` executable.
+This README describes version **0.8.2** of the `deepseek-team` package, which installs the single `deepseek-team` executable.
 
-Workers use the `deepseek-flash` model and a separate **DeepSeek API key**. By default, the coordinator chooses the reasoning effort (`low`, `medium` or `high`) for each assignment; you can also save a fixed level.
+Workers use the `deepseek-flash` model and a separate **DeepSeek API key**. By default, the coordinator chooses the reasoning effort (`low`, `high` or `max`) for each assignment; you can also save a fixed level. `low` suits bounded or mechanical work, `high` is the normal case, and `max` covers difficult debugging, cross-file reasoning and adversarial review. Under `auto` the coordinator selects the level per assignment; if no level is selected, the worker runs with `high`. The levels map to the provider's reasoning levels, and thinking stays enabled as before. The legacy value `medium` is still accepted as an alias of `high`, so old settings and commands keep working. See the DeepSeek [thinking mode guide](https://api-docs.deepseek.com/guides/thinking_mode/) when reasoning depth matters.
 
 Fresh installations use **read-only** access: workers inspect the project and report their findings. To let them make changes in isolated development copies, explicitly enable `full-access`.
 
@@ -39,7 +39,7 @@ On Ubuntu, `setup --with-sandbox` can install the required system components (se
 
 ## Install
 
-Version 0.8.1 is published on [PyPI](https://pypi.org/project/deepseek-team/), so install the released package by name. [pipx](https://pipx.pypa.io/latest/how-to/install-pipx.html) keeps the CLI in its own environment and is the recommended route:
+The package is published on [PyPI](https://pypi.org/project/deepseek-team/), so install the released package by name. [pipx](https://pipx.pypa.io/latest/how-to/install-pipx.html) keeps the CLI in its own environment and is the recommended route:
 
 ```bash
 sudo apt-get install pipx      # Ubuntu, once
@@ -136,7 +136,7 @@ After the list comes an approximate coordinator/DeepSeek split in whole-number p
 | Delegation | `auto` | Chooses the executor per task; no fixed quota. |
 | Access | `auto` -> read-only in Auto | Full-access enables isolated implementation. |
 | Model | `deepseek-flash` | Fixed for all workers. |
-| Effort | `auto` | Coordinator picks `low`/`medium`/`high` per assignment. |
+| Effort | `auto` | Coordinator picks `low`/`high`/`max` per assignment; `medium` is a legacy alias of `high`. |
 | Workers | `8` | Configurable 1-64; further jobs queue FIFO. |
 | Total timeout | unlimited | An explicit timeout also includes queue time. |
 
@@ -198,7 +198,7 @@ pipx uninstall deepseek-team
 - [Routing guide](https://github.com/kirill31337/deepseek-team/blob/main/docs/ROUTING.md) - admission, evidence and feedback.
 - [Hardening](https://github.com/kirill31337/deepseek-team/blob/main/docs/HARDENING.md) - coordinator and worker boundaries.
 - [Publishing](https://github.com/kirill31337/deepseek-team/blob/main/docs/PUBLISHING.md) - release-maintainer details.
-- [0.8.1 release notes](https://github.com/kirill31337/deepseek-team/blob/main/docs/releases/0.8.1.md)
+- [0.8.2 release notes](https://github.com/kirill31337/deepseek-team/blob/main/docs/releases/0.8.2.md)
 - Russian README: [README.ru.md](https://github.com/kirill31337/deepseek-team/blob/main/README.ru.md)
 
 ## License

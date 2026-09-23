@@ -10,7 +10,7 @@ def features(**overrides):
     card = dict(kind='implementation', domain='python', operation='fix',
                 localization='known', coupling='local', verification='tests',
                 clarity='clear', risk='low', scope_size='small', runtime='codex',
-                effort='medium', model='deepseek-flash', context_version='v1')
+                effort='high', model='deepseek-flash', context_version='v1')
     card.update(overrides)
     return card
 
@@ -191,6 +191,15 @@ class BindingTests(AdapterBase):
         with self.assertRaises(RoutingError):
             admission.bound_decision(self.conn, binding(), features(operation='extend'))
 
+    def test_legacy_medium_decision_matches_a_canonical_high_card(self):
+        record = decision(card=features(effort='medium'))
+        self.store(record)
+        admission.bind_decision(self.conn, record)
+        matched = admission.bound_decision(self.conn, binding(), features(effort='high'))
+        self.assertEqual(matched['features'], validate_features(features(effort='high')))
+        with self.assertRaises(RoutingError):
+            admission.bound_decision(self.conn, binding(), features(effort='low'))
+
     def test_different_binding_is_unbound(self):
         record = decision(card=self.card)
         self.store(record)
@@ -287,12 +296,34 @@ class RecordOutcomeTests(AdapterBase):
         self.assertFalse(admission.cooling(self.conn, features(), now=1000.0))
 
 
+class LegacyEffortCooldownTests(AdapterBase):
+    def test_existing_medium_cooldown_applies_to_high_until_expiry(self):
+        from codex_deepseek_team.routing_models import fingerprint
+        legacy = features(effort='medium')
+        family = fingerprint([legacy[key] for key in admission.FAMILY_FIELDS])
+        self.conn.execute('INSERT INTO routing_admission_cooldowns VALUES (?, ?, ?)',
+                          (family, 100., 400.))
+        for effort in ('medium', 'high'):
+            self.assertTrue(admission.cooling(self.conn, features(effort=effort), now=200.))
+            self.assertFalse(admission.cooling(self.conn, features(effort=effort), now=400.))
+        for effort in ('low', 'max'):
+            self.assertFalse(admission.cooling(self.conn, features(effort=effort), now=200.))
+
+
 class FamilyIdTests(unittest.TestCase):
     def test_family_fields_are_the_declared_tuple(self):
         self.assertEqual(admission.FAMILY_FIELDS,
                          ('kind', 'domain', 'operation', 'runtime', 'model', 'effort', 'context_version'))
         self.assertEqual(admission.REWORK_LIMIT, 3)
         self.assertEqual(validate_features(features()), validate_features(features()))
+
+    def test_legacy_medium_and_high_share_one_family(self):
+        self.assertEqual(validate_features(features(effort='medium')),
+                         validate_features(features(effort='high')))
+        self.assertNotEqual(validate_features(features(effort='low')),
+                            validate_features(features(effort='high')))
+        self.assertNotEqual(validate_features(features(effort='max')),
+                            validate_features(features(effort='high')))
 
 
 if __name__ == '__main__':

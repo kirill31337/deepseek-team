@@ -9,7 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from codex_deepseek_team.routing import RoutingService
-from codex_deepseek_team.routing_models import RoutingError, validate_features
+from codex_deepseek_team.routing_models import RoutingError, validate_features, validate_observation
 
 
 class ServiceTests(unittest.TestCase):
@@ -46,6 +46,16 @@ class ServiceTests(unittest.TestCase):
             self.service.observe(self.observation(outcome='rejected'))
         with self.assertRaises(RoutingError):
             self.service.observe(self.observation(id='other', origin='external', source_id='source', source_family='family'))
+
+    def test_legacy_medium_case_rejects_backdated_high_event(self):
+        old = validate_observation(self.observation(observed_at=200.))
+        old['features'] = dict(old['features'], effort='medium')
+        # Insert pre-upgrade data directly: normal validation now canonicalizes it.
+        with self.service.store.transaction() as db:
+            self.service.store.put(db, 'observations', old['id'], old)
+        with self.assertRaisesRegex(RoutingError, 'backdated'):
+            self.service.observe(self.observation(id='backdated', observed_at=100.))
+        self.service.observe(self.observation(id='later', observed_at=300.))
 
     def test_decision_captures_original_features_and_config(self):
         result = self.service.predict(self.features)

@@ -19,6 +19,7 @@ from .routing_models import (
     RoutingError,
     fingerprint,
     number,
+    normalized_record_features,
     read_json,
     validate_features,
 )
@@ -172,7 +173,8 @@ def bound_decision(conn, binding, features):
     raw = conn.execute('SELECT value FROM decisions WHERE id=?', (row[0],)).fetchone()
     if raw is None:
         raise RoutingError('Recorded decision binding has no decision.', 78)
-    decision = read_json(raw[0])
+    # A historical decision may still carry the legacy 'medium' effort spelling.
+    decision = normalized_record_features(read_json(raw[0]))
     card = validate_features(features)
     if decision.get('binding') != binding or decision.get('features') != card:
         raise RoutingError('Features changed for an immutable decision binding.')
@@ -249,9 +251,17 @@ def record_outcome(conn, row, observations, config):
 def cooling(conn, features, now=None):
     """Return whether the task family is currently in a quality-failure cooldown."""
     timestamp = _now(now)
-    row = conn.execute('SELECT cooldown_until FROM routing_admission_cooldowns WHERE family_id=?',
-                       (_family_id(features),)).fetchone()
-    return row is not None and float(row[0]) > timestamp
+    family = list(_family(features))
+    ids = [fingerprint(family)]
+    effort_index = FAMILY_FIELDS.index('effort')
+    if family[effort_index] == 'high':
+        family[effort_index] = 'medium'
+        ids.append(fingerprint(family))
+    placeholders = ','.join('?' for _ in ids)
+    row = conn.execute(
+        f'SELECT MAX(cooldown_until) FROM routing_admission_cooldowns '
+        f'WHERE family_id IN ({placeholders})', ids).fetchone()
+    return row[0] is not None and float(row[0]) > timestamp
 
 
 def status(conn, now=None):

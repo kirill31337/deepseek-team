@@ -90,8 +90,9 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
             prompt=str(payload.get("prompt") or ""), policy=policy, runtime=runtime)
         coordination.sync_routing_feedback(root, task['id'])
         effort_context = (
-            "Effort policy is auto: choose low, medium or high for each DeepSeek assignment "
-            "from task complexity and pass it explicitly. "
+            "Effort policy is auto: choose low, high or max for each DeepSeek assignment "
+            "from task complexity and pass it explicitly (the legacy medium spelling is "
+            "accepted as high). "
             if policy.effort == "auto" else
             f"Effort policy is forced to {policy.effort}: use that level for new DeepSeek assignments. "
         )

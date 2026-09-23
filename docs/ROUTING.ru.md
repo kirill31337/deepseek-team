@@ -44,7 +44,7 @@ flowchart TD
 
 Если характеристика задачи неизвестна, для неё сохраняется `unknown`. Это касается, например, области, операции, риска и способа проверки. Недостающие сведения нельзя придумывать, чтобы оценка выглядела увереннее.
 
-У условий запуска есть значения по умолчанию: `codex`, `deepseek-flash`, `medium` и контекст `default`. Вид работы и среда запуска берутся из плана. Координатор должен проверить, что карточка соответствует реальному заданию. Если неизвестно, к какому типу относится задача, её результат не используют для оценки других задач.
+У условий запуска есть значения по умолчанию: `codex`, `deepseek-flash`, `high` и контекст `default`. Параметр `effort` принимает уровни `low`/`high`/`max`; старое значение `medium` считается синонимом `high`. Вид работы и среда запуска берутся из плана. Координатор должен проверить, что карточка соответствует реальному заданию. Если неизвестно, к какому типу относится задача, её результат не используют для оценки других задач.
 
 Архитектура, решения по безопасности, интеграция, итоговая проверка, коммиты и push, действия в боевых системах, секреты и подпись всегда остаются за координатором.
 
@@ -99,7 +99,7 @@ flowchart TD
 - `kind = implementation`, `domain = python`, `operation = extend`
 - `localization = known`, `coupling = local`, `verification = tests`
 - `clarity = clear`, `risk = low`, `scope_size = small`
-- `runtime = codex`, `model = deepseek-flash`, `effort = medium`, `context_version = project-v1`
+- `runtime = codex`, `model = deepseek-flash`, `effort = high`, `context_version = project-v1`
 
 После выполнения задания через команды координации записываются:
 
@@ -239,7 +239,7 @@ cat > /tmp/deepseek-routing-example.json <<JSON
         "scope_size": "small",
         "runtime": "codex",
         "model": "deepseek-flash",
-        "effort": "medium",
+        "effort": "high",
         "context_version": "example-v1"
       },
       "action": "worker",
@@ -278,7 +278,7 @@ cat > /tmp/feature-card.json <<'JSON'
   "scope_size": "small",
   "runtime": "codex",
   "model": "deepseek-flash",
-  "effort": "medium",
+  "effort": "high",
   "context_version": "example-v1"
 }
 JSON
@@ -310,7 +310,7 @@ cat > /tmp/local-observation.json <<JSON
     "scope_size": "small",
     "runtime": "codex",
     "model": "deepseek-flash",
-    "effort": "medium",
+    "effort": "high",
     "context_version": "example-v1"
   },
   "action": "worker",

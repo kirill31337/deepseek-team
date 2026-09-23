@@ -38,7 +38,7 @@ class DevelopmentError(Exception):
 
 def runtime_command(binary: str, runtime: str, *, writable: bool,
                     path: str = '/usr/local/bin:/usr/bin:/bin',
-                    effort: str = 'medium') -> list[str]:
+                    effort: str = 'high') -> list[str]:
     from . import worker
     instructions = FULL_INSTRUCTIONS if writable else worker.INSTRUCTIONS
     if runtime == 'codex':
@@ -178,7 +178,7 @@ def probe(args: list[str], env: dict[str, str]) -> None:
 
 
 def write_launch(control: Path, binary: str, runtime: str, env: dict[str, str], *,
-                 writable: bool, effort: str = 'medium') -> None:
+                 writable: bool, effort: str = 'high') -> None:
     shutil.copyfile(Path(relay.__file__), control / 'bridge.py')
     (control / 'bridge.py').chmod(0o400)
     command = runtime_command(binary, runtime, writable=writable, path=env['PATH'], effort=effort)

@@ -34,7 +34,7 @@ The frontier coordinator classifies each task itself, before any worker runs. It
 - `localization` (`known`/`partial`/`unknown`), `coupling` (`local`/`component`/`cross-component`/`unknown`), `risk`, `scope_size`, `clarity` and `verification` describe the known scope.
 - `runtime`, `model`, `effort` and `context_version` identify the execution conditions, so results from one execution identity are not silently reused for another.
 
-Unspecified task attributes such as domain, operation, risk and verification stay `unknown`; the coordinator should not guess them into certainty. Execution fields have documented defaults (`codex`, `deepseek-flash`, `medium`, context `default`), and a plan supplies its kind and runtime. The coordinator must check these against the actual assignment. A case whose task family is unknown cannot transfer evidence to another task. Protected work stays with the coordinator: architecture, security, integration, final verification, commit/push, production and secret signing.
+Unspecified task attributes such as domain, operation, risk and verification stay `unknown`; the coordinator should not guess them into certainty. Execution fields have documented defaults (`codex`, `deepseek-flash`, `high`, context `default`), where `effort` uses the concrete levels `low`/`high`/`max` and the legacy value `medium` is accepted as an alias of `high`; a plan supplies its kind and runtime. The coordinator must check these against the actual assignment. A case whose task family is unknown cannot transfer evidence to another task. Protected work stays with the coordinator: architecture, security, integration, final verification, commit/push, production and secret signing.
 
 ### Estimator — acceptance without rework, with uncertainty
 
@@ -69,7 +69,7 @@ Facts known before execution, recorded in the feature card and unchanged by the 
 - `kind = implementation`, `domain = python`, `operation = extend`
 - `localization = known`, `coupling = local`, `verification = tests`
 - `clarity = clear`, `risk = low`, `scope_size = small`
-- `runtime = codex`, `model = deepseek-flash`, `effort = medium`, `context_version = project-v1`
+- `runtime = codex`, `model = deepseek-flash`, `effort = high`, `context_version = project-v1`
 
 Observed only after the work, recorded through the coordination lifecycle:
 
@@ -194,7 +194,7 @@ cat > /tmp/deepseek-routing-example.json <<JSON
         "scope_size": "small",
         "runtime": "codex",
         "model": "deepseek-flash",
-        "effort": "medium",
+        "effort": "high",
         "context_version": "example-v1"
       },
       "action": "worker",
@@ -233,7 +233,7 @@ cat > /tmp/feature-card.json <<'JSON'
   "scope_size": "small",
   "runtime": "codex",
   "model": "deepseek-flash",
-  "effort": "medium",
+  "effort": "high",
   "context_version": "example-v1"
 }
 JSON
@@ -263,7 +263,7 @@ cat > /tmp/local-observation.json <<JSON
     "scope_size": "small",
     "runtime": "codex",
     "model": "deepseek-flash",
-    "effort": "medium",
+    "effort": "high",
     "context_version": "example-v1"
   },
   "action": "worker",

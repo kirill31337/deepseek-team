@@ -322,6 +322,42 @@ class StateAndDistributionTests(CoordinationCase):
         reloaded = coordination.load_task(self.repo, task["id"])
         self.assertEqual(reloaded["assignments"][0]["disposition"]["kind"], "reproduced")
 
+    def test_assignment_effort_is_canonical_and_legacy_medium_maps_to_high(self):
+        for index, (requested, expected) in enumerate((("max", "max"), ("medium", "high"), ("low", "low"))):
+            with self.subTest(requested=requested):
+                task = coordination.open_task(
+                    self.repo, session_id="sess-effort", turn_id=f"turn-{index}",
+                    prompt="implement feature", policy=self.policy())
+                planned = coordination.plan_task(self.repo, task["id"], {
+                    "classification": "substantial",
+                    "deliverables": [
+                        {"id": "review", "kind": "review", "scope": ["a.py"],
+                         "executor": "worker", "acceptance": ["review"],
+                         "dependencies": [], "checks": []},
+                    ],
+                })
+                row = coordination.assignment_started(
+                    self.repo, task["id"], planned["assignments"][0]["id"],
+                    workspace_id="ws-effort", runtime="codex",
+                    prepared_changes=[], effort=requested)["assignments"][0]
+                self.assertEqual(row["effort"], expected)
+                self.assertEqual(row["routing_features"]["effort"], expected)
+        task = coordination.open_task(
+            self.repo, session_id="sess-effort", turn_id="turn-bad",
+            prompt="implement feature", policy=self.policy())
+        planned = coordination.plan_task(self.repo, task["id"], {
+            "classification": "substantial",
+            "deliverables": [
+                {"id": "review", "kind": "review", "scope": ["a.py"],
+                 "executor": "worker", "acceptance": ["review"],
+                 "dependencies": [], "checks": []},
+            ],
+        })
+        with self.assertRaises(coordination.CoordinationError):
+            coordination.assignment_started(self.repo, task["id"], planned["assignments"][0]["id"],
+                                            workspace_id="ws-effort", runtime="codex",
+                                            prepared_changes=[], effort="xhigh")
+
 
 class ReadinessAndAttributionTests(CoordinationCase):
     def test_missing_declared_command_fails_readiness_before_worker(self):

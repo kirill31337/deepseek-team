@@ -7,6 +7,8 @@ import math
 import re
 import time
 
+from .effort import CANONICAL_EFFORTS, DEFAULT_EFFORT, LEGACY_EFFORT_ALIASES, normalize_effort
+
 
 class RoutingError(Exception):
     def __init__(self, message: str, code: int = 64):
@@ -29,10 +31,10 @@ FEATURE_VALUES = {
     'risk': ('low', 'medium', 'high', 'protected', 'unknown'),
     'scope_size': ('small', 'medium', 'large', 'unknown'),
     'runtime': ('codex', 'claude'),
-    'effort': ('low', 'medium', 'high'),
+    'effort': CANONICAL_EFFORTS + tuple(LEGACY_EFFORT_ALIASES),
 }
 FEATURE_DEFAULTS = dict.fromkeys(FEATURE_VALUES, 'unknown')
-FEATURE_DEFAULTS.update(kind='implementation', runtime='codex', effort='medium',
+FEATURE_DEFAULTS.update(kind='implementation', runtime='codex', effort=DEFAULT_EFFORT,
                         model='deepseek-flash', context_version='default')
 DEFAULT_CONFIG = {
     'mode': 'auto', 'confidence': .95,
@@ -65,9 +67,32 @@ def validate_features(value: dict) -> dict:
     for key, allowed in FEATURE_VALUES.items():
         if not isinstance(result[key], str) or result[key] not in allowed:
             raise RoutingError(f'Invalid feature {key}.')
+    # A stored card may still carry the legacy 'medium' spelling; normalize it so
+    # medium and high compare equal in identities, families and evidence keys.
+    result['effort'] = normalize_effort(result['effort'])
     for key in ('model', 'context_version'):
         identifier(result[key], key)
     return result
+
+
+def normalized_features(value):
+    """Map a stored feature card's legacy effort spelling without full validation.
+
+    Used on read paths so a historical ``medium`` record compares equal to a
+    canonical ``high`` card without rewriting the stored record.
+    """
+    if isinstance(value, dict):
+        canonical_effort = normalize_effort(value.get('effort'))
+        if canonical_effort is not None and canonical_effort != value.get('effort'):
+            return dict(value, effort=canonical_effort)
+    return value
+
+
+def normalized_record_features(record):
+    """Normalize the nested feature card of a stored observation or decision."""
+    features = record.get('features') if isinstance(record, dict) else None
+    normalized = normalized_features(features)
+    return record if normalized is features else dict(record, features=normalized)
 
 
 def validate_config(value: dict, base=None) -> dict:

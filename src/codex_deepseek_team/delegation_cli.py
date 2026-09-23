@@ -13,8 +13,10 @@ def policy_options(parser):
                         choices=settings.LEVELS,
                         help='auto adapts per task; 25/50/75 force a fixed profile.')
     parser.add_argument('--access', choices=settings.ACCESS)
-    parser.add_argument('--effort', choices=settings.EFFORT,
-                        help='auto lets the frontier coordinator choose per DeepSeek assignment; low/medium/high force a level.')
+    parser.add_argument('--effort', choices=settings.EFFORT_CHOICES,
+                        help='auto lets the frontier coordinator choose per DeepSeek assignment; '
+                             'low/high/max force a canonical level. The legacy medium spelling is '
+                             'accepted and saved as high.')
     parser.add_argument('--max-workers', type=int,
                         help='Maximum concurrently running workers (1..64, default 8); extra jobs queue.')
 

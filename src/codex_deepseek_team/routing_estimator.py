@@ -13,13 +13,23 @@ import itertools
 import math
 import time
 
-from .routing_models import RoutingError, validate_config, validate_features
+from .routing_models import RoutingError, normalized_features, validate_config, validate_features
 
 _IDENTITY = ("runtime", "model", "effort", "context_version")
 _ANCHORS = ("kind", "domain", "operation")
 _SOFT_CONTEXT = ("localization", "coupling", "verification", "clarity", "risk", "scope_size")
 _CONTEXT = _ANCHORS + _SOFT_CONTEXT
 _LABELLED = frozenset(("accepted", "rework", "rejected"))
+
+
+def _canonical_observations(observations):
+    """Treat a stored legacy 'medium' effort as the same level as 'high'."""
+    result = []
+    for row in observations:
+        features = row.get("features")
+        canonical = normalized_features(features)
+        result.append(row if canonical is features else dict(row, features=canonical))
+    return result
 
 
 def _beta_fraction(a: float, b: float, x: float) -> float:
@@ -198,7 +208,7 @@ def _posterior(weighted, config, *, intervals=True, evidence_ids=True):
 def estimate(features, observations, config, *, now=None) -> dict:
     """Estimate acceptance without rework under the recorded candidate context."""
     features, config, now = validate_features(features), validate_config(config), _timestamp(now)
-    return _posterior(_weighted(features, observations, config, now), config)
+    return _posterior(_weighted(features, _canonical_observations(observations), config, now), config)
 
 
 def _economics(weighted):
@@ -227,7 +237,7 @@ def _economics(weighted):
 def forecast(features, observations, config, *, now=None) -> dict:
     """Forecast worker quality and measured costs without choosing an executor."""
     features, config, now = validate_features(features), validate_config(config), _timestamp(now)
-    observations = list(observations)
+    observations = _canonical_observations(observations)
     weighted = _weighted(features, observations, config, now)
     posterior = _posterior(weighted, config)
     economics = _economics(_weighted(features, observations, config, now, for_cost=True))
@@ -438,7 +448,7 @@ cutoff. Training incorporates each correction only at its observed timestamp,
 so a later failure cannot influence an earlier forecast.
 """
     config, now = validate_config(config), _timestamp(now)
-    all_rows = sorted((r for r in observations if r["observed_at"] <= now),
+    all_rows = sorted((r for r in _canonical_observations(observations) if r["observed_at"] <= now),
                       key=lambda r: (r["observed_at"], r["outcome"] == "accepted", r["id"]))
     rows = list(_case_outcomes(all_rows, now, corrections=False))
     targets = {_case_key(row): row for row in _case_outcomes(all_rows, now)}

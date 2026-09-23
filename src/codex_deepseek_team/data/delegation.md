@@ -69,14 +69,16 @@ user-namespace restrictions to make delegation pass.
 DeepSeek Team workers always use **`deepseek-flash`**. Do not route to another DeepSeek
 model. Resolve the current effort policy with the effective config before assigning work.
 The default is `effort=auto`: in that mode the frontier coordinator chooses the effort
-from the actual delegated scope and passes `--effort low|medium|high` (`low` for bounded
-or mechanical work, `medium` for the normal case, `high` for difficult debugging,
-cross-file reasoning, security-sensitive review or adversarial verification). If the
-resolved policy is explicitly `low`, `medium` or `high`, treat it as the saved forced
-level for new DeepSeek jobs and do not auto-select another value. `config set` can persist
-that choice per project or globally, and setting it back to `auto` restores frontier
-selection. A direct worker launched while policy is auto falls back to `medium` only when
-no frontier-selected concrete effort reaches the runner.
+from the actual delegated scope and passes `--effort low|high|max` (`low` for bounded
+or mechanical work, `high` for the normal case, `max` for difficult debugging,
+cross-file reasoning, security-sensitive review or adversarial verification). The legacy
+spelling `--effort medium` is still accepted and is treated exactly as `high`, so old
+commands, saved settings and feature cards keep working. If the resolved policy is
+explicitly `low`, `high` or `max`, treat it as the saved forced level for new DeepSeek
+jobs and do not auto-select another value (a saved legacy `medium` normalizes to `high`).
+`config set` can persist that choice per project or globally, and setting it back to
+`auto` restores frontier selection. A direct worker launched while policy is auto falls
+back to `high` only when no frontier-selected concrete effort reaches the runner.
 
 The coordinator may also use its own **native subagents** when this materially improves
 parallelism, isolated context, independent verification, or access to a native capability.
@@ -125,7 +127,7 @@ deepseek-team coordination plan --task TASK_ID <<'JSON'
         "kind": "implementation", "domain": "python", "operation": "extend",
         "localization": "known", "coupling": "local", "verification": "tests",
         "clarity": "clear", "risk": "low", "scope_size": "small",
-        "runtime": "{runtime}", "model": "deepseek-flash", "effort": "medium",
+        "runtime": "{runtime}", "model": "deepseek-flash", "effort": "high",
         "context_version": "project-v1"
       }
     }
@@ -140,7 +142,7 @@ the plan returns a worker assignment; retain a coordinator decision with the coo
 Use the assignment id returned by the plan:
 
 ```bash
-deepseek-team worker --runtime {runtime} --effort medium \
+deepseek-team worker --runtime {runtime} --effort high \
   --coord-task TASK_ID --coord-assignment ASSIGNMENT_ID <<'TASK'
 Implement the assigned deliverable and satisfy its registered acceptance criteria.
 TASK

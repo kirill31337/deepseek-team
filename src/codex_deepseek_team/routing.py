@@ -11,7 +11,7 @@ import uuid
 from . import routing_admission, routing_estimator, settings
 from .routing_models import (RoutingError, WRITE_KINDS, canonical, fingerprint, identifier, read_json,
                              number, validate_config, validate_features, validate_observation)
-from .routing_store import RoutingStore, evidence_key
+from .routing_store import RoutingStore, evidence_keys
 
 
 class RoutingService:
@@ -91,8 +91,11 @@ class RoutingService:
                                   (row['decision_id'],)).fetchone()
                 if case and case[0] != row['case_id']:
                     raise RoutingError('One recorded decision cannot represent different observed cases.')
-            latest = db.execute('SELECT MAX(observed_at) FROM evidence_index WHERE case_key=?',
-                                (evidence_key(row),)).fetchone()[0]
+            keys = evidence_keys(row)
+            placeholders = ','.join('?' for _ in keys)
+            latest = db.execute(
+                f'SELECT MAX(observed_at) FROM evidence_index WHERE case_key IN ({placeholders})',
+                keys).fetchone()[0]
             if latest is not None and row['observed_at'] < latest:
                 raise RoutingError('Local outcomes cannot be backdated before an existing case event.')
             self.store.put(db, 'observations', row['id'], row)
