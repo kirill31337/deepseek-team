@@ -34,7 +34,7 @@ class UniversalCliTests(unittest.TestCase):
     def cli(self, *args, input='', cwd=None):
         return subprocess.run([sys.executable, '-m', 'codex_deepseek_team', *args],
                               input=input, text=True, capture_output=True,
-                              env=self.env, timeout=15, cwd=cwd)
+                              env=self.env, timeout=15, cwd=cwd or self.root)
 
     def git_repo(self):
         repo = self.root / 'repo'
@@ -116,7 +116,7 @@ class PackagingTests(unittest.TestCase):
         scripts = data['project']['scripts']
         self.assertEqual(scripts['codex-deepseek-team'], 'codex_deepseek_team.cli:main')
         self.assertEqual(scripts['deepseek-team'], 'codex_deepseek_team.cli:main')
-        self.assertEqual(data['project']['version'], '0.6.0')
+        self.assertEqual(data['project']['version'], '0.7.0')
         self.assertIn('data/apparmor/*', data['tool']['setuptools']['package-data']['codex_deepseek_team'])
         urls = data['project']['urls']
         self.assertEqual(urls['Repository'], 'https://github.com/kirill31337/deepseek-team')

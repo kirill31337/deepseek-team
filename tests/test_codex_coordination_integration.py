@@ -8,6 +8,7 @@ import secrets
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -40,6 +41,12 @@ class RealCodexCoordinatorHookTests(unittest.TestCase):
             home.mkdir(mode=0o700)
             repo = root / "repo"
             repo.mkdir()
+            bin_dir = root / "bin"
+            bin_dir.mkdir()
+            command = bin_dir / "deepseek-team"
+            command.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) +
+                               ' -m codex_deepseek_team "$@"\n')
+            command.chmod(0o700)
             (repo / "a.py").write_text("VALUE = 1\n")
             subprocess.run(["git", "init", "-q", str(repo)], check=True)
             subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
@@ -181,6 +188,8 @@ class RealCodexCoordinatorHookTests(unittest.TestCase):
                     CODEX_HOME=str(home),
                     FIXTURE_KEY=synthetic_key,
                     DEEPSEEK_TEAM_STATE_DIR=str(root / "state"),
+                    PATH=str(bin_dir) + os.pathsep + os.environ.get("PATH", "/usr/bin:/bin"),
+                    PYTHONPATH=str(Path(__file__).resolve().parents[1] / "src"),
                 )
                 result = subprocess.run([
                     binary, "exec", "--strict-config", "--ephemeral", "--json",

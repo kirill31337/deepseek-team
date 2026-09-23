@@ -18,6 +18,21 @@ derive an "actual percentage" from calls, tasks, files, lines, tokens, time, or 
 subjective list of bullets. Access remains independent of the target profile:
 explicit read-only always remains read-only.
 
+Fresh installations use the **Auto** delegation profile. In Auto, register eligible
+deliverables with `executor: "auto"`; the recorded routing decision resolves each to
+worker or coordinator. Saved manual 25/50/75 profiles retain priority. Capture a
+structured `features` card before execution in both Auto and manual profiles so real
+outcomes continue to teach the router. Match its runtime/model/effort/context to the
+actual assignment, and keep unknown task attributes unknown. Protected coordinator
+responsibilities keep an explicit coordinator executor.
+
+Auto uses capped public evidence and comparable local outcomes, with uncertainty and
+measured total cost. Controlled recovery admits only small, low-risk, local tasks with
+known scope and concrete checks: one pending/running recovery assignment project-wide,
+then at least ten distinct eligible opportunities between selections by default.
+Quality failures pause that task family for one hour; old evidence loses weight.
+Recovery never grants access or automatically retries a failed implementation.
+
 Keep the required Linux OS sandbox enabled for managed workers. Never add `--os-sandbox off`
 to ordinary coordination flows and do not weaken Ubuntu AppArmor
 user-namespace restrictions to make delegation pass.
@@ -78,13 +93,23 @@ deepseek-team coordination plan --task TASK_ID <<'JSON'
       "executor": "worker",
       "acceptance": ["focused behavior implemented"],
       "dependencies": [{"kind": "command", "value": "python3"}],
-      "checks": ["python3 -m unittest tests.test_example -q"]
+      "checks": ["python3 -m unittest tests.test_example -q"],
+      "features": {
+        "kind": "implementation", "domain": "python", "operation": "extend",
+        "localization": "known", "coupling": "local", "verification": "tests",
+        "clarity": "clear", "risk": "low", "scope_size": "small",
+        "runtime": "{runtime}", "model": "deepseek-flash", "effort": "medium",
+        "context_version": "project-v1"
+      }
     }
   ]
 }
 JSON
 ```
 
+This example explicitly chooses a worker for a manual profile. With profile Auto,
+set its executor to `auto` and inspect the resolved plan. Start a worker only when
+the plan returns a worker assignment; retain an abstention with the coordinator.
 Use the assignment id returned by the plan:
 
 ```bash
@@ -99,8 +124,16 @@ declared checks automatically. After inspection, record disposition:
 
 ```bash
 deepseek-team coordination use --task TASK_ID --assignment ASSIGNMENT_ID \
-  --disposition incorporated --evidence "reviewed diff and accepted result"
+--disposition incorporated --evidence "reviewed diff and accepted result"
 ```
+
+Record verified coordinator outcomes with `coordination result --task TASK_ID
+--deliverable DELIVERABLE_ID --outcome accepted --evidence "checks passed"`.
+Both result commands accept `--cost-usd` for the measured total, including review
+and rework; omit unknown costs rather than inventing a subscription dollar value.
+Use `needs-rework` when the worker result needed fixes. Repeated attempts remain one
+case, and a recorded quality failure cannot be converted into a clean first-pass
+success by a later incorporation. Provider/environment failures stay unlabelled.
 
 If selected uncommitted source is required, never copy the whole checkout:
 

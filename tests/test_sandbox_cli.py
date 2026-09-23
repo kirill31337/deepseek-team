@@ -54,7 +54,7 @@ class DoctorSandboxTests(unittest.TestCase):
              mock.patch.object(doctor, 'selected_runtimes', return_value=('codex',)), \
              mock.patch.object(doctor, 'check_runtime', side_effect=runtime_check), \
              mock.patch('sys.stdout', new_callable=io.StringIO) as output:
-            code = doctor.main(['--offline', '--runtime', 'codex'])
+            code = doctor.main(['--offline', '--runtime', 'codex', '--access', 'read-only'])
         self.assertEqual(code, 0)
         self.assertEqual(calls, ['sandbox', 'runtime'])
         self.assertIn('direct', output.getvalue())
@@ -63,7 +63,7 @@ class DoctorSandboxTests(unittest.TestCase):
         with mock.patch.object(doctor.worker, 'resolve_os_sandbox') as os_check, \
              mock.patch.object(doctor, 'selected_runtimes', return_value=()), \
              mock.patch('sys.stdout', new_callable=io.StringIO):
-            code = doctor.main(['--offline', '--runtime', 'codex', '--os-sandbox', 'off'])
+            code = doctor.main(['--offline', '--runtime', 'codex', '--access', 'read-only', '--os-sandbox', 'off'])
         self.assertEqual(code, 0)
         os_check.assert_not_called()
 

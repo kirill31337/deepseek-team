@@ -14,19 +14,32 @@ from types import MappingProxyType
 from typing import Mapping
 
 PROJECT_FILE = '.deepseek-team.toml'
-LEVELS = (25, 50, 75)
+LEVELS = ('auto', 25, 50, 75)
 ACCESS = ('auto', 'read-only', 'full-access')
 EFFORT = ('auto', 'low', 'medium', 'high')
-DEFAULTS = {'delegation_level': 25, 'access': 'auto', 'effort': 'auto'}
+DEFAULTS = {'delegation_level': 'auto', 'access': 'auto', 'effort': 'auto'}
 
 
 class SettingsError(Exception):
     """Invalid or unsafe settings; never silently escalate permissions."""
 
 
+def parse_level(value):
+    """Argparse converter: literal lowercase 'auto', or exactly 25/50/75.
+
+    Rejects bools, floats, padded strings and any other spelling so a typo can
+    never silently change the delegation profile or widen access.
+    """
+    if isinstance(value, str) and value == 'auto':
+        return 'auto'
+    if isinstance(value, str) and value in ('25', '50', '75'):
+        return int(value)
+    raise ValueError("delegation-level must be 'auto', 25, 50 or 75.")
+
+
 @dataclass(frozen=True)
 class Policy:
-    delegation_level: int
+    delegation_level: str | int
     access: str
     sources: Mapping[str, str]
     effort: str = 'auto'
@@ -37,13 +50,19 @@ class Policy:
     def effective_access(self) -> str:
         if self.access != 'auto':
             return self.access
-        return 'read-only' if self.delegation_level == 25 else 'full-access'
+        # Auto and manual 25 stay read-only; only an explicit 50/75 widens access.
+        return 'read-only' if self.delegation_level in ('auto', 25) else 'full-access'
+
+    @property
+    def adaptive(self) -> bool:
+        return self.delegation_level == 'auto'
 
     def as_dict(self) -> dict:
         return {
             'enabled': self.enabled,
             'enabled_source': self.enabled_source,
             'delegation_level': self.delegation_level,
+            'delegation_mode': 'adaptive' if self.adaptive else 'fixed',
             'access': self.access,
             'effective_access': self.effective_access,
             'effort': self.effort,
@@ -91,8 +110,10 @@ def _validate(values: dict) -> None:
         raise SettingsError('Only delegation_level, access and effort are allowed in delegation settings.')
     if 'delegation_level' in values:
         level = values['delegation_level']
-        if type(level) is not int or level not in LEVELS:
-            raise SettingsError('delegation_level must be the integer 25, 50 or 75.')
+        valid = (type(level) is str and level == 'auto') or (
+            type(level) is int and level in LEVELS)
+        if not valid:
+            raise SettingsError('delegation_level must be auto, 25, 50 or 75.')
     if 'access' in values and values['access'] not in ACCESS:
         raise SettingsError('access must be auto, read-only or full-access.')
     if 'effort' in values and values['effort'] not in EFFORT:
@@ -126,7 +147,7 @@ def read_values(path: Path) -> dict:
     return values
 
 
-def resolve(root: Path | None = None, *, delegation_level: int | None = None,
+def resolve(root: Path | None = None, *, delegation_level: str | int | None = None,
             access: str | None = None, effort: str | None = None,
             global_path: Path | None = None) -> Policy:
     """Resolve both fields independently and freeze a new-job policy snapshot."""
@@ -152,7 +173,7 @@ def resolve(root: Path | None = None, *, delegation_level: int | None = None,
                   values['effort'], active.enabled, active.source)
 
 
-def set_values(path: Path, *, delegation_level: int | None = None,
+def set_values(path: Path, *, delegation_level: str | int | None = None,
                access: str | None = None, effort: str | None = None) -> bool:
     """Atomic partial update: changing a level never implicitly resets access."""
     changes = {k: v for k, v in {
@@ -206,9 +227,15 @@ def set_values(path: Path, *, delegation_level: int | None = None,
 
 def describe(policy: Policy) -> str:
     data = policy.as_dict()
+    if policy.adaptive:
+        level = ('delegation_level: auto (adaptive per task; no fixed percentage; '
+                 f'source={policy.sources["delegation_level"]})')
+    else:
+        level = (f'delegation_level: {policy.delegation_level}% '
+                 f'(target; source={policy.sources["delegation_level"]})')
     return '\n'.join((
         f'enabled: {str(policy.enabled).lower()} (source={policy.enabled_source})',
-        f'delegation_level: {policy.delegation_level}% (target; source={policy.sources["delegation_level"]})',
+        level,
         f'access: {policy.access} (source={policy.sources["access"]})',
         f'effective_access: {policy.effective_access} (source={data["effective_access_source"]})',
         f'effort: {policy.effort} (source={policy.sources.get("effort", "default")}; '
@@ -262,17 +289,19 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
         'Coordinator-native subagents remain available. Use them only when parallelism, isolated '
         'context or a native capability materially helps. Represent that choice in the plan with '
         'executor: "native-agent" plus a concrete delegation_reason. Native agents complement '
-        'DeepSeek workers and do not satisfy DeepSeek worker assignments required by the 50/75 '
-        'profiles. Protected coordinator responsibilities remain with the coordinator. DeepSeek '
+        'DeepSeek workers and do not satisfy DeepSeek worker assignments required by the '
+        'effective profile. Protected coordinator responsibilities remain with the coordinator. DeepSeek '
         'workers themselves remain leaf workers and must never delegate.\n'
     )
 
     full_profiles = {
+        'auto': 'Delegation depth is adaptive (auto), not a fixed target: delegate a separable implementation, test, fixture, documentation or review slice when the captured task features show it is worthwhile, and leave the task with the coordinator on cold start or when it is not separable.',
         25: 'Delegate bounded research, diagnosis and independent review. The coordinator performs the main implementation.',
         50: 'Delegate at least one separable implementation/test/docs slice when such work exists; coordinator defines architecture/interfaces and integrates.',
         75: 'Delegate most separable implementation, tests, fixtures, documentation, non-secret metadata and independent review before doing that same work yourself. Use up to three workers only for genuinely independent assignments.',
     }
     read_only_profiles = {
+        'auto': 'Delegation depth is adaptive (auto), not a fixed target: delegate bounded research, diagnosis, design validation and independent review when the captured task features show it is worthwhile, and leave the task with the coordinator on cold start or when it is not separable. Read-only auto never delegates writing tasks.',
         25: 'Delegate bounded research, diagnosis and independent review. The coordinator performs the main implementation.',
         50: 'Delegate substantial investigation, design validation, test planning and independent review before the coordinator implements the corresponding changes.',
         75: 'Delegate most separable analysis, diagnostics, design validation, test planning and independent review. Use up to three read-only workers only for genuinely independent assignments.',
@@ -291,12 +320,37 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
         access = (
             'Actual access is read-only, regardless of the target level. Assign analysis, diagnostics '
             'and review only; project writes and mutating tests/builds remain coordinator work. '
-            'Do not expand access merely to satisfy the target profile.\n'
+            'Do not expand access merely to satisfy the target profile. '
+            + ('Read-only auto does not delegate writing tasks; implementation stays with the coordinator.\n'
+               if policy.adaptive else '\n')
         )
 
     guidance = (
         full_profiles if policy.effective_access == 'full-access' else read_only_profiles
     )[policy.delegation_level]
+
+    if policy.adaptive:
+        adaptive = (
+            'Delegation level is auto: the profile is adaptive per task, chosen from local outcomes and '
+            'bounded external evidence instead of a fixed percentage. New auto plans must record '
+            'executor: "auto" together with a "features" card capturing the task before execution: '
+            'kind, domain, operation, localization, coupling, verification, clarity, risk, scope_size, '
+            'runtime, model, effort and context_version. The coordinator classifies the task; the router '
+            'resolves its saved feature card. Workers must not self-select a profile. Cold start '
+            'may abstain and return the task to the coordinator. A bounded share of safe, small, locally '
+            'verifiable regular tasks can be delegated for recovery, with one such assignment in flight '
+            'and a finite cooldown after failures. There is no automatic paid exploration outside the '
+            'normal task stream and no automatic permission widening; keep the resolved access and explicit executor '
+            'choices. Inspect adaptive routing state with deepseek-team routing status and adjust it '
+            'with deepseek-team routing configure.\n'
+        )
+    else:
+        adaptive = (
+            'The fixed delegation target is not a measurement: completed assignments still collect '
+            'feedback so manual 25/50/75 behavior can be reviewed, with no invented ratio, call or '
+            'token percentages. Explicit executor choices are respected, and a fixed target never '
+            'widens the resolved access.\n'
+        )
 
     coordinator = 'Claude' if runtime == 'claude' else 'Codex'
     process = (
@@ -327,10 +381,11 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
             'instead of blocking again. Native subagent hook events do not change the coordinator ledger. '
             'Check enabled hooks through Claude /hooks; --bare or native settings can disable them.\n')
 
+    label = 'auto (adaptive)' if policy.adaptive else f'{policy.delegation_level}%'
     return (
-        f'### Effective delegation profile: {policy.delegation_level}% / {policy.effective_access}; '
+        f'### Effective delegation profile: {label} / {policy.effective_access}; '
         f'effort={policy.effort}\n'
-        + common + guidance + '\n' + access + process
+        + common + guidance + '\n' + adaptive + access + process
         + 'While a worker runs, work only on independent scope. Review the actual diff and recorded '
           'checks without repeating the whole investigation or rewriting correct code. DeepSeek workers never '
           'stage, commit, push, publish, deploy, access production services or delegate.\n'

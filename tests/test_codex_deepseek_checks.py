@@ -35,7 +35,7 @@ class CheckTests(unittest.TestCase):
                  mock.patch.object(check.worker, 'load_api_key') as key, \
                  mock.patch('urllib.request.build_opener') as network, \
                  mock.patch('sys.stdout', new_callable=io.StringIO) as output:
-                self.assertEqual(check.main(['--offline', '--os-sandbox', 'off']), 0)
+                self.assertEqual(check.main(['--offline', '--access', 'read-only', '--os-sandbox', 'off']), 0)
                 self.assertIn('example-primary', output.getvalue())
                 key.assert_not_called()
                 network.assert_not_called()

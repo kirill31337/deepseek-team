@@ -45,6 +45,64 @@ class PolicyResolutionTests(RepoCase):
                 self.assertEqual(policy.as_dict()['effort_mode'], 'frontier-auto')
                 self.assertTrue(policy.as_dict()['percentage_is_target_not_measurement'])
 
+    def test_default_is_adaptive_auto_without_widening_permissions(self):
+        self.assertEqual(settings.DEFAULTS['delegation_level'], 'auto')
+        self.assertEqual(settings.LEVELS, ('auto', 25, 50, 75))
+        policy = settings.resolve(self.repo)
+        self.assertEqual(policy.delegation_level, 'auto')
+        self.assertEqual(policy.access, 'auto')
+        self.assertEqual(policy.effective_access, 'read-only')
+        self.assertEqual(policy.sources['delegation_level'], 'default')
+        self.assertNotIn('%', settings.describe(policy).splitlines()[1])
+        self.assertEqual(policy.as_dict()['delegation_level'], 'auto')
+
+    def test_auto_and_manual_levels_resolve_access_without_widening_fresh_installs(self):
+        expected = {'auto': 'read-only', 25: 'read-only', 50: 'full-access', 75: 'full-access'}
+        for level, access in expected.items():
+            with self.subTest(level=level):
+                policy = settings.resolve(self.repo, delegation_level=level, access='auto')
+                self.assertEqual(policy.delegation_level, level)
+                self.assertEqual(policy.effective_access, access)
+        forced = settings.resolve(self.repo, delegation_level='auto', access='full-access')
+        self.assertEqual(forced.effective_access, 'full-access')
+        self.assertEqual(forced.access, 'full-access')
+
+    def test_manual_numeric_preference_persists_and_stays_numeric(self):
+        self.assertTrue(settings.set_values(self.repo / settings.PROJECT_FILE,
+                                            delegation_level=50, access='auto'))
+        saved = (self.repo / settings.PROJECT_FILE).read_text()
+        self.assertIn('delegation_level = 50', saved)
+        policy = settings.resolve(self.repo)
+        self.assertEqual(policy.delegation_level, 50)
+        self.assertEqual(policy.access, 'auto')
+        self.assertEqual(policy.effective_access, 'full-access')
+        self.assertIn('delegation_level: 50%', settings.describe(policy))
+        self.assertTrue(settings.set_values(self.repo / settings.PROJECT_FILE,
+                                            delegation_level='auto'))
+        saved = (self.repo / settings.PROJECT_FILE).read_text()
+        self.assertIn('delegation_level = "auto"', saved)
+        self.assertEqual(settings.resolve(self.repo).delegation_level, 'auto')
+
+    def test_invalid_level_types_fail_closed(self):
+        for bad in (True, False, 25.0, 50.0, 'AUTO', 'Auto', 'auto ', ' 25', '25', '100',
+                    'auto\n', b'auto'):
+            with self.subTest(bad=bad), self.assertRaises(settings.SettingsError):
+                settings.resolve(self.repo, delegation_level=bad)
+        for literal in ('delegation_level = true', 'delegation_level = 25.0',
+                        'delegation_level = "25"', 'delegation_level = "AUTO"'):
+            (self.repo / settings.PROJECT_FILE).write_text(literal + '\n')
+            with self.subTest(toml=literal), self.assertRaises(settings.SettingsError):
+                settings.resolve(self.repo)
+
+    def test_parse_level_is_argparse_friendly(self):
+        self.assertEqual(settings.parse_level('auto'), 'auto')
+        for text, number in (('25', 25), ('50', 50), ('75', 75)):
+            with self.subTest(text=text):
+                self.assertEqual(settings.parse_level(text), number)
+        for bad in ('AUTO', 'Auto', ' auto', 'auto ', '25.0', '0', '100', 'twenty', '', 25, 25.0, True):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                settings.parse_level(bad)
+
     def test_explicit_access_is_independent_of_level(self):
         self.assertEqual(
             settings.resolve(self.repo, delegation_level=75, access='read-only').effective_access,
@@ -92,6 +150,34 @@ class PolicyResolutionTests(RepoCase):
         self.assertIn('--effort low', text)
         self.assertIn('native-agent', text)
         self.assertIn('delegation_reason', text)
+
+    def test_auto_instructions_are_adaptive_without_percentage_or_paid_exploration(self):
+        policy = settings.resolve(self.repo, delegation_level='auto', access='auto')
+        text = settings.instructions(policy, 'codex')
+        self.assertIn('Effective delegation profile: auto (adaptive) / read-only', text)
+        self.assertNotIn('%', text)
+        self.assertIn('adaptive', text)
+        self.assertIn('features', text)
+        for feature in ('kind', 'domain', 'operation', 'localization', 'coupling', 'verification',
+                        'clarity', 'risk', 'scope_size', 'runtime', 'model', 'effort',
+                        'context_version'):
+            with self.subTest(feature=feature):
+                self.assertIn(feature, text)
+        self.assertIn('executor', text)
+        self.assertIn('routing status', text)
+        self.assertIn('routing configure', text)
+        self.assertIn('Cold start may abstain', text)
+        self.assertIn('Read-only auto does not delegate writing tasks', text)
+        self.assertIn('no automatic paid exploration', text.lower())
+        self.assertIn('Protected coordinator responsibilities', text)
+
+    def test_manual_instructions_keep_fixed_percentage_and_feedback(self):
+        policy = settings.resolve(self.repo, delegation_level=75, access='full-access')
+        text = settings.instructions(policy, 'codex')
+        self.assertIn('Effective delegation profile: 75% / full-access', text)
+        self.assertIn('collect feedback', text)
+        self.assertIn('Do not calculate an actual useful-work percentage', text)
+        self.assertIn('Explicit executor choices', text)
 
     def test_forced_effort_policy_is_persisted_and_removes_frontier_choice(self):
         settings.set_values(self.repo / settings.PROJECT_FILE, effort='high')
@@ -163,6 +249,44 @@ class PolicyResolutionTests(RepoCase):
         self.assertEqual(shown['effort_mode'], 'forced')
         self.assertIn('project:', shown['sources']['access'])
 
+    def test_config_cli_sets_and_shows_auto_then_numeric_unchanged(self):
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(delegation_cli.main([
+                'config', 'set', '--project', '--path', str(self.repo),
+                '--delegation-level', 'auto',
+            ]), 0)
+        self.assertIn('delegation_level = "auto"',
+                      (self.repo / settings.PROJECT_FILE).read_text())
+        policy = settings.resolve(self.repo)
+        self.assertEqual(policy.delegation_level, 'auto')
+        self.assertEqual(policy.effective_access, 'read-only')
+        self.assertIn('delegation_level: auto', settings.describe(policy))
+
+        with redirect_stdout(out := io.StringIO()):
+            self.assertEqual(delegation_cli.main([
+                'config', 'show', '--effective', '--path', str(self.repo), '--json',
+            ]), 0)
+        shown = json.loads(out.getvalue())
+        self.assertEqual(shown['delegation_level'], 'auto')
+        self.assertEqual(shown['effective_access'], 'read-only')
+
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(delegation_cli.main([
+                'config', 'set', '--project', '--path', str(self.repo),
+                '--delegation-level', '50',
+            ]), 0)
+        self.assertIn('delegation_level = 50',
+                      (self.repo / settings.PROJECT_FILE).read_text())
+        self.assertEqual(settings.resolve(self.repo).delegation_level, 50)
+
+    def test_config_cli_rejects_non_literal_level_values(self):
+        for value in ('AUTO', 'Auto', '40', '0', '25.0', 'auto '):
+            with self.subTest(value=value), self.assertRaises(SystemExit):
+                delegation_cli.main([
+                    'config', 'set', '--project', '--path', str(self.repo),
+                    '--delegation-level', value,
+                ])
+
 
 class ManagedRuntimeMountTests(RepoCase):
     def test_home_npm_runtime_mounts_package_not_entire_user_prefix(self):
@@ -203,6 +327,23 @@ class RemovedLegacyWriterTests(unittest.TestCase):
         ]:
             with self.subTest(argv=argv), self.assertRaises(SystemExit):
                 self.parse(*argv)
+
+
+
+class WorkerLevelParserTests(unittest.TestCase):
+    def parse(self, *argv):
+        with mock.patch.object(sys, 'argv', ['deepseek-team worker', *argv]):
+            return worker.parse_args()
+
+    def test_worker_accepts_auto_and_numeric_levels(self):
+        self.assertEqual(self.parse('--delegation-level', 'auto').delegation_level, 'auto')
+        self.assertEqual(self.parse('--delegation-level', '25').delegation_level, 25)
+        self.assertEqual(self.parse('--delegation-level', '75').delegation_level, 75)
+
+    def test_worker_rejects_other_level_values(self):
+        for value in ('AUTO', '30', 'auto '):
+            with self.subTest(value=value), self.assertRaises(SystemExit):
+                self.parse('--delegation-level', value)
 
 
 class ManagedBlockTests(RepoCase):
@@ -250,6 +391,23 @@ class DoctorPolicyTests(RepoCase):
         self.assertIn('delegation_level: 50%', output.getvalue())
         self.assertIn('effective_access: full-access', output.getvalue())
         self.assertIn('effort: auto', output.getvalue())
+
+    def test_doctor_parser_accepts_auto_and_rejects_other_levels(self):
+        backend = sandbox.SandboxBackend(('/usr/bin/bwrap',), '/usr/bin/bwrap', 'direct')
+        policy = settings.Policy('auto', 'auto',
+                                 {'delegation_level': 'cli', 'access': 'cli'})
+        with mock.patch.object(doctor, 'resolve_policy', return_value=policy) as resolve, \
+             mock.patch.object(doctor.worker, 'resolve_os_sandbox',
+                               return_value=(sandbox, backend)), \
+             mock.patch.object(doctor, 'selected_runtimes', return_value=()), \
+             mock.patch('sys.stdout', new_callable=io.StringIO):
+            code = doctor.main(['--offline', '--runtime', 'codex',
+                                '--delegation-level', 'auto', '--access', 'auto'])
+        self.assertEqual(code, 0)
+        self.assertEqual(resolve.call_args.kwargs['delegation_level'], 'auto')
+        for value in ('AUTO', '40', 'auto '):
+            with self.subTest(value=value), self.assertRaises(SystemExit):
+                doctor.main(['--offline', '--delegation-level', value])
 
     def test_doctor_refuses_full_access_with_os_sandbox_off(self):
         policy = settings.Policy(75, 'full-access',

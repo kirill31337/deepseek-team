@@ -38,6 +38,10 @@ class CoordinationCase(unittest.TestCase):
         (self.root / "home").mkdir()
         self.env.start()
         self.addCleanup(self.env.stop)
+        # Match the fixture's declared worker authority with real project
+        # configuration; constructed policy snapshots cannot grant access.
+        settings.set_values(self.repo / settings.PROJECT_FILE,
+                            delegation_level=75, access='full-access')
 
     def policy(self, level=75, access="full-access"):
         return settings.Policy(level, access, {
@@ -398,6 +402,8 @@ class CoordinationCliTests(CoordinationCase):
 class CodexHookTests(CoordinationCase):
     def setUp(self):
         super().setUp()
+        # These fixtures exercise write-scope gates; authorize writes explicitly.
+        settings.set_values(self.repo / settings.PROJECT_FILE, access='full-access')
         project.attach(self.repo, coordinator="codex")
 
     def hook(self, name, **extra):
