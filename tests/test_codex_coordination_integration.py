@@ -17,6 +17,40 @@ import unittest.mock
 from codex_deepseek_team import config, coordination, project, settings
 
 
+SOURCE_INSPECTION_COMMANDS = ('sed -n 1p a.py', 'grep -n VALUE a.py', 'cat a.py')
+
+
+def hook_invocations(path):
+    """Parent-hook invocations recorded by the fixture shim, in delivery order.
+
+    The installed matcher decides which tool events reach the hook at all, so this is
+    the boundary the registration claims; the model transcript alone cannot show it.
+    """
+    if not path.exists():
+        return []
+    records = []
+    for line in path.read_text().splitlines():
+        entry = json.loads(line)
+        payload = {}
+        if entry['args'] == ['coordinator-hook'] and entry['stdin'].strip():
+            payload = json.loads(entry['stdin'])
+        tool_input = payload.get('tool_input')
+        stdout = entry['stdout'].strip()
+        try:
+            response = json.loads(stdout) if stdout else {}
+        except ValueError:
+            response = None
+        records.append({
+            'args': entry['args'],
+            'event': payload.get('hook_event_name'),
+            'tool': payload.get('tool_name'),
+            'shell': tool_input.get('command') if isinstance(tool_input, dict) else None,
+            'stdout': stdout,
+            'response': response,
+        })
+    return records
+
+
 class RealCodexCoordinatorHookTests(unittest.TestCase):
     def _codex(self):
         binary = shutil.which("codex")
@@ -38,6 +72,9 @@ class RealCodexCoordinatorHookTests(unittest.TestCase):
     def test_native_spawn_reaches_parent_hook_before_child_starts(self):
         self._run_hook_fixture('native-dispatch')
 
+    def test_source_inspection_reminder_then_denial_until_a_small_plan(self):
+        self._run_hook_fixture('source-inspection')
+
     def _run_hook_fixture(self, scenario):
         binary = self._codex()
         requests = []
@@ -56,8 +93,30 @@ class RealCodexCoordinatorHookTests(unittest.TestCase):
             bin_dir = root / "bin"
             bin_dir.mkdir()
             command = bin_dir / "deepseek-team"
-            command.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) +
-                               ' -m codex_deepseek_team "$@"\n')
+            hook_log = root / "hook-log.jsonl"
+            if scenario == 'source-inspection':
+                # Record argv, payload and response of every hook invocation so the
+                # scenario can assert what the installed registration delivered.
+                shim = bin_dir / "shim.py"
+                shim.write_text(
+                    "import json, subprocess, sys\n"
+                    f"LOG = {str(hook_log)!r}\n"
+                    "data = sys.stdin.buffer.read()\n"
+                    "proc = subprocess.run([sys.executable, '-m', 'codex_deepseek_team',\n"
+                    "                       *sys.argv[1:]], input=data, capture_output=True)\n"
+                    "with open(LOG, 'a', encoding='utf-8') as record:\n"
+                    "    record.write(json.dumps({'args': sys.argv[1:],\n"
+                    "                             'stdin': data.decode('utf-8', 'replace'),\n"
+                    "                             'stdout': proc.stdout.decode('utf-8', 'replace')}) + '\\n')\n"
+                    "sys.stdout.buffer.write(proc.stdout)\n"
+                    "sys.stderr.buffer.write(proc.stderr)\n"
+                    "sys.exit(proc.returncode)\n"
+                )
+                command.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) + ' ' +
+                                   shlex.quote(str(shim)) + ' "$@"\n')
+            else:
+                command.write_text("#!/bin/sh\nexec " + shlex.quote(sys.executable) +
+                                   ' -m codex_deepseek_team "$@"\n')
             command.chmod(0o700)
             (repo / "a.py").write_text("VALUE = 1\n")
             subprocess.run(["git", "init", "-q", str(repo)], check=True)
@@ -132,7 +191,51 @@ class RealCodexCoordinatorHookTests(unittest.TestCase):
                             "arguments": json.dumps(arguments), "status": "completed",
                         }
 
-                    if scenario == 'native-dispatch' and step == 0:
+                    if scenario == 'source-inspection':
+                        if state["task_id"] is None:
+                            output = [{
+                                "type": "message", "id": "msg_missing", "role": "assistant",
+                                "status": "completed", "content": [{
+                                    "type": "output_text",
+                                    "text": "TASK_ID_NOT_IN_CONTEXT", "annotations": []}]
+                            }]
+                        elif step < 2:
+                            output = [shell_call(SOURCE_INSPECTION_COMMANDS[step], step + 1)]
+                        elif step == 2:
+                            plan = {
+                                "classification": "small",
+                                "small_evidence": "one coordinator read of a.py after its plan",
+                                "deliverables": [{
+                                    "id": "inspect", "kind": "review",
+                                    "scope": ["a.py"], "executor": "coordinator",
+                                    "acceptance": ["a.py is read after the distribution exists"],
+                                    "dependencies": [], "checks": []
+                                }]
+                            }
+                            command = (
+                                "printf %s " + shlex.quote(json.dumps(plan)) +
+                                " | deepseek-team coordination plan --path " +
+                                shlex.quote(str(repo)) + " --task " + state["task_id"]
+                            )
+                            output = [shell_call(command, 3)]
+                        elif step == 3:
+                            output = [shell_call(SOURCE_INSPECTION_COMMANDS[2], 4)]
+                        elif step == 4:
+                            command = (
+                                "deepseek-team coordination result --path " +
+                                shlex.quote(str(repo)) + " --task " + state["task_id"] +
+                                " --deliverable inspect --outcome accepted" +
+                                " --evidence \"read a.py after the registered small plan\""
+                            )
+                            output = [shell_call(command, 5)]
+                        else:
+                            output = [{
+                                "type": "message", "id": f"msg_{step}", "role": "assistant",
+                                "status": "completed", "content": [{
+                                    "type": "output_text",
+                                    "text": "SOURCE_INSPECTION_GATE_OBSERVED", "annotations": []}]
+                            }]
+                    elif scenario == 'native-dispatch' and step == 0:
                         candidates = []
                         for item in body.get('tools', []):
                             if item.get('type') == 'namespace':
@@ -289,6 +392,55 @@ class RealCodexCoordinatorHookTests(unittest.TestCase):
                     self.assertEqual(len(requests), 2, 'A child or extra continuation reached the model fixture')
                     self.assertEqual(task['status'], 'closed')
                     self.assertEqual(task['deliverables'], [])
+                    return
+                if scenario == 'source-inspection':
+                    self.assertEqual((repo / "a.py").read_text(), "VALUE = 1\n")
+                    self.assertIn('SOURCE_INSPECTION_GATE_OBSERVED', result.stdout)
+                    records = hook_invocations(hook_log)
+                    inspections = [record for record in records
+                                   if record['event'] == 'PreToolUse'
+                                   and record['tool'] == 'Bash'
+                                   and record['shell'] in SOURCE_INSPECTION_COMMANDS]
+                    self.assertEqual([record['shell'] for record in inspections],
+                                     list(SOURCE_INSPECTION_COMMANDS),
+                                     'Both pre-plan inspections and the post-plan read must reach the '
+                                     'parent hook: ' + str(records))
+                    first, second, allowed = inspections
+                    plan_calls = [index for index, record in enumerate(records)
+                                  if record['args'][:2] == ['coordination', 'plan']]
+                    self.assertEqual(len(plan_calls), 1,
+                                     'The small plan must reach the coordination CLI exactly once, '
+                                     'so the inspection gate must not block plan registration: '
+                                     + str(records))
+                    self.assertLess(records.index(second), plan_calls[0],
+                                    'The denied inspection must precede the distribution plan')
+                    self.assertEqual(task['status'], 'completed', task)
+                    self.assertEqual(task['deliverables'][0]['result']['outcome'], 'accepted')
+                    combined = "\n".join(tool_outputs) + result.stdout
+                    self.assertIn('VALUE = 1', combined,
+                                  'The permitted read did not return source content')
+                    reminder = first['response']
+                    self.assertIsInstance(reminder, dict, 'Unreadable hook response: ' + first['stdout'])
+                    self.assertTrue(reminder,
+                                    'The first pre-plan inspection returned no reminder: ' + first['stdout'])
+                    specific = reminder.get('hookSpecificOutput')
+                    decided = specific.get('permissionDecision') if isinstance(specific, dict) else None
+                    self.assertNotEqual(decided, 'deny',
+                                        'The first pre-plan inspection must be reminded, not denied: '
+                                        + first['stdout'])
+                    self.assertNotEqual(reminder.get('decision'), 'block', first['stdout'])
+                    context = json.dumps(reminder).lower()
+                    self.assertRegex(context, r'(plan|distribution|route|delegat)')
+                    self.assertRegex(context, r'(source|inspect|read|regist)')
+                    denial = (json.dumps(second['response']).lower() if second['response']
+                              else second['stdout'].lower())
+                    self.assertRegex(denial, r'(deny|block)',
+                                     'The second pre-plan inspection must be denied: ' + second['stdout'])
+                    self.assertRegex(denial, r'(plan|distribution)')
+                    self.assertEqual(allowed['stdout'], '',
+                                     'The registered plan must permit the read: ' + str(allowed))
+                    self.assertRegex(combined.lower(), r'(blocked|deny|denied)',
+                                     'The denial never reached the model: ' + combined)
                     return
                 self.assertGreaterEqual(len(requests), 3, result.stderr + result.stdout)
                 self.assertIsNotNone(state["assignment_id"], str(tool_outputs))

@@ -17,6 +17,32 @@ def _head(root):
     return result.stdout.strip() if result.returncode == 0 else None
 
 
+def _unavailable_message(assignment_id, row):
+    """Actionable rejection that never promises an automatic retry."""
+    status = row['status']
+    if status == 'failed':
+        if row.get('failure_stage') == 'preparation':
+            recovery = (
+                'No workspace was created. Correct the source or environment and register a new coordination task.'
+                if not row.get('workspace_id') else
+                'Inspect any retained copy with workspace show. An incomplete baseline needs a fresh copy; '
+                'a verified baseline may be prepared explicitly. If HEAD changed, start a new coordination task.')
+            return (f'Assignment {assignment_id} already has a recorded failure during preparation. '
+                    'Review the ledger result and record a disposition with coordination use. '
+                    + recovery + ' Nothing was retried automatically.')
+        return (f'Assignment {assignment_id} already has a recorded failure; a plain relaunch is '
+                'rejected. Inspect the retained workspace and ledger result, record a disposition '
+                'with the coordination use command, then continue explicitly with '
+                '--resume-after-failure. Nothing was retried automatically.')
+    if status == 'succeeded':
+        return (f'Assignment {assignment_id} already has a recorded result; it cannot launch again. '
+                'Review that result and register new scope instead of relaunching it.')
+    if status == 'running':
+        return (f'Assignment {assignment_id} is already running; a duplicate launch is rejected. '
+                'Inspect the live workspace instead of starting a second worker.')
+    return f'Assignment {assignment_id} is already active or completed; it cannot launch again.'
+
+
 def acquire(args, api, *, policy=None, root=None):
     root = settings.project_root(root or Path.cwd())
     initial = settings.resolve(root)
@@ -49,7 +75,7 @@ def acquire(args, api, *, policy=None, root=None):
                 if (row['status'] != 'planned'
                         and not (resuming and row['status'] in ('failed', 'running'))
                         and not (started and row['status'] == 'running')):
-                    raise api.WorkerError(78, 'Assignment is already active or completed; it cannot launch again.')
+                    raise api.WorkerError(78, _unavailable_message(args.coord_assignment, row))
                 if (item.get('routing') or {}).get('requested_executor') == 'auto':
                     RoutingService(root).validate_start(item['routing']['decision_id'],
                         already_running=(resuming or started) and row['status'] == 'running',

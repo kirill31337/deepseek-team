@@ -5,9 +5,10 @@ import argparse
 import json
 from pathlib import Path
 import re
+import time
 import uuid
 
-from . import activation, coordination, project, scope_matching, settings
+from . import activation, coordination, coordinator_activity, project, scope_matching, settings
 from .shell_mutation import classify_shell_mutation
 
 
@@ -38,7 +39,7 @@ def _declared_scopes(root: Path, deliverable: dict) -> list[str]:
 
 
 def _mutation(payload: dict) -> tuple[bool, list[str]]:
-    tool = payload.get("tool_name", "")
+    tool = coordinator_activity.normalize_tool_name(payload.get("tool_name", ""))
     data = payload.get("tool_input") or {}
     command = data.get("command", "") if isinstance(data, dict) else ""
     if tool == "apply_patch":
@@ -55,9 +56,15 @@ def _mutation(payload: dict) -> tuple[bool, list[str]]:
             return True, []
         path = data.get("file_path") or data.get("notebook_path") or data.get("path")
         return True, [str(path)] if isinstance(path, str) and path else []
-    if tool != "Bash":
+    if not coordinator_activity.is_shell_tool(tool):
         return False, []
-    return classify_shell_mutation(command)
+    if isinstance(data, dict):
+        # Codex sends exec_command as ``cmd`` while shell_command uses ``command``.
+        for key in ("cmd", "shell", "script"):
+            value = data.get(key)
+            if not command and isinstance(value, str):
+                command = value
+    return classify_shell_mutation(command if isinstance(command, str) else "")
 
 
 _NATIVE_START = frozenset(('spawn_agent', 'Agent', 'Task'))
@@ -116,6 +123,65 @@ def _check_native_dispatch(root, task, payload):
     except coordination.CoordinationError as error:
         return _deny(prefix + str(error))
     return {}
+
+
+_EARLY_PLAN_NUDGE = (
+    "DeepSeek Team early-planning gate: this is the first recognized source inspection of an "
+    "unclassified task. Register a concrete distribution (classification and deliverables) with "
+    "`deepseek-team coordination plan --task {task_id}` before further investigation. Status, "
+    "bootstrap and instruction reads stay exempt, but another recognized source read is denied "
+    "until the task is classified."
+)
+_EARLY_PLAN_DENY = (
+    "DeepSeek Team early-planning gate: this task is still unclassified after an earlier source "
+    "inspection was recorded. Register a concrete distribution with "
+    "`deepseek-team coordination plan --task {task_id}`; further recognized source reads are "
+    "denied until then."
+)
+
+
+def _source_inspection_gate(root, task, payload, cwd):
+    """Nudge then deny recognized source inspection of an unclassified task.
+
+    The first recognized read records one ``source_inspection`` coordinator
+    event, which also makes the turn count as work for Stop, and returns
+    ``additionalContext``. A repeated delivery of the same nonempty
+    ``tool_use_id`` is idempotent; any other recognized read is denied until the
+    coordinator registers a distribution.
+    """
+    if task.get('status') != 'planning' or task.get('classification') is not None:
+        return {}
+    data = payload.get('tool_input')
+    verdict = coordinator_activity.classify_inspection(
+        str(payload.get('tool_name') or ''), data if isinstance(data, dict) else {},
+        root, cwd=cwd)
+    if verdict != 'source':
+        return {}
+    task_id = task['id']
+    nudge = _context(_EARLY_PLAN_NUDGE.format(task_id=task_id), 'PreToolUse')
+    tool_use_id = str(payload.get('tool_use_id') or '').strip()
+    with coordination._lock(root):
+        current = coordination.load_task(root, task_id)
+        if current.get('classification') is not None or current.get('status') != 'planning':
+            return {}
+        events = current.get('coordinator_events')
+        if not isinstance(events, list):
+            events = []
+        inspections = [event for event in events
+                       if isinstance(event, dict) and event.get('kind') == 'source_inspection']
+        if tool_use_id and any(event.get('tool_use_id') == tool_use_id
+                               for event in inspections):
+            return nudge
+        if inspections:
+            return _deny(_EARLY_PLAN_DENY.format(task_id=task_id))
+        now = time.time()
+        events.append({'kind': 'source_inspection', 'paths': [], 'at': now,
+                       'tool_use_id': tool_use_id,
+                       'tool_name': str(payload.get('tool_name') or '')})
+        current['coordinator_events'] = events
+        current['updated_at'] = now
+        coordination._atomic(coordination._task_path(root, task_id), current)
+    return nudge
 
 
 def handle(payload: dict, runtime: str = 'codex') -> dict:
@@ -235,19 +301,26 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
     if event == "PreToolUse":
         is_mutation, paths = _mutation(payload)
         if not is_mutation:
-            return {}
+            return _source_inspection_gate(root, task, payload, cwd)
         issues = coordination.validate_task(root, task["id"])
         if issues:
             return _deny("DeepSeek Team distribution gate: " + "; ".join(issues))
-        if payload.get('tool_name') == 'apply_patch' and not paths:
+        if coordinator_activity.normalize_tool_name(payload.get('tool_name')) == 'apply_patch' and not paths:
             return _deny('Patch targets could not be mapped to the registered distribution.')
+        protected_kinds = coordination.PROTECTED_COORDINATOR_KINDS
         policy = task.get("policy", {})
-        if not paths and task.get("classification") == "substantial" and (
-                policy.get("delegation_level", 'auto') in ('auto', 75)
-                and policy.get("effective_access") == "full-access"):
-            return _deny(
-                "Unscoped mutating Bash cannot be mapped to the registered Auto/75 full-access "
-                "distribution. Revise the plan or use a file edit whose scope can be checked.")
+        if not paths:
+            if coordinator_activity.has_protected_deliverable(task, protected_kinds):
+                return _deny(
+                    "DeepSeek Team protected-scope gate: an unmapped mutation cannot be checked "
+                    "against protected coordinator scope. Target an exact declared decision "
+                    "artifact or integration write_scope file instead.")
+            if task.get("classification") == "substantial" and (
+                    policy.get("delegation_level", 'auto') in ('auto', 75)
+                    and policy.get("effective_access") == "full-access"):
+                return _deny(
+                    "Unscoped mutating Bash cannot be mapped to the registered Auto/75 full-access "
+                    "distribution. Revise the plan or use a file edit whose scope can be checked.")
         scope_tasks = coordination.unfinished_tasks(root, session) or [task]
         normalized_paths = []
         for raw in paths:
@@ -258,16 +331,8 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
             if path is None:
                 return _deny('Mutation scope is outside the attached project: ' + raw)
             normalized_paths.append(path)
-            matching = [
-                deliverable for deliverable in task.get("deliverables", [])
-                if any(scope_matching.contained(path, scope)
-                       for scope in _declared_scopes(root, deliverable))
-            ]
-            if not matching:
-                return _deny(
-                    f"Unplanned mutation scope {path}. Revisit the distribution before "
-                    "starting a new block of work.")
-            # A directory mutation also conflicts with worker-owned descendants.
+            # A pending worker owns its registered scope across every unfinished
+            # task, so precedence beats coordinator authority for that path.
             for owner in scope_tasks:
                 for deliverable in owner.get("deliverables", []):
                     if not any(scope_matching.mutation_overlaps(root, path, scope)
@@ -279,6 +344,15 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
                         return _deny(
                             f"Path {path} belongs to pending worker assignment {assignment['id']}; "
                             "wait for/review that result before duplicating implementation.")
+            allowed, problem = coordinator_activity.mutation_authorizers(
+                root, task, path, protected_kinds=protected_kinds,
+                worker_write_kinds=coordination.WORKER_WRITE_KINDS)
+            if not allowed:
+                if problem:
+                    return _deny(problem)
+                return _deny(
+                    f"Unplanned mutation scope {path}. Revisit the distribution before "
+                    "starting a new block of work.")
         for affected in scope_tasks:
             if affected['id'] == task['id'] or any(
                     coordination._mutation_touches_scope(root, normalized_paths, item.get('scope', []))

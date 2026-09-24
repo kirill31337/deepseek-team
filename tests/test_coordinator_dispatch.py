@@ -39,13 +39,23 @@ class NativeDispatchHookTests(CoordinationCase):
                 self.assert_denied(self.hook('PreToolUse', tool_name=name,
                     tool_input={'id': 'existing-agent', 'message': 'Investigate another file'}))
 
-    def test_control_and_coordinator_only_read_do_not_create_work(self):
+    def test_control_and_exempt_reads_do_not_create_work(self):
         task = self.start_hook()
         for name, data in (('wait_agent', {}), ('resume_agent', {'id': 'existing-agent'}),
-                           ('Read', {'file_path': 'a.py'}), ('Bash', {'command': 'git log -1'})):
+                           ('Read', {'file_path': 'AGENTS.md'}),
+                           ('Bash', {'command': 'git log -1'})):
             self.assertEqual(self.hook('PreToolUse', tool_name=name, tool_input=data), {})
         self.assertEqual(self.hook('Stop'), {'continue': True})
         self.assertEqual(coordination.load_task(self.repo, task['id'])['status'], 'closed')
+
+    def test_unplanned_source_read_nudges_then_denies(self):
+        task = self.start_hook()
+        reminder = self.hook('PreToolUse', tool_name='Read', tool_input={'file_path': 'a.py'})
+        self.assertIn('early-planning', reminder['hookSpecificOutput']['additionalContext'])
+        denied = self.hook('PreToolUse', tool_name='Read', tool_input={'file_path': 'a.py'})
+        self.assertEqual(denied['hookSpecificOutput']['permissionDecision'], 'deny', denied)
+        self.assertEqual(self.hook('Stop').get('decision'), 'block')
+        self.assertEqual(coordination.load_task(self.repo, task['id'])['status'], 'planning')
 
     def test_off_bypasses_native_gate(self):
         task = self.start_hook()
@@ -138,9 +148,17 @@ class NativeDispatchHookTests(CoordinationCase):
 
     def test_marker_cannot_reassign_worker_owned_scope(self):
         task = self.start_hook()
-        coordination.plan_task(self.repo, task['id'], {
+        planned = coordination.plan_task(self.repo, task['id'], {
             'classification': 'substantial', 'deliverables': [{
-                'id': 'history', 'kind': 'research', 'scope': ['a.py'], 'executor': 'worker',
-                'acceptance': ['Return commit references'], 'dependencies': [], 'checks': []}]})
+                'id': 'history', 'kind': 'research', 'scope': ['a.py'], 'executor': 'auto',
+                'acceptance': ['Return commit references'], 'dependencies': [], 'checks': [],
+                'features': {
+                    'kind': 'research', 'domain': 'python', 'operation': 'review',
+                    'localization': 'known', 'coupling': 'local', 'verification': 'manual',
+                    'clarity': 'clear', 'risk': 'low', 'scope_size': 'small',
+                    'runtime': 'codex', 'model': 'deepseek-flash', 'effort': 'high',
+                    'context_version': 'dispatch-test',
+                }}]})
+        self.assertEqual(planned['deliverables'][0]['executor'], 'worker')
         self.assert_denied(self.hook('PreToolUse', tool_name='spawn_agent', tool_use_id='call-2',
             tool_input={'prompt': '[deepseek-team:' + task['id'] + ':history] Inspect history'}))

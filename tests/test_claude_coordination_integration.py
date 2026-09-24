@@ -92,8 +92,16 @@ class RealClaudeCoordinatorHookTests(unittest.TestCase):
                                  'input': {'file_path': str(repo / 'a.py'), 'content': 'VALUE = 999\n'}}
                     elif step == 3 and state['task']:
                         plan = {'classification': 'substantial', 'deliverables': [{
-                            'id': 'review', 'kind': 'review', 'scope': ['a.py'], 'executor': 'worker',
-                            'acceptance': ['review the value'], 'dependencies': [], 'checks': [],
+                            'id': 'review', 'kind': 'review', 'scope': ['a.py'], 'executor': 'auto',
+                            'acceptance': ['review a.py confirms the value stays 1'],
+                            'dependencies': [], 'checks': [],
+                            'features': {'kind': 'review', 'domain': 'python',
+                                         'operation': 'review', 'localization': 'known',
+                                         'coupling': 'local', 'verification': 'manual',
+                                         'clarity': 'clear', 'risk': 'low',
+                                         'scope_size': 'small', 'runtime': 'claude',
+                                         'model': 'deepseek-flash', 'effort': 'high',
+                                         'context_version': 'project-v1'},
                         }]}
                         shell = ('printf %s ' + shlex.quote(json.dumps(plan)) +
                                  ' | deepseek-team coordination plan --task ' + state['task'])
@@ -166,6 +174,7 @@ class RealClaudeCoordinatorHookTests(unittest.TestCase):
                 with patch.dict(os.environ, env, clear=True):
                     task = coordination.load_task(repo, state['task'])
                 self.assertNotEqual(task['status'], 'completed')
+                self.assertEqual(task['deliverables'][0]['executor'], 'worker')
                 self.assertEqual(task['assignments'][0]['status'], 'planned')
             finally:
                 server.shutdown()

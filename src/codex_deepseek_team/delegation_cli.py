@@ -76,6 +76,10 @@ def main(argv):
         show.add_argument('--runtime', choices=('codex', 'claude'), default='codex')
         policy_options(show)
     else:
+        check = subs.add_parser('check', help='Preflight committed HEAD for preparation '
+                                             'blockers; allocates no state or copy.')
+        check.add_argument('path', type=Path, nargs='?', default=Path.cwd())
+        check.add_argument('--json', action='store_true')
         for name in ('create', 'show', 'diff', 'prepare', 'import'):
             sub = subs.add_parser(name)
             sub.add_argument('--state-dir', type=Path, default=Path.home() / '.local/state/codex-deepseek')
@@ -133,6 +137,13 @@ def main(argv):
                 if getattr(args, 'instructions', False):
                     print(settings.instructions(policy, args.runtime))
         else:
+            if args.command == 'check':
+                report = workspace.check_source(args.path)
+                if args.json:
+                    print(json.dumps(report, indent=2, ensure_ascii=True))
+                else:
+                    print(workspace.describe_check(report))
+                return 0 if report['eligible'] else 78
             copy = (workspace.create(args.path, args.state_dir) if args.command == 'create'
                     else workspace.load(args.state_dir, args.id))
             if args.command == 'prepare':

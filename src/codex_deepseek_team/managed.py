@@ -1,6 +1,7 @@
 """One managed development job; no scheduler and no automatic writer retry."""
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -8,6 +9,23 @@ import tempfile
 import time
 
 from . import coordination, development, relay, settings, workspace
+
+
+@contextmanager
+def _preparation_status(copy):
+    """Record failure while holding the copy lock; preserve earlier attempts."""
+    try:
+        yield
+    except BaseException as error:
+        # Only a fresh/explicitly prepared copy is ours to mark. In particular,
+        # a failed resume probe must not replace a previous execution result.
+        if copy.metadata.get('status') == 'ready':
+            code = 130 if isinstance(error, KeyboardInterrupt) else getattr(error, 'code', 71)
+            try:
+                copy.failed('preparation', code)
+            except (workspace.WorkspaceError, OSError):
+                pass  # The independent coordination record is still reconciled.
+        raise
 
 
 def run(args, policy: settings.Policy, api, copy=None) -> int:
@@ -22,22 +40,25 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
     effort = api.DEFAULT_EFFORT if requested_effort in (None, 'auto') else api.effort_level(requested_effort)
     if not task.strip():
         raise api.WorkerError(64, 'Pass a task on stdin or as one argument.')
-    slot = api.acquire_job_slot(args, policy=policy, root=copy.source if copy else Path.cwd())
+    source = copy.source if copy else Path.cwd()
+    slot = api.acquire_job_slot(args, policy=policy, root=source)
     started = time.monotonic()
+    coord_task = getattr(args, 'coord_task', None)
+    coord_assignment = getattr(args, 'coord_assignment', None)
+    coord_started = False
+    runtime = None
+    preparation_cause = 'environment'
     try:
         runtime, binary = api.resolve_runtime(args.runtime, args.codex, args.claude)
         development.check_runtime(binary, runtime)
         sb, backend = api.resolve_os_sandbox('required')
         if copy is None:
             copy = workspace.create(Path.cwd(), args.state_dir)
-        coord_task = getattr(args, 'coord_task', None)
-        coord_assignment = getattr(args, 'coord_assignment', None)
-        coord_started = False
         coord_before = None
         coord_item = None
         print(f'Workspace: {copy.id}\nWorking copy: {copy.path}\n'
               'Source: committed HEAD only; source uncommitted changes were not copied or modified.', file=api.sys.stderr)
-        with copy.lock(recover=getattr(args, 'resume_after_failure', False)):
+        with copy.lock(recover=getattr(args, 'resume_after_failure', False)), _preparation_status(copy):
             with tempfile.TemporaryDirectory(prefix='session-', dir=args.state_dir) as session, \
                     tempfile.TemporaryDirectory(prefix='dst-') as transport:
                 home, control = Path(session), Path(transport)
@@ -72,11 +93,14 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
                         raise coordination.CoordinationError(
                             'Preparation sandbox is missing declared dependencies/check runtime: ' +
                             ', '.join(sandbox_missing) +
-                            '. Prepare dependencies inside the owned workspace; host-only tools are not exposed.', 78)
+                            '. Prepare dependencies inside the owned workspace; host-only tools are not exposed.',
+                            78, constraint_code='dependency_unavailable')
                     prepared_changes, _ignored = copy.changes()
                     coord_before = workspace.content_snapshot(copy)
                 # Only after the actual namespace/readiness probes have succeeded.
+                preparation_cause = 'admission'
                 args.validate_admission()
+                preparation_cause = 'environment'
                 key = api.load_api_key()
                 if not key.strip():
                     raise api.WorkerError(78, 'Provider credential is absent; configure it locally. Workspace retained.')
@@ -181,8 +205,28 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
                     print(f'{kind.title()} failure; retained workspace {copy.id}. '
                           'Explicit recovery is required; no automatic implementation retry.', file=api.sys.stderr)
                     raise
-    except (workspace.WorkspaceError, development.DevelopmentError,
-            coordination.CoordinationError) as error:
-        raise api.WorkerError(error.code, str(error)) from None
+    except BaseException as error:
+        if coord_task and not coord_started:
+            code = 130 if isinstance(error, KeyboardInterrupt) else getattr(error, 'code', 71)
+            known = isinstance(error, (workspace.WorkspaceError, development.DevelopmentError,
+                                       coordination.CoordinationError, api.WorkerError))
+            message = (error.message if known else
+                       'Preparation cancelled before model execution.' if code == 130 else
+                       'Preparation failed before model execution; inspect the local runtime and filesystem.')
+            cause = preparation_cause
+            if isinstance(error, coordination.CoordinationError):
+                cause = 'environment' if error.constraint_code else 'admission'
+            try:
+                coordination.assignment_preparation_failed(
+                    source, coord_task, coord_assignment, message, exit_code=code,
+                    workspace_id=copy.id if copy is not None else getattr(error, 'workspace_id', None),
+                    runtime=runtime, effort=effort, cause=cause)
+            except (coordination.CoordinationError, OSError):
+                print('Could not record the preparation failure in the coordination ledger; '
+                      'inspect the task before another assignment.', file=api.sys.stderr)
+        if isinstance(error, (workspace.WorkspaceError, development.DevelopmentError,
+                              coordination.CoordinationError)):
+            raise api.WorkerError(error.code, str(error)) from None
+        raise
     finally:
         os.close(slot)

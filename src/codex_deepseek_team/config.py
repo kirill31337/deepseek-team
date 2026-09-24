@@ -18,10 +18,23 @@ BLOCK = (b'\n\n' + BEGIN + b'\n[model_providers.deepseek]\n' +
 
 
 CODEX_HOOK_COMMAND = 'deepseek-team coordinator-hook'
+# Shell tool names differ across Codex surfaces: the hook payload uses Bash for the
+# interactive shell, while exec_command/shell_command appear on other tool surfaces.
+# Source inspection must reach the parent hook on every surface, so mutations,
+# inspection and native dispatches share one matcher.
+CODEX_SHELL_TOOLS = ('Bash', 'exec_command', 'shell_command')
+CODEX_INSPECTION_TOOLS = ('Read', 'Grep', 'Glob')
+CODEX_MUTATION_TOOLS = ('apply_patch', 'Edit', 'Write', 'NotebookEdit')
+CODEX_NATIVE_TOOLS = ('spawn_agent', 'send_message', 'send_input', 'followup_task',
+                      'assign_agent_task', 'resume_agent', 'Agent', 'Task')
+# A qualified name such as functions.exec_command or collaboration.spawn_agent is
+# normalized by the hook; the matcher keeps the optional namespace prefix.
+CODEX_PRETOOLUSE_MATCHER = '(?:.*[./])?(?:' + '|'.join(
+    CODEX_SHELL_TOOLS + CODEX_INSPECTION_TOOLS + CODEX_MUTATION_TOOLS + CODEX_NATIVE_TOOLS) + ')'
 CODEX_HOOK_EVENTS = {
     'SessionStart': {'matcher': 'startup|resume|clear|compact', 'context': True},
     'UserPromptSubmit': {'matcher': None, 'context': True},
-    'PreToolUse': {'matcher': 'Bash|apply_patch|Edit|Write|(?:.*[./])?(?:spawn_agent|send_message|send_input|followup_task|assign_agent_task|resume_agent|Agent|Task)', 'context': False},
+    'PreToolUse': {'matcher': CODEX_PRETOOLUSE_MATCHER, 'context': False},
     'Stop': {'matcher': None, 'context': False},
 }
 
@@ -148,6 +161,10 @@ def _hook_group(spec):
     return group
 
 
+def _owned_codex_hook(handler):
+    return isinstance(handler, dict) and handler.get('command') == CODEX_HOOK_COMMAND
+
+
 def _strip_codex_hooks(data):
     hooks = data.get('hooks', {})
     if hooks is None:
@@ -168,8 +185,7 @@ def _strip_codex_hooks(data):
             if not isinstance(handlers, list):
                 kept.append(group)
                 continue
-            filtered = [handler for handler in handlers if not (
-                isinstance(handler, dict) and handler.get('command') == CODEX_HOOK_COMMAND)]
+            filtered = [handler for handler in handlers if not _owned_codex_hook(handler)]
             if len(filtered) != len(handlers):
                 changed = True
             if filtered:
@@ -238,6 +254,13 @@ def remove_codex_hooks(home):
 
 
 def codex_hooks_status(home):
+    """Check the installed event/matcher/handler definitions, not just their count.
+
+    A managed entry installed by an older release can carry a stale matcher that no
+    longer delivers the events this version depends on. Reporting it as not installed
+    lets onboarding and doctor repair it by reinstalling, while unrelated user hooks in
+    shared groups are neither claimed nor modified.
+    """
     raw = read_regular(Path(home) / 'hooks.json')
     if raw is None:
         return False
@@ -247,15 +270,24 @@ def codex_hooks_status(home):
         return False
     if not isinstance(data, dict):
         return False
-    count = 0
-    for groups in data.get('hooks', {}).values():
+    hooks = data.get('hooks', {})
+    if not isinstance(hooks, dict):
+        return False
+    for event, spec in CODEX_HOOK_EVENTS.items():
+        groups = hooks.get(event, [])
         if not isinstance(groups, list):
-            continue
+            return False
+        matches = []
         for group in groups:
-            for handler in group.get('hooks', []) if isinstance(group, dict) else []:
-                if isinstance(handler, dict) and handler.get('command') == CODEX_HOOK_COMMAND:
-                    count += 1
-    return count == len(CODEX_HOOK_EVENTS)
+            handlers = group.get('hooks') if isinstance(group, dict) else None
+            if not isinstance(handlers, list):
+                continue
+            for handler in handlers:
+                if _owned_codex_hook(handler):
+                    matches.append(dict(group, hooks=[handler]))
+        if matches != [_hook_group(spec)]:
+            return False
+    return True
 
 
 def save_key(value):

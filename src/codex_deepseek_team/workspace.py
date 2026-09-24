@@ -22,8 +22,9 @@ DEFAULT_STATE = Path.home() / '.local/state/codex-deepseek'
 
 
 class WorkspaceError(Exception):
-    def __init__(self, message: str, code: int = 78):
+    def __init__(self, message: str, code: int = 78, *, workspace_id: str | None = None):
         self.code, self.message = code, message
+        self.workspace_id = workspace_id
         super().__init__(message)
 
 
@@ -93,23 +94,118 @@ def _git_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _check_source_tree(path: Path) -> None:
-    for entry in git(path, 'ls-tree', '-r', '-z', 'HEAD').split(b'\0'):
+SUBMODULE_REASON = 'submodule needs a coordinator-prepared standalone source copy'
+CREDENTIAL_REASON = 'committed credential-like file cannot be exposed'
+INCOMPLETE_PREPARATION = (
+    'Workspace preparation never completed: this retained copy has no verified baseline and no '
+    'trusted checkout. Inspect it with workspace show; after correcting the committed source, '
+    'create a fresh copy. Nothing is deleted, resumed or checked out automatically.')
+SOURCE_RECOVERY = (
+    'Inspect the listed paths locally. Keep credentials outside tracked source; preserve any '
+    'required local files when removing them from tracking, then commit the source change. '
+    '.gitignore and index-only edits do not change HEAD. For submodules, prepare a standalone '
+    'source project. Start a new coordination task on the corrected HEAD and rerun workspace check.')
+
+
+def _credential_like(name: Path) -> bool:
+    """The single credential-like predicate shared by preflight, create and import."""
+    lower = name.name.lower()
+    return (lower in {'.env', 'auth.json', 'api-key', '.npmrc', '.pypirc', '.netrc',
+                      '.git-credentials', 'id_rsa', 'id_ed25519'}
+            or (lower.startswith('.env.') and lower not in {'.env.example', '.env.sample', '.env.template'})
+            or name.suffix.lower() in {'.pem', '.key', '.p12', '.pfx', '.jks', '.keystore'}
+            or any(part.lower() in {'.ssh', '.aws', '.azure', '.kube', '.gnupg'} for part in name.parts))
+
+
+def _escape_name(value: str) -> str:
+    """Render a repository path for terminals: no raw control or unprintable characters."""
+    pieces = []
+    for char in value:
+        code = ord(char)
+        if char == '\\':
+            pieces.append('\\\\')
+        elif 0xdc80 <= code <= 0xdcff:  # surrogateescape byte from a non-UTF-8 name
+            pieces.append(f'\\x{code - 0xdc00:02x}')
+        elif char.isprintable():
+            pieces.append(char)
+        elif code < 0x100:
+            pieces.append(f'\\x{code:02x}')
+        elif code < 0x10000:
+            pieces.append(f'\\u{code:04x}')
+        else:
+            pieces.append(f'\\U{code:08x}')
+    return ''.join(pieces)
+
+
+def _tree_blockers(entries: bytes) -> list[dict]:
+    """All committed-tree blockers in one listing, sorted by path for stable reporting."""
+    found: dict[str, str] = {}
+    for entry in entries.split(b'\0'):
         if not entry:
             continue
         header, _, raw_name = entry.partition(b'\t')
-        name = Path(os.fsdecode(raw_name))
+        name = os.fsdecode(raw_name)
         if header.startswith(b'160000 '):
-            raise WorkspaceError('Preparation: submodules need a coordinator-prepared standalone source copy.')
-        lower = name.name.lower()
-        secret = (lower in {'.env', 'auth.json', 'api-key', '.npmrc', '.pypirc', '.netrc',
-                             '.git-credentials', 'id_rsa', 'id_ed25519'}
-                  or (lower.startswith('.env.') and lower not in {'.env.example', '.env.sample', '.env.template'})
-                  or name.suffix.lower() in {'.pem', '.key', '.p12', '.pfx', '.jks', '.keystore'}
-                  or any(part.lower() in {'.ssh', '.aws', '.azure', '.kube', '.gnupg'} for part in name.parts))
-        if secret:
-            raise WorkspaceError('Preparation: committed credential-like files cannot be exposed; '
-                                 'the coordinator must provide a sanitized source copy.')
+            found.setdefault(name, SUBMODULE_REASON)
+        elif _credential_like(Path(name)):
+            found.setdefault(name, CREDENTIAL_REASON)
+    return [{'path': name, 'reason': found[name]} for name in sorted(found)]
+
+
+def _blocked_message(blockers: list[dict], *, allocated: bool = False) -> str:
+    listed = '; '.join(f'{_escape_name(item["path"])} ({item["reason"]})' for item in blockers)
+    state = ('The fetched tree was not checked out and the copy is retained for inspection.'
+             if allocated else
+             'No workspace was allocated and no source files were changed.')
+    return ('Preparation refused: committed HEAD contains protected names: ' + listed + '. '
+            + state + ' ' + SOURCE_RECOVERY)
+
+
+def _check_source_tree(path: Path, rev: str = 'HEAD') -> None:
+    blockers = _tree_blockers(git(path, 'ls-tree', '-r', '-z', rev))
+    if blockers:
+        raise WorkspaceError(_blocked_message(blockers, allocated=True))
+
+
+def check_source(source: Path) -> dict:
+    """Preflight committed HEAD without allocating state, copying or reading file contents.
+
+    Only ``git ls-tree`` of the pinned commit is inspected: the working tree, index and every
+    uncommitted or ignored file stay irrelevant; ``create`` copies only that committed tree.
+    """
+    try:
+        root = project_root(source, required=True)
+    except SettingsError as error:
+        raise WorkspaceError(f'Preparation: {error}') from None
+    try:
+        raw_head = git(root, 'rev-parse', '--verify', 'HEAD', ok=(0, 128))
+    except WorkspaceError:
+        raise WorkspaceError('Preparation cannot read the source repository; no files were changed.') from None
+    head = raw_head.strip().decode('ascii', 'replace')
+    if not re.fullmatch(r'[0-9a-f]{40,64}', head):
+        raise WorkspaceError('Preparation requires a committed source HEAD; commit the source first.')
+    try:
+        entries = git(root, 'ls-tree', '-r', '-z', head)
+    except WorkspaceError:
+        raise WorkspaceError('Preparation cannot inspect the committed source HEAD; '
+                             'no files were changed.') from None
+    blockers = _tree_blockers(entries)
+    return {'source': str(root), 'head': head, 'eligible': not blockers, 'blockers': blockers}
+
+
+def describe_check(report: dict) -> str:
+    """Plain-text preflight rendering; blocker paths are escaped, never file contents."""
+    lines = [f'Source: {_escape_name(report["source"])}',
+             f'HEAD: {report["head"]}',
+             'Eligible: ' + ('yes' if report['eligible'] else 'no')]
+    if report['blockers']:
+        lines.append('Blockers in committed HEAD (workspace create would be refused):')
+        lines.extend(f'- {_escape_name(item["path"])}: {item["reason"]}'
+                     for item in report['blockers'])
+        lines.append(SOURCE_RECOVERY)
+    else:
+        lines.append('No committed HEAD blockers; workspace create may proceed.')
+    return '\n'.join(lines)
 
 
 class Workspace:
@@ -129,6 +225,8 @@ class Workspace:
         if (self.path.is_symlink() or not self.path.is_dir()
                 or self.path.stat().st_ino != self.metadata.get('work_inode')):
             raise WorkspaceError('Workspace directory was replaced; foreign work is never adopted.', 73)
+        if not self.metadata.get('base_head') or not self.metadata.get('git_digest'):
+            raise WorkspaceError(INCOMPLETE_PREPARATION, 73)
         if _git_digest(self.path) != self.metadata.get('git_digest'):
             raise WorkspaceError('Worker Git metadata changed; result rejected and copy retained.', 73)
         if git(self.path, 'rev-parse', 'HEAD').strip().decode('ascii') != self.metadata['base_head']:
@@ -240,10 +338,13 @@ def changed_since(copy: Workspace, before: dict[str, str]) -> list[str]:
 
 
 def create(source: Path, state: Path = DEFAULT_STATE) -> Workspace:
-    try:
-        source = project_root(source, required=True)
-    except SettingsError as error:
-        raise WorkspaceError(f'Preparation: {error}') from None
+    # Preflight committed HEAD before any state directory, copy or fetch exists, so a
+    # blocked source names its offenders and never leaves an incomplete retained copy.
+    report = check_source(source)
+    if not report['eligible']:
+        raise WorkspaceError(_blocked_message(report['blockers']))
+    source = Path(report['source'])
+    head = report['head']
     state = Path(state).absolute()
     _private(state, create=True)
     root = state / 'workspaces'
@@ -251,30 +352,41 @@ def create(source: Path, state: Path = DEFAULT_STATE) -> Workspace:
     directory = root / uuid.uuid4().hex
     directory.mkdir(mode=0o700)
     work = directory / 'work'
-    work.mkdir(mode=0o700)
-    metadata = {'schema': SCHEMA, 'source': str(source), 'status': 'preparing',
-                'attempt': 0, 'created_at': time.time(), 'work_inode': work.stat().st_ino}
-    copy = Workspace(directory, metadata)
-    copy.save()
+    copy = None
     try:
-        head = git(source, 'rev-parse', '--verify', 'HEAD').strip().decode('ascii')
-        if not re.fullmatch(r'[0-9a-f]{40,64}', head):
-            raise WorkspaceError('Preparation requires a committed source HEAD.')
+        work.mkdir(mode=0o700)
+        metadata = {'schema': SCHEMA, 'source': str(source), 'status': 'preparing',
+                    'attempt': 0, 'created_at': time.time(), 'work_inode': work.stat().st_ino}
+        copy = Workspace(directory, metadata)
+        copy.save()
         git(work, 'init', '-q', '--template=', '-b', 'deepseek/' + copy.id)
+        # Fetch exactly the preflighted commit: a concurrent HEAD move cannot swap the tree.
         git(work, 'fetch', '-q', '--depth=1', '--no-tags', '--no-recurse-submodules',
             '--', str(source), head)
+        fetched = git(work, 'rev-parse', '--verify', 'FETCH_HEAD').strip().decode('ascii', 'replace')
+        if fetched != head:
+            raise WorkspaceError('Preparation fetched an unexpected commit.')
+        _check_source_tree(work, fetched)           # defense before any checkout of the tree
         git(work, 'reset', '--soft', 'FETCH_HEAD')  # only this newly-created, owned repository
-        _check_source_tree(work)
         git(work, 'reset', '--hard', 'HEAD')       # never used when reopening a copy
         (work / '.git/FETCH_HEAD').unlink(missing_ok=True)
         metadata.update(base_head=head, git_digest=_git_digest(work), status='ready',
                         changed_files=[], ignored_artifacts=0)
         copy.save()
         return copy
-    except (WorkspaceError, OSError, UnicodeError) as error:
-        copy.failed('preparation', 78)
+    except (WorkspaceError, OSError, UnicodeError, KeyboardInterrupt) as error:
+        code = 130 if isinstance(error, KeyboardInterrupt) else 78
+        if copy is not None:
+            try:
+                copy.failed('preparation', code)
+            except (WorkspaceError, OSError):
+                pass  # Preserve the original failure and the allocated directory ID.
+        if isinstance(error, KeyboardInterrupt):
+            error.workspace_id = directory.name
+            raise
         message = str(error) if isinstance(error, WorkspaceError) else 'Cannot create the private Git copy.'
-        raise WorkspaceError(f'{message} Retained workspace {copy.id}: {work}') from None
+        raise WorkspaceError(f'{message} Retained workspace {directory.name}: {_escape_name(str(work))}',
+                             code, workspace_id=directory.name) from None
 
 
 def load(state: Path, identifier: str) -> Workspace:
@@ -296,15 +408,6 @@ def load(state: Path, identifier: str) -> Workspace:
         return copy
     except (OSError, ValueError, KeyError, TypeError):
         raise WorkspaceError('Workspace is missing, unsafe or foreign; no files were changed.') from None
-
-
-def _credential_like(name: Path) -> bool:
-    lower = name.name.lower()
-    return (lower in {'.env', 'auth.json', 'api-key', '.npmrc', '.pypirc', '.netrc',
-                      '.git-credentials', 'id_rsa', 'id_ed25519'}
-            or (lower.startswith('.env.') and lower not in {'.env.example', '.env.sample', '.env.template'})
-            or name.suffix.lower() in {'.pem', '.key', '.p12', '.pfx', '.jks', '.keystore'}
-            or any(part.lower() in {'.ssh', '.aws', '.azure', '.kube', '.gnupg'} for part in name.parts))
 
 
 @contextmanager

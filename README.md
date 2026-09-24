@@ -22,7 +22,7 @@ Requires Linux, Python 3.11+ and [pipx](https://pipx.pypa.io/latest/how-to/insta
 
 *Workflow illustration with `full-access` enabled.*
 
-This README describes version **0.8.2** of the `deepseek-team` package, which installs the single `deepseek-team` executable.
+This README describes version **0.8.5** of the `deepseek-team` package, which installs the single `deepseek-team` executable.
 
 Workers use the `deepseek-flash` model and a separate **DeepSeek API key**. By default, the coordinator chooses the reasoning effort (`low`, `high` or `max`) for each assignment; you can also save a fixed level. `low` suits bounded or mechanical work, `high` is the normal case, and `max` covers difficult debugging, cross-file reasoning and adversarial review. Under `auto` the coordinator selects the level per assignment; if no level is selected, the worker runs with `high`. The levels map to the provider's reasoning levels, and thinking stays enabled as before. The legacy value `medium` is still accepted as an alias of `high`, so old settings and commands keep working. See the DeepSeek [thinking mode guide](https://api-docs.deepseek.com/guides/thinking_mode/) when reasoning depth matters.
 
@@ -94,6 +94,7 @@ A few notes:
 
 - `--no-key` deliberately defers authentication so `setup` never prompts for or reads a secret. Store the key separately with `deepseek-team auth set`, or omit `--no-key` on a terminal when you are ready.
 - Fresh access defaults are **read-only**. Step 4 lets Auto delegate implementation by explicitly granting write access. Full-access means a private, owned development copy, not the host system.
+- When setup finishes it explains that fresh Auto is read-only and shows `deepseek-team config set --project --access full-access` for explicit opt-in from the attached project. This notice does not change access or saved policy. Use `--no-key` to defer credential setup; setup also runs outside a project.
 - On Ubuntu, the very first setup may need to install the sandbox package and a named AppArmor profile. Use `deepseek-team setup --runtime codex --with-sandbox --no-key` for that explicit, administrator-authorized step. Ordinary setup never invokes `sudo`; on other distributions install the system prerequisites yourself.
 - For Claude Code, substitute `claude` for `codex` in `--runtime` and `--coordinator`, or pass `both` to prepare both coordinators.
 - Codex owns native hook trust: review and trust the installed hook once with `/hooks`. In Claude Code, start a fresh session and check `/hooks` there.
@@ -109,6 +110,24 @@ Auto delegation admits suitable work immediately; it does not wait for prior his
 Implementation needs an executable check - tests, a build or a reproducer. Review, research and documentation tasks may use manual acceptance criteria instead. Unknown costs never block eligible work, and the coordinator keeps anything whose measured economics do not justify delegation.
 
 Every delegated subtask - even a small read-only history, search or review request - is planned and routed before another agent is assigned; in Auto a resolved worker decision means DeepSeek. The coordinator's own native subagents are an explicit exception: they need a `delegation_reason` and a `native_exception` (an explicit user request, or a native capability a DeepSeek worker cannot reach), the coordinator attests that evidence, and the native prompt carries `[deepseek-team:TASK_ID:DELIVERABLE_ID]` binding the registered scope.
+
+The coordinator orients before it solves. It registers the bounded diagnostic, test-plan and
+implementation slices it needs before deep self-investigation, treats an unknown global attribute
+as unknown and decomposes it into a bounded diagnostic instead of claiming a safe implementation,
+and batches every independent, eligible scope into one plan before duplicating that work. In a
+SUBSTANTIAL Auto plan ordinary read/write deliverables must use `executor: "auto"`; an explicit
+`coordinator` or `worker` executor is rejected there. Genuinely small single-output tasks, saved
+manual profiles, protected coordinator work and valid native exceptions keep their existing
+behavior, and access is never widened automatically.
+
+Protected scopes describe read or review context and no longer grant generic write permission. An
+architecture or security report lists `decision_artifacts` with the exact relative `.md`, `.rst`
+or `.txt` files inside its scope. An integration deliverable names the completed implementation
+with `integration_of` and the exact files it writes with `write_scope`, backed by real worker
+changes or by accepted coordinator edits recorded in the ledger. Newly discovered implementation
+needs a separately routed deliverable; substantial Auto plans use `executor: "auto"`. Corrections
+within reviewed worker output remain coordinator rework. A read-only review never confers
+integration write rights.
 
 The coordinator records what actually happened after reviewing the real diff and the declared checks. One rework is recorded without pausing anything; a rejection, or three distinct recent reworks, pauses only that task family for 300 seconds. Failed implementation is never retried automatically.
 
@@ -129,7 +148,7 @@ The coordinator splits that into bounded assignments, runs them through the work
 
 Final-summary guidance ships with the package for both Codex and Claude Code. While DeepSeek Team is enabled, summaries of performed work include short bullets separating the coordinator's personal work from accepted DeepSeek results, including any rework or failed attempts. They cover the reported task across turns; native subagents are credited separately, and no delegation is stated explicitly.
 
-After the list comes an approximate coordinator/DeepSeek split in whole-number percentages totaling 100, labelled **“subjective estimate, not measured.”** It reflects accepted scope, complexity, review and rework, never counts of calls, tasks, files, lines, tokens, time or bullets, and never the configured 25/50/75 target or claimed savings. Without accepted worker work the split is 100/0; if evidence is insufficient, the estimate is unavailable. Status-only and no-work replies need no report, and `off` disables the requirement. Updating the package refreshes hook guidance; refresh existing project instructions with `deepseek-team init --coordinator both /path/to/project` (use `codex` or `claude` for a single coordinator).
+After the list comes an approximate coordinator/DeepSeek split in whole-number percentages totaling 100, labelled **“subjective estimate, not measured.”** The coordinator describes the accepted scope and any specific rework first. The split is not a measured delegation rate or performance metric and is not router feedback; it only summarizes accepted work. It reflects accepted scope, complexity, review and rework, never counts of calls, tasks, files, lines, tokens, time or bullets, and never the configured 25/50/75 target or claimed savings. Without accepted worker work the split is 100/0; if evidence is insufficient, the estimate is unavailable. Status-only and no-work replies need no report, and `off` disables the requirement. Updating the package refreshes hook guidance; refresh existing project instructions with `deepseek-team init --coordinator both /path/to/project` (use `codex` or `claude` for a single coordinator).
 
 ## Current defaults
 
@@ -175,6 +194,26 @@ temporary worktree and fully merged branch. It preserves active, failed, unaccep
 work: it never bulk-prunes or force-deletes work it does not own. This is coordinator process
 guidance, not worker OS enforcement, and there is no automatic cleanup engine. Worker copies
 stay outside the project for review and recovery and are never deleted automatically.
+
+### Preflight and recovery
+
+Before allocating a copy, the coordinator can run a read-only check of the committed source:
+
+```bash
+deepseek-team workspace check --json
+```
+
+An optional path before `--json` selects another checkout. It reads only committed HEAD **names and modes**, never file contents, and reports `source`,
+`head`, `eligible` and any `blockers` (each with `path` and `reason`). It calls no model and
+creates no copy, so it is safe to run at any time; exit code `0` means eligible and `78` means
+blocked. The whole HEAD is examined, including paths outside the current task scope, and
+adding a tracked path to `.gitignore`, removing it from the index without committing, or
+deleting only its working-tree file does not clear its HEAD blocker. The name filter is a heuristic, not proof of a real secret, and its
+only exceptions are `.env.example`, `.env.sample` and `.env.template`.
+
+If the preflight blocks, there is no copy to resume: fix the tracked source, commit, and
+re-run the check. Otherwise a failed job retains its copy for inspection (`workspace show`),
+and continuation stays explicit. See [Hardening](https://github.com/kirill31337/deepseek-team/blob/main/docs/HARDENING.md) for the full preflight and recovery rules.
 
 ## Diagnostics
 

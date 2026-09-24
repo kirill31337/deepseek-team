@@ -1,5 +1,7 @@
+import json
 import os
 from pathlib import Path
+import re
 import secrets
 import stat
 import tempfile
@@ -8,6 +10,29 @@ import unittest
 from unittest import mock
 
 from codex_deepseek_team import config
+
+
+CODEX_HOOK = 'deepseek-team coordinator-hook'
+# The matcher shipped before source-inspection delivery existed; installing over it
+# must repair the managed entry without touching another owner's hooks.
+LEGACY_PRETOOLUSE_MATCHER = (
+    'Bash|apply_patch|Edit|Write|(?:.*[./])?(?:spawn_agent|send_message|send_input|'
+    'followup_task|assign_agent_task|resume_agent|Agent|Task)'
+)
+
+
+def owned_codex_handlers(data, event):
+    return [handler for group in data.get('hooks', {}).get(event, [])
+            if isinstance(group, dict)
+            for handler in group.get('hooks', [])
+            if isinstance(handler, dict) and handler.get('command') == CODEX_HOOK]
+
+
+def owned_codex_groups(data, event):
+    return [group for group in data.get('hooks', {}).get(event, [])
+            if isinstance(group, dict)
+            and any(isinstance(handler, dict) and handler.get('command') == CODEX_HOOK
+                    for handler in group.get('hooks', []))]
 
 
 class ConfigTests(unittest.TestCase):
@@ -125,3 +150,129 @@ class ConfigTests(unittest.TestCase):
             key = 'x' * 4096
             config.save_key(key)
             self.assertEqual(config.worker.load_api_key(), key)
+
+    def test_install_repairs_legacy_managed_matcher_and_preserves_unrelated_hooks(self):
+        path = self.home / 'hooks.json'
+        legacy_group = {
+            'matcher': LEGACY_PRETOOLUSE_MATCHER,
+            'hooks': [
+                {'type': 'command', 'command': CODEX_HOOK, 'timeout': 10,
+                 'statusMessage': 'DeepSeek Team coordination policy'},
+                {'type': 'command', 'command': 'user-guard', 'timeout': 30},
+            ],
+        }
+        path.write_text(json.dumps({'hooks': {
+            'PreToolUse': [legacy_group, {'hooks': [
+                {'type': 'command', 'command': 'user-global'}]}],
+            'Stop': [{'hooks': [{'type': 'command', 'command': 'user-stop'}]}],
+            'PostToolUse': [{'hooks': [{'type': 'command', 'command': 'user-post'}]}],
+        }}, indent=2) + '\n')
+
+        self.assertTrue(config.install_codex_hooks(self.home))
+        installed = json.loads(path.read_text())
+        for event in config.CODEX_HOOK_EVENTS:
+            with self.subTest(event=event):
+                self.assertEqual(len(owned_codex_handlers(installed, event)), 1)
+        pretooluse = owned_codex_groups(installed, 'PreToolUse')
+        self.assertEqual(len(pretooluse), 1)
+        self.assertEqual(pretooluse[0]['matcher'],
+                         config.CODEX_HOOK_EVENTS['PreToolUse']['matcher'])
+        # The shared group still belongs to the other owner: its matcher and handler
+        # are byte-identical to the pre-existing definition, so no unrelated hook
+        # and no native trust decision is silently rewritten.
+        shared = [group for group in installed['hooks']['PreToolUse']
+                  if {'type': 'command', 'command': 'user-guard', 'timeout': 30}
+                  in group.get('hooks', [])]
+        self.assertEqual(len(shared), 1)
+        self.assertEqual(shared[0], {'matcher': LEGACY_PRETOOLUSE_MATCHER,
+                                     'hooks': [{'type': 'command', 'command': 'user-guard',
+                                                'timeout': 30}]})
+        self.assertNotIn(CODEX_HOOK, json.dumps(shared))
+        self.assertIn({'type': 'command', 'command': 'user-global'},
+                      installed['hooks']['PreToolUse'][1]['hooks'])
+        self.assertIn({'type': 'command', 'command': 'user-stop'},
+                      installed['hooks']['Stop'][0]['hooks'])
+        self.assertIn('PostToolUse', installed['hooks'])
+        self.assertTrue(config.codex_hooks_status(self.home))
+
+        self.assertFalse(config.install_codex_hooks(self.home))
+        repaired = path.read_bytes()
+        self.assertFalse(config.install_codex_hooks(self.home))
+        self.assertEqual(path.read_bytes(), repaired)
+
+    def test_stale_managed_matcher_is_reported_and_reinstall_repairs_it(self):
+        config.install_codex_hooks(self.home)
+        path = self.home / 'hooks.json'
+        stale = json.loads(path.read_text())
+        for group in owned_codex_groups(stale, 'PreToolUse'):
+            group['matcher'] = LEGACY_PRETOOLUSE_MATCHER
+        path.write_text(json.dumps(stale, indent=2, sort_keys=True) + '\n')
+
+        self.assertFalse(config.codex_hooks_status(self.home))
+        self.assertTrue(config.install_codex_hooks(self.home))
+        self.assertTrue(config.codex_hooks_status(self.home))
+        repaired = json.loads(path.read_text())
+        self.assertEqual(owned_codex_groups(repaired, 'PreToolUse')[0]['matcher'],
+                         config.CODEX_HOOK_EVENTS['PreToolUse']['matcher'])
+
+    def test_stale_managed_matcher_still_removes_cleanly(self):
+        config.install_codex_hooks(self.home)
+        path = self.home / 'hooks.json'
+        stale = json.loads(path.read_text())
+        stale['hooks']['PreToolUse'][0]['matcher'] = LEGACY_PRETOOLUSE_MATCHER
+        stale['hooks'].setdefault('SessionStart', []).append(
+            {'hooks': [{'type': 'command', 'command': 'user-session'}]})
+        path.write_text(json.dumps(stale, indent=2, sort_keys=True) + '\n')
+
+        self.assertTrue(config.remove_codex_hooks(self.home))
+        remaining = path.read_text()
+        self.assertNotIn(CODEX_HOOK, remaining)
+        self.assertIn('user-session', remaining)
+
+    def test_installed_matcher_delivers_inspection_mutation_and_dispatch_events(self):
+        self.assertTrue(config.install_codex_hooks(self.home))
+        installed = json.loads((self.home / 'hooks.json').read_text())
+        matcher = owned_codex_groups(installed, 'PreToolUse')[0]['matcher']
+        for name in ('Read', 'Grep', 'Glob', 'Bash', 'exec_command', 'shell_command',
+                     'functions.exec_command', 'functions.shell_command', 'functions.Read',
+                     'apply_patch', 'Edit', 'Write', 'spawn_agent',
+                     'collaboration.spawn_agent'):
+            with self.subTest(name=name):
+                self.assertIsNotNone(re.fullmatch(matcher, name), name)
+
+
+class CodexHookMatcherTests(unittest.TestCase):
+    """The installed Codex matcher decides which tool events the parent hook sees."""
+
+    def matcher(self):
+        return config.CODEX_HOOK_EVENTS['PreToolUse']['matcher']
+
+    def matches(self, name):
+        self.assertIsNotNone(re.fullmatch(self.matcher(), name), name)
+
+    def test_delivers_source_inspection_and_shell_events(self):
+        for name in ('Read', 'Grep', 'Glob', 'Bash', 'exec_command', 'shell_command'):
+            with self.subTest(name=name):
+                self.matches(name)
+
+    def test_delivers_qualified_source_inspection_and_shell_names(self):
+        for name in ('functions.Read', 'functions.Grep', 'functions.Glob',
+                     'functions.exec_command', 'functions.shell_command',
+                     'functions.Bash', 'shell.exec_command', 'codex/exec_command',
+                     'tools.Grep'):
+            with self.subTest(name=name):
+                self.matches(name)
+
+    def test_retains_mutation_and_native_dispatch_events(self):
+        for name in ('apply_patch', 'Edit', 'Write', 'functions.apply_patch',
+                     'spawn_agent', 'collaboration.spawn_agent', 'send_message',
+                     'send_input', 'followup_task', 'assign_agent_task', 'resume_agent',
+                     'Agent', 'Task'):
+            with self.subTest(name=name):
+                self.matches(name)
+
+    def test_ignores_control_and_unrelated_tools(self):
+        for name in ('wait_agent', 'view_image', 'request_user_input', 'write_stdin',
+                     'web_search', 'multi_agent_v1'):
+            with self.subTest(name=name):
+                self.assertIsNone(re.fullmatch(self.matcher(), name), name)

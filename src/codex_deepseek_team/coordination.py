@@ -38,11 +38,43 @@ PROTECTED_COORDINATOR_KINDS = {
 TECHNICAL_RETENTION = {
     "runner_unavailable", "dependency_unavailable", "environment_incompatible",
 }
+# Optional plan metadata that also becomes part of a deliverable's identity, so an
+# accepted or started scope cannot silently change by replanning. They stay
+# optional: read-only protected plans do not need a mutation authorization.
+OPTIONAL_DEFINITION_FIELDS = ("integration_of", "write_scope", "decision_artifacts")
+_DELIVERABLE_ID = re.compile(r"[A-Za-z0-9_.-]{1,80}")
+# Stable, human-readable advice for a routing decision that retained the work.
+ROUTING_NEXT_STEPS = {
+    "protected_kind": "keep this protected responsibility with the coordinator",
+    "ineligible_kind": "use a supported deliverable kind or keep this slice with the coordinator",
+    "write_requires_full_access": "explicitly opt into full access before delegating a writing "
+                                  "slice, or keep it with the coordinator",
+    "ineligible_risk": "keep this risky slice with the coordinator or reduce its uncertainty",
+    "ineligible_scope_size": "split this large deliverable into bounded slices before delegating",
+    "ineligible_coupling": "split this cross-component deliverable into locally coupled slices "
+                           "before delegating",
+    "ineligible_localization": "use a bounded read-only diagnostic deliverable to localize the "
+                               "change before delegating",
+    "ineligible_clarity": "use a bounded read-only diagnostic deliverable to clarify the "
+                          "requirements before delegating",
+    "ineligible_verification": "declare executable checks or a reproducer before delegating",
+    "declared_verification_required": "declare executable checks or a reproducer before "
+                                      "delegating, or keep this slice with the coordinator",
+    "ineligible_domain": "use a bounded read-only diagnostic deliverable to establish the domain",
+    "ineligible_operation": "use a bounded read-only diagnostic deliverable to establish the operation",
+    "ineligible_context_version": "state the exact context version before delegating",
+    "ineligible_model": "route worker execution to the deepseek-flash model",
+    "quality_failure_cooldown": "inspect the recorded quality failure and replan after the cooldown",
+    "insufficient_measured_savings": "keep this slice with the coordinator while measured economics "
+                                     "do not support delegation",
+    "routing_disabled": "keep this slice with the coordinator or explicitly enable delegation",
+}
 
 
 class CoordinationError(Exception):
-    def __init__(self, message: str, code: int = 78):
+    def __init__(self, message: str, code: int = 78, *, constraint_code: str | None = None):
         self.message, self.code = message, code
+        self.constraint_code = constraint_code
         super().__init__(message)
 
 
@@ -332,6 +364,142 @@ def complete_task(root: Path, task_id: str) -> dict:
         return task
 
 
+def _exact_project_path(value, field: str) -> str:
+    """Return one exact project-relative path, or reject a malformed entry."""
+    if not isinstance(value, str) or not value.strip():
+        raise CoordinationError(f"{field} entries must be non-empty project-relative paths.", 64)
+    if value != value.strip():
+        raise CoordinationError(f"{field} entries must not carry surrounding whitespace.", 64)
+    parts = value.split("/")
+    if (value.startswith("/") or "\\" in value or re.match(r"[A-Za-z]:", parts[0])
+            or any(part in ("", ".", "..") for part in parts)
+            or any(char in value for char in "*?[")):
+        raise CoordinationError(
+            f"{field} entries must be exact project-relative paths without wildcards.", 64)
+    return value
+
+
+def _plan_metadata(value, field: str) -> list:
+    """Validate one optional plan-metadata field and return its normalized list."""
+    if not isinstance(value, list):
+        raise CoordinationError(f"{field} must be a list.", 64)
+    if field == "integration_of":
+        entries = []
+        for entry in value:
+            if not isinstance(entry, str) or not _DELIVERABLE_ID.fullmatch(entry):
+                raise CoordinationError("integration_of entries must be deliverable ids.", 64)
+            entries.append(entry)
+        return entries
+    return [_exact_project_path(entry, field) for entry in value]
+
+
+def _requested_executor(item: dict) -> str:
+    """The executor the coordinator asked for, before the saved routing decision."""
+    return (item.get("routing") or {}).get("requested_executor", item["executor"])
+
+
+def _started_deliverable_ids(task: dict) -> set[str]:
+    started = {row["deliverable_id"] for row in task.get("assignments", [])
+               if row.get("status") != "planned"}
+    started.update(item["id"] for item in task.get("deliverables", [])
+                   if item.get("routing_feedback") or item.get("result")
+                   or item.get("native_dispatches") or 'result_invalidated_at' in item)
+    return started
+
+
+def _valid_started_legacy_executor(root: Path, task: dict, item: dict) -> bool:
+    """Let an unchanged, already-started pre-enforcement plan finish.
+
+    Legacy explicit executors could override a prediction. Require their actual
+    persisted decision and full original binding, rather than trusting a claim
+    in the ledger or silently converting them to a new automatic assignment.
+    """
+    routing = item.get('routing') or {}
+    requested = routing.get('requested_executor')
+    if (item.get('id') not in _started_deliverable_ids(task)
+            or requested not in ('worker', 'coordinator')
+            or item.get('executor') != requested):
+        return False
+    try:
+        decision = RoutingService(root).decision(routing.get('decision_id'))
+        # An explicit legacy executor was independent of the router's mode and
+        # prediction. Preserve its authenticated identity even in advisory,
+        # shadow or off mode; automatic assignments still use strict validation.
+        return (decision['binding'] == _binding(task['id'], item)
+                and decision['features'] == validate_features(item.get('features')))
+    except (RoutingError, KeyError, TypeError):
+        return False
+
+
+def _auto_executor_issue(item: dict, requested: str) -> str | None:
+    """Return the Auto-profile bypass issue for one deliverable, if any.
+
+    Ordinary worker-eligible read and write kinds must let the saved routing
+    decision choose the executor; protected coordinator responsibilities keep an
+    explicit coordinator executor. Nothing is converted automatically.
+    """
+    if item.get("executor") == "native-agent":
+        # The existing attested native exception is validated where the
+        # deliverable is normalized; it is not an auto-routing bypass.
+        return None
+    kind = item.get("kind")
+    if kind in PROTECTED_COORDINATOR_KINDS:
+        if requested != "coordinator":
+            return (f"{item['id']}: protected coordinator responsibility {kind} must keep "
+                    "executor:'coordinator'")
+        return None
+    if kind in WORKER_READ_KINDS or kind in WORKER_WRITE_KINDS:
+        if requested != "auto":
+            return (f"{item['id']}: a substantial Auto-profile {kind} deliverable must request "
+                    "executor:'auto' and let the saved routing decision choose worker or "
+                    f"coordinator; explicit executor:'{requested}' is not an accepted bypass")
+    return None
+
+
+def _auto_executor_issues(item_list, started_ids) -> list[str]:
+    issues = []
+    for item in item_list:
+        if item["id"] in started_ids:
+            # Started deliverables are immutable; their saved routing decision is
+            # validated instead of the registration-time request.
+            continue
+        issue = _auto_executor_issue(item, item["executor"])
+        if issue:
+            issues.append(issue)
+    return issues
+
+
+def _routing_next_step(requested: str, resolved: str, reason_codes) -> str | None:
+    """One concrete next step for work a routing decision retained."""
+    if resolved != 'coordinator':
+        return None
+    for code in reason_codes:
+        step = ROUTING_NEXT_STEPS.get(code)
+        if step:
+            return step
+    if requested == 'auto':
+        return 'keep this slice with the coordinator'
+    return None
+
+
+def routing_diagnostics(task: dict) -> list[dict]:
+    """Concise per-deliverable routing outcome for plan JSON and status text.
+
+    Only identifiers, executors, stable reason codes and one bounded next step are
+    exposed; prompts, secrets and raw evidence never appear here.
+    """
+    rows = []
+    for item in task.get('deliverables', []):
+        routing = item.get('routing') or {}
+        requested = _requested_executor(item)
+        resolved = item.get('executor')
+        codes = [str(code) for code in (routing.get('reason_codes') or [])]
+        rows.append({'id': item.get('id'), 'requested_executor': requested,
+                     'resolved_executor': resolved, 'reason_codes': codes,
+                     'next_step': _routing_next_step(requested, resolved, codes)})
+    return rows
+
+
 def _normalize_deliverable(raw: dict) -> dict:
     if not isinstance(raw, dict):
         raise CoordinationError("Each deliverable must be an object.", 64)
@@ -361,6 +529,9 @@ def _normalize_deliverable(raw: dict) -> dict:
     for key in ('routing', 'routing_feedback', 'result', 'result_invalidated_at',
                 'native_dispatches', 'native_dispatch_started_at'):
         value.pop(key, None)
+    for field in OPTIONAL_DEFINITION_FIELDS:
+        if field in raw:
+            value[field] = _plan_metadata(raw[field], field)
     value["scope"] = list(raw["scope"]) if isinstance(raw["scope"], list) else [str(raw["scope"])]
     value["acceptance"] = list(raw["acceptance"])
     value["dependencies"] = list(raw["dependencies"])
@@ -371,6 +542,11 @@ def _normalize_deliverable(raw: dict) -> dict:
 def _definition(item):
     definition = {key: item[key] for key in ('id', 'kind', 'scope', 'acceptance',
                                              'dependencies', 'checks', 'features')}
+    for field in OPTIONAL_DEFINITION_FIELDS:
+        # Only present fields join the identity so historical plans, whose saved
+        # routing bindings never carried them, keep validating unchanged.
+        if field in item:
+            definition[field] = item[field]
     if item.get('executor') == 'native-agent':
         # The native attestation is part of the identity of a native deliverable
         # so a started/attested dispatch cannot be rewritten by replanning.
@@ -387,11 +563,7 @@ def _binding(task_id, item):
 
 def _prepare_routing(root, task, items, service):
     previous = {item['id']: item for item in task.get('deliverables', [])}
-    started = {row['deliverable_id'] for row in task.get('assignments', [])
-               if row['status'] != 'planned'}
-    started.update(item['id'] for item in previous.values()
-                   if item.get('routing_feedback') or item.get('result')
-                   or item.get('native_dispatches'))
+    started = _started_deliverable_ids(task)
     ids = set()
     for item in items:
         if item['id'] in ids:
@@ -423,7 +595,10 @@ def _prepare_routing(root, task, items, service):
             continue
         requested = item['executor']
         if requested == 'auto' and service.config()['mode'] != 'auto':
-            raise CoordinationError('executor:auto requires routing mode auto.', 64)
+            raise CoordinationError(
+                'executor:auto requires routing mode auto. Explicitly choose '
+                '`deepseek-team routing configure --mode auto`, or save a manual '
+                '25/50/75 delegation profile before registering new work.', 64)
         from .routing_admission import manual_acceptance
         decision = service.predict(item['features'], access=task['policy']['effective_access'],
                                    binding=_binding(task['id'], item),
@@ -473,6 +648,14 @@ def plan_task(root: Path, task_id: str, plan: dict) -> dict:
     root = _project_root(root)
     with _lock(root), _routing_batch(root) as service:
         task = load_task(root, task_id)
+        if classification == "substantial" and task['policy'].get('delegation_level') == 'auto':
+            # Reject an explicit executor bypass before any durable ledger record
+            # or routing decision exists for this revision. Started deliverables
+            # are immutable and keep their already-validated saved decision.
+            bypasses = _auto_executor_issues(deliverables, _started_deliverable_ids(task))
+            if bypasses:
+                raise CoordinationError(
+                    'Auto distribution cannot be bypassed: ' + '; '.join(bypasses) + '.', 64)
         try:
             _prepare_routing(root, task, deliverables, service)
         except RoutingError as error:
@@ -586,6 +769,13 @@ def validate_task(root: Path, task_id: str) -> list[str]:
     eligible_write_count = 0
     for item in task.get("deliverables", []):
         kind, executor = item["kind"], item["executor"]
+        if level == 'auto':
+            # Forged or historical plans must not keep an explicit executor that
+            # bypasses the saved routing decision; started deliverables are
+            # validated through their recorded automatic decision instead.
+            auto_issue = _auto_executor_issue(item, _requested_executor(item))
+            if auto_issue and not _valid_started_legacy_executor(root, task, item):
+                issues.append(auto_issue)
         if executor == 'worker' and kind in WORKER_WRITE_KINDS and access != 'full-access':
             issues.append(f"{item['id']}: current access does not permit worker writes; revise the plan")
         if (item.get('routing') or {}).get('requested_executor') == 'auto':
@@ -650,17 +840,26 @@ def _check_assignment_access(root, task, item):
 
 
 def assignment_queue_state(root: Path, task_id: str, assignment_id: str, state: str) -> None:
-    """Expose scheduling without changing executor, retry history or start state."""
+    """Expose scheduling without changing executor, retry history or start state.
+
+    Only a still-planned assignment is schedulable. A rejected duplicate launch
+    must never relabel a live or finished attempt, so any state update for a
+    running, failed or succeeded row is a safe no-op that preserves the original
+    queue state and terminal result.
+    """
     if state not in ('waiting', 'ready', 'blocked', 'cancelled'):
         raise CoordinationError('Invalid worker queue state.', 64)
     with _lock(root):
         task = load_task(root, task_id)
         row = _assignment(task, assignment_id)
+        if row.get('status') != 'planned':
+            return
+        now = time.time()
         row['queue_state'] = state
-        row['queue_updated_at'] = time.time()
+        row['queue_updated_at'] = now
         if state == 'waiting':
-            row.setdefault('queued_at', row['queue_updated_at'])
-        task['updated_at'] = row['queue_updated_at']
+            row.setdefault('queued_at', now)
+        task['updated_at'] = now
         _atomic(_task_path(root, task_id), task)
 
 
@@ -710,7 +909,7 @@ def assignment_started(root: Path, task_id: str, assignment_id: str,
             history = row.setdefault('attempt_history', [])
             history.append({key: row.get(key) for key in ('status', 'workspace_id', 'runtime', 'effort',
                 'started_at', 'finished_at', 'checks', 'disposition', 'error_kind', 'exit_code',
-                'routing_features', 'routing_decision_id')})
+                'failure_stage', 'preparation_cause', 'routing_features', 'routing_decision_id')})
         if item.get('features'):
             declared = validate_features(item['features'])
             features = validate_features(dict(item['features'], runtime=runtime,
@@ -731,7 +930,7 @@ def assignment_started(root: Path, task_id: str, assignment_id: str,
         row.update(status="running", workspace_id=workspace_id, runtime=runtime,
                    effort=effort, prepared_changes=sorted(set(prepared_changes)),
                    started_at=time.time(), disposition=None, error_kind=None, exit_code=None,
-                   queue_state='running')
+                   failure_stage=None, preparation_cause=None, queue_state='running')
         task.update(status="active", updated_at=time.time())
         _atomic(_task_path(root, task_id), task)
         return task
@@ -766,6 +965,79 @@ def assignment_finished(root: Path, task_id: str, assignment_id: str,
         _atomic(_task_path(root, task_id), task)
     sync_routing_feedback(root, task_id)
     return load_task(root, task_id)
+
+
+def assignment_preparation_failed(root: Path, task_id: str, assignment_id: str,
+                                  result_summary: str, *,
+                                  exit_code: int = 78,
+                                  workspace_id: str | None = None,
+                                  runtime: str | None = None,
+                                  effort: str | None = None,
+                                  cause: str = 'environment') -> dict:
+    """Close a still-planned assignment that failed before any model execution.
+
+    The managed runner calls this when preparation of an owned copy (sandbox,
+    declared dependencies or the provider boundary) fails before the runtime
+    starts. No model ran, so this never records a start time, duration, cost,
+    quality outcome or routing observation: the attempt stays dispositionable
+    through :func:`use_result` and the task can then be completed or replanned.
+
+    The transition is atomic and only applies to a planned assignment. Any
+    running, already-failed or succeeded assignment is protected: the call is a
+    safe no-op so managed exception reconciliation can never rewrite a live or
+    previously recorded result, workspace, queue state, disposition or history.
+    A runner ``environment_incompatible`` constraint is recorded on the
+    deliverable in the same atomic update, except for cancellation (130); an
+    already-recorded specific technical constraint is never duplicated. Admission
+    refusals are infrastructure outcomes too, but grant no technical-retention
+    exception: revoking permissions or timing out cannot justify bypassing policy.
+    """
+    if isinstance(exit_code, bool) or not isinstance(exit_code, int):
+        raise CoordinationError('Preparation failure requires an integer exit code.', 64)
+    if cause not in ('environment', 'admission'):
+        raise CoordinationError('Unknown preparation failure cause.', 64)
+    canonical_effort = None
+    if effort is not None:
+        canonical_effort = normalize_effort(effort)
+        if canonical_effort is None:
+            raise CoordinationError('Worker effort must be low, high or max (legacy medium maps to high).', 64)
+    if runtime is not None and (not isinstance(runtime, str) or not runtime.strip()):
+        raise CoordinationError('Worker runtime must be a non-empty runtime name.', 64)
+    cancelled = exit_code == 130
+    summary = str(result_summary)[:4000]
+    with _lock(root):
+        task = load_task(root, task_id)
+        row = _assignment(task, assignment_id)
+        if row.get('status') != 'planned':
+            return task
+        item = assignment_deliverable(task, assignment_id)
+        now = time.time()
+        row.update(status='failed', queue_state='finished',
+                   error_kind='cancelled' if cancelled else 'environment',
+                   failure_stage='preparation', preparation_cause=cause, exit_code=exit_code,
+                   result_summary=summary, finished_at=now,
+                   worker_changes=[], checks=[])
+        if workspace_id is not None:
+            row['workspace_id'] = str(workspace_id)
+        if runtime is not None:
+            row['runtime'] = runtime
+        if canonical_effort is not None:
+            row['effort'] = canonical_effort
+        if not cancelled and cause == 'environment':
+            constraints = task.setdefault('constraints', [])
+            recorded = any(
+                constraint.get('deliverable_id') == item['id']
+                and constraint.get('code') in TECHNICAL_RETENTION
+                and constraint.get('source') == 'runner'
+                for constraint in constraints)
+            if not recorded:
+                constraints.append({'deliverable_id': item['id'],
+                                    'code': 'environment_incompatible',
+                                    'evidence': summary[:1000],
+                                    'source': 'runner', 'at': now})
+        task['updated_at'] = now
+        _atomic(_task_path(root, task_id), task)
+        return task
 
 
 def use_result(root: Path, task_id: str, assignment_id: str,
@@ -1105,7 +1377,8 @@ def ensure_assignment_ready(root: Path, task_id: str, assignment_id: str, copy) 
     if copy.metadata.get('base_head') != task.get('base_head'):
         record_constraint(root, task_id, item['id'], 'environment_incompatible',
                           'workspace base HEAD does not match coordination task base HEAD')
-        raise CoordinationError('Workspace source version does not match the coordination task base HEAD.', 78)
+        raise CoordinationError('Workspace source version does not match the coordination task base HEAD.',
+                                78, constraint_code='environment_incompatible')
     missing = []
     for dep in item.get('dependencies', []):
         if not isinstance(dep, dict) or dep.get('kind') not in ('command', 'path'):
@@ -1133,7 +1406,8 @@ def ensure_assignment_ready(root: Path, task_id: str, assignment_id: str, copy) 
         record_constraint(root, task_id, item['id'], 'dependency_unavailable', evidence)
         raise CoordinationError(
             'Preparation ' + evidence +
-            '. Prepare the owned workspace explicitly; stubs are not equivalent verification.', 78)
+            '. Prepare the owned workspace explicitly; stubs are not equivalent verification.',
+            78, constraint_code='dependency_unavailable')
     return item
 
 
@@ -1152,6 +1426,12 @@ def summary(task: dict) -> str:
             text += f"; effort={row['effort']}"
         if row.get('queue_state'):
             text += f"; queue={row['queue_state']}"
+        if row.get('error_kind'):
+            text += f"; error={row['error_kind']}"
+        if row.get('failure_stage'):
+            text += f"; stage={row['failure_stage']}"
+        if row.get('preparation_cause'):
+            text += f"; cause={row['preparation_cause']}"
         if row.get('checks'):
             passed = sum(check.get('exit_code') == 0 for check in row['checks'])
             text += f"; checks_passed={passed}; checks_failed={len(row['checks']) - passed}"
@@ -1169,4 +1449,11 @@ def summary(task: dict) -> str:
             if item['executor'] == 'native-agent':
                 text += '; reason=' + str(item.get('delegation_reason') or '')[:300]
             lines.append(text)
+    for row in routing_diagnostics(task):
+        text = (f"- routing deliverable={row['id']} requested={row['requested_executor']} "
+                f"resolved={row['resolved_executor']}; "
+                f"reasons={', '.join(row['reason_codes']) or 'none'}")
+        if row['next_step']:
+            text += '; next_step=' + row['next_step']
+        lines.append(text)
     return "\n".join(lines)

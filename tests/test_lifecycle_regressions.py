@@ -84,9 +84,12 @@ class LifecycleRegressions(CoordinationCase):
                     self.assertEqual(self.task(runtime)['status'], 'completed')
 
     def test_read_only_shell_text_does_not_require_distribution(self):
+        # The quoted '>' only exercises the shell lexer: documentation stays a
+        # metadata read, while a source path would now open the planning gate.
+        (self.repo / 'README.md').write_text('Documented value threshold.\n')
         commands = [
             "python3 -c 'print(2 > 1)'",
-            "rg 'value>=limit' a.py",
+            "rg 'value>=limit' README.md",
             "python3 - <<'PY'\nprint(2 >= 1)\nPY\n",
         ]
         for runtime in ('codex', 'claude'):

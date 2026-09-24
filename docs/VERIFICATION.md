@@ -1,3 +1,70 @@
+# Version 0.8.5 verification
+
+Date: 2026-09-24. Scope: send ordinary Auto read and write work to the saved routing
+decision instead of an explicit executor, require a concrete distribution before further
+supported source inspection, and stop protected coordinator scope from granting blanket
+source writes.
+
+The final release suite ran **903 tests, all passing without skips**, in 492.638
+seconds with Codex **0.153.2** and Claude Code **2.1.278** available. It used
+`PYTHONPATH=src python3 -m unittest discover -s tests -v`, with the existing isolated
+Claude installation on PATH. Source fingerprints remained unchanged during the run.
+The real Claude fixture now registers its ordinary review with `executor: "auto"`
+and a feature card, then asserts worker routing; its missing-plan, native-launch,
+pending-worker and Stop checks remain intact. The exact candidate wheel passed
+installation/replacement/uninstallation checks with **pip, pipx and uv**, preserving
+external configuration. Wheel and sdist passed `twine check --strict`; archive
+inspection matched package sources and resources and excluded private configuration,
+credentials and raw logs. Publication uses the artifacts from the tagged release
+workflow, with their digests checked before the PyPI upload.
+
+## Delegation-enforcement regressions
+
+The lifecycle regression modules cover a substantial Auto plan rejecting an explicit
+`coordinator` or `worker` executor for ordinary read and write deliverables while
+protected responsibilities, attested native exceptions, genuinely small concrete-scope
+tasks and saved manual profiles keep their explicit executors. They also cover truthful
+requested/resolved routing diagnostics; the first recognized source inspection returning
+an early-planning reminder that records `source_inspection` as work; the second one
+being denied until a distribution exists; duplicate tool-use identity staying idempotent;
+status, bootstrap, instruction-read and control calls staying exempt; namespaced names
+such as `functions.exec_command` and `collaboration.spawn_agent`; protected `scope` no
+longer authorizing a write; `decision_artifacts` limited to exact in-scope `.md`, `.rst`
+or `.txt` files; `integration_of` backed by a terminal worker's actual changed files or a
+currently accepted coordinator write; directory deletion; documentation aliases that
+resolve or link into source files; and pending-worker precedence. The modules
+`tests.test_claude_hooks`, `tests.test_coordinator_dispatch`,
+`tests.test_lifecycle_regressions` and `tests.test_review_lifecycle` passed locally
+against the enforcement source. After integration and review corrections, the coordinator
+ran an initial `PYTHONPATH=src python3 -m unittest discover -s tests -v` on the host:
+**903 tests, OK, 3 skipped** in 377.050 seconds. The skips require an installed
+Claude CLI, which was not on PATH for that initial run. The run includes the offline real-Codex
+inspection scenario and real Linux sandbox tests. `git diff --check` also passed.
+No package installation or publication was performed at that implementation stage.
+
+Independent review found three additional cases; regression checks reproduced them
+before correction and pass in the final run: authentic started legacy explicit plans
+under advisory/shadow/off routing modes, Git global options and recursive grep in
+source inspection, and hard-link aliases in protected file authorization.
+
+## Matcher coverage and current boundaries
+
+The installed `PreToolUse` matcher names the read tools (`Read`, `Grep`, `Glob`), the
+shell spellings the runtimes deliver (`Bash`, `exec_command`, `shell_command`), the
+mutation tools (`apply_patch`, `Edit`, `Write`, `NotebookEdit`) and the
+native launch/message names, each with an optional qualified prefix. The offline Codex
+**0.153.2** fixture delivers its shell tool as `Bash`; the `exec_command`,
+`shell_command`, `Read`, `Grep` and `Glob` names and the Claude installation matcher are
+unit-tested against the installed matcher text. Real Claude **2.1.278** coverage
+verifies distribution injection, mutation/native-launch denial and Stop handling;
+the new source-inspection scenario has real-runtime coverage in Codex. No universal
+hook interception is claimed, and opaque or unbounded shell text is outside
+the recognized surface. Protection is partial by design: runtime settings can disable
+hooks, `hooks status` cannot establish what a running session loaded, and native
+coordinator trust remains Codex-owned.
+
+---
+
 # Version 0.8.4 verification
 
 Date: 2026-09-23. Scope: consolidate pending lifecycle, configuration and selected

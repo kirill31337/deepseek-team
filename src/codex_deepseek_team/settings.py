@@ -354,7 +354,9 @@ FINAL_REPORTING_GUIDANCE = (
     'coordinator/DeepSeek split of ACCEPTED WORK as two whole-number percentages totaling 100 percent, in the '
     'user\'s language, and label it exactly "subjective estimate, not measured" (translated into '
     'that language). Judge that split qualitatively from accepted scope and complexity and from '
-    'coordinator review and rework. Never derive it from counts of calls, tasks, deliverables, '
+    'coordinator review and rework. Describe the accepted scope and any specific rework first. '
+    'The split is not a measured delegation rate, a performance metric or routing feedback; it '
+    'only summarizes accepted work. Never derive it from counts of calls, tasks, deliverables, '
     'files, lines, tokens, time or bullets; never reuse a configured Auto/25/50/75 profile; and '
     'never claim measured productivity or money, time or token savings. If even a rough estimate '
     'lacks supporting evidence, report the estimate as unavailable instead of inventing numbers. '
@@ -416,6 +418,17 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
         'metadata from workers. Do not calculate an actual useful-work percentage from calls, '
         'deliverable counts, lines or files.\n'
     ) + effort_guidance + (
+        'Orient before you solve: register the bounded diagnostic, test-plan and implementation '
+        'slices you need before extensive self-investigation of unfamiliar source. An unknown '
+        'global attribute stays unknown - decompose it into a bounded diagnostic deliverable '
+        'whose result informs the plan instead of claiming a safe implementation. Batch every '
+        'independent, eligible scope into one distribution and launch those assignments before '
+        'duplicating that work yourself; one plan keeps the overhead down. In a SUBSTANTIAL Auto '
+        'plan every ordinary read or write deliverable must carry executor: "auto"; an explicit '
+        'executor: "coordinator" or executor: "worker" is rejected there. A genuinely small '
+        'single-output task, a manual 25/50/75 profile, a protected coordinator responsibility and '
+        'a valid native exception keep their existing behavior. Never promise a contribution '
+        'percentage and never widen access automatically.\n'
         'Plan and route every delegated subtask before assigning another agent, even a small '
         'read-only history, search or review task; a worker decision means DeepSeek. Generic '
         'parallelism, isolated context or convenience alone is not a sufficient reason to use a '
@@ -436,6 +449,17 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
         'remain with the coordinator: architecture, security, integration, final verification, '
         'secrets/signing and publishing stay coordinator-only. '
         'DeepSeek workers themselves remain leaf workers and must never delegate.\n'
+        'Protected scopes describe read or review context; they no longer grant generic '
+        'source-write permission. An architecture or security report may list decision_artifacts '
+        'with exact relative .md, .rst or .txt files contained in its scope (for example '
+        'decision_artifacts: ["docs/design.md"]). An integration deliverable requires '
+        'integration_of naming the completed implementation deliverable ids and write_scope '
+        'naming the exact relative files (for example integration_of: ["implementation"] and '
+        'write_scope: ["src/example.py"]), backed by actual worker changes or by accepted '
+        'coordinator edits recorded in the ledger. A read-only review never confers integration '
+        'write rights. Newly discovered implementation needs a separately routed deliverable; '
+        'substantial Auto plans use executor: "auto". Corrections within reviewed worker output '
+        'remain coordinator rework and must be reported as such.\n'
     )
 
     full_profiles = {
@@ -551,6 +575,11 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
             'prompts retain existing unfinished tasks. Stop requests continuation for unfinished '
             'assignments/results, including coordinator and native-agent outcomes. On repeated Stop '
             'it warns and keeps the ledger unfinished without vetoing another hook continuation. '
+            'The lifecycle hook lets the first recognized source inspection through with an '
+            'early-planning reminder and records it as work; a registered distribution is '
+            'required before any further supported source read. Real status/bootstrap checks and '
+            'purely conversational turns stay exempt, and tool recognition is bounded, never '
+            'universal. '
     )
     if runtime == 'codex':
         process += (

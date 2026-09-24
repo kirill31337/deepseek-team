@@ -64,6 +64,7 @@ def main(argv):
                 'task': task['id'],
                 'assignments': task['assignments'],
                 'issues': issues,
+                'diagnostics': coordination.routing_diagnostics(task),
             }, indent=2))
             return 78 if issues else 0
         if args.command == 'use':

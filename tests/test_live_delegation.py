@@ -23,7 +23,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from codex_deepseek_team import activation, coordination, managed, relay, sandbox, settings, worker, workspace
+from codex_deepseek_team import activation, coordination, development, managed, relay, sandbox, settings, worker, workspace
 from codex_deepseek_team.routing import RoutingService
 
 DRIVER = r'''#!/usr/bin/env python3
@@ -144,16 +144,40 @@ class LiveDemoTests(LiveBase):
             localization='known', coupling='local', verification='tests', clarity='clear',
             risk='low', scope_size='small', runtime='claude', model='deepseek-flash',
             effort='medium', context_version='deadline-v1')
+        check = "python3 -c 'import time; time.sleep(15)'"
         plan = coordination.plan_task(self.source, task['id'], dict(classification='substantial',
             deliverables=[dict(id='fix', kind='implementation', scope=['calc.py'],
-                executor='auto', acceptance=['checks pass within timeout'], dependencies=[],
-                checks=["python3 -c 'import time; time.sleep(3)'"], features=features)]))
+                executor='auto', acceptance=['declared checks expire with the shared job deadline'],
+                dependencies=[], checks=[check], features=features)]))
         aid = plan['assignments'][0]['id']
+        # The total job timeout must cover real preparation and the runtime, leaving a
+        # positive but partly consumed slice for the declared check to expire inside.
+        args = self.args(self.task('fix', sibling), timeout=10,
+                         coord_task=task['id'], coord_assignment=aid)
+        observed = {}
+        real_run_checks = development.run_checks
+
+        def spy(layout, env, commands, timeout=120, *, deadline=None):
+            observed['deadline'] = deadline
+            observed['called_at'] = time.monotonic()
+            observed['commands'] = list(commands)
+            # Delegate to the real helper: the declared check still runs inside the
+            # sandbox and still expires against its remaining budget.
+            return real_run_checks(layout, env, commands, timeout, deadline=deadline)
+
         started = time.monotonic()
-        result = managed.run(self.args(self.task('fix', sibling), timeout=2,
-            coord_task=task['id'], coord_assignment=aid), policy, worker, copy)
+        with patch.object(development, 'run_checks', spy):
+            result = managed.run(args, policy, worker, copy)
         self.assertEqual(result, 124)
-        self.assertLess(time.monotonic() - started, 4)
+        self.assertEqual(observed['commands'], [check])
+        # The check received the original absolute job deadline, not a fresh full
+        # timeout; the reset-timeout failure mode cannot satisfy both conditions.
+        self.assertEqual(observed['deadline'], args.job_deadline)
+        remaining = args.job_deadline - observed['called_at']
+        self.assertGreater(remaining, 0, 'declared check never reached its budget')
+        self.assertLess(remaining, args.timeout, 'no preparation/execution budget was consumed')
+        self.assertLess(remaining, 15, 'declared sleep did not exceed the remaining budget')
+        self.assertLess(time.monotonic() - started, args.timeout + 5)
         row = coordination.load_task(self.source, task['id'])['assignments'][0]
         self.assertEqual(row['status'], 'failed')
         self.assertEqual(row['error_kind'], 'environment')

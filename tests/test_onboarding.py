@@ -141,6 +141,29 @@ class SetupTests(unittest.TestCase):
         self.assertTrue(json.loads(settings.read_text())['disableAllHooks'])
         self.assertEqual(json.loads(settings.read_text())['model'], 'preserve')
 
+    def test_success_states_read_only_and_prints_the_explicit_opt_in(self):
+        code, output = self.call('--no-key')
+        self.assertEqual(code, 0, output)
+        self.assertIn('read-only', output)
+        self.assertIn('opt in', output.lower())
+        self.assertIn('deepseek-team config set --project --access full-access', output)
+        # Setup itself must not persist or widen access.
+        self.assertFalse((self.root / 'config' / 'deepseek-team' / 'config.toml').exists())
+
+    def test_success_explains_refreshing_project_instructions_after_upgrade(self):
+        code, output = self.call('--no-key')
+        self.assertEqual(code, 0, output)
+        self.assertIn('After upgrading', output)
+        self.assertIn('init --coordinator', output)
+
+    def test_setup_runs_outside_a_project_directory(self):
+        previous = os.getcwd()
+        self.addCleanup(os.chdir, previous)
+        os.chdir(self.root)
+        code, output = self.call('--no-key')
+        self.assertEqual(code, 0, output)
+        self.assertIn('/path/to/project', output)
+
     def test_working_ubuntu_sandbox_needs_no_privileged_changes(self):
         with mock.patch.object(onboarding.platform, 'freedesktop_os_release', return_value={'ID': 'ubuntu'}), \
              mock.patch('subprocess.run', side_effect=AssertionError('unexpected privileged command')), \

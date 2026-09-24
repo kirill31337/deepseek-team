@@ -36,6 +36,13 @@ class IntegrationTests(unittest.TestCase):
     def task(self, policy=None, turn='1'):
         return coordination.open_task(self.root, session_id='test', turn_id=turn, prompt='redacted task', policy=policy or self.policy)
 
+    def manual_policy(self, level=75, access='full-access'):
+        """A fixed 25/50/75 snapshot, where an explicit executor stays allowed."""
+        return settings.Policy(level, access, {'access': 'test', 'delegation_level': 'test'})
+
+    def manual_task(self, turn='1', level=75, access='full-access'):
+        return self.task(self.manual_policy(level, access), turn=turn)
+
     def plan(self, task, executor='auto', **changes):
         item = dict(id='fix', kind='implementation', executor=executor, scope=['src/example.py'],
                     acceptance=['Tests pass'], checks=['python3 -V'], dependencies=[], features=self.features)
@@ -182,7 +189,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertAlmostEqual(forecast['economics']['worker_mean_cost_usd'], .5)
 
     def test_feedback_outbox_survives_partial_failure(self):
-        task = self.task()
+        task = self.manual_task()
         result = self.plan(task, 'worker')
         aid = result['assignments'][0]['id']
         coordination.assignment_started(self.root, task['id'], aid, 'ws', 'codex', [], effort='medium')
@@ -201,7 +208,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertTrue(saved['assignments'][0]['routing_feedback'][0]['recorded'])
 
     def test_coordinator_feedback_freezes_scope_and_survives_replan(self):
-        task = self.task()
+        task = self.manual_task()
         self.plan(task, 'coordinator')
         coordination.observe_coordinator_result(self.root, task['id'], 'fix', 'rework', 'Needs correction', cost_usd=.2)
         revised = self.plan(task, 'coordinator')
@@ -214,7 +221,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(len(self.service.observations()), 2)
 
     def test_failed_checks_are_quality_evidence_and_retry_requires_review(self):
-        task = self.task()
+        task = self.manual_task()
         result = self.plan(task, 'worker')
         aid = result['assignments'][0]['id']
         coordination.assignment_started(self.root, task['id'], aid, 'ws', 'codex', [], effort='medium')
@@ -233,7 +240,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertLess(self.service.predict(self.features)['posterior']['mean'], .5)
 
     def test_provider_failure_is_unlabelled(self):
-        task = self.task()
+        task = self.manual_task()
         result = self.plan(task, 'worker')
         aid = result['assignments'][0]['id']
         coordination.assignment_started(self.root, task['id'], aid, 'ws', 'codex', [], effort='medium')
@@ -248,19 +255,26 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(result['deliverables'][0]['executor'], 'coordinator')
         self.assertEqual(coordination.validate_task(self.root, task['id']), [])
 
-    def test_explicit_executor_overrides_prediction(self):
+    def test_manual_explicit_executor_overrides_prediction_but_auto_never_does(self):
         self.seed()
-        result = self.plan(self.task(), 'coordinator')
+        # In Auto an explicit executor is a bypass, even when the prediction would
+        # have chosen that same executor.
+        with self.assertRaisesRegex(coordination.CoordinationError, "executor:'auto'"):
+            self.plan(self.task(), 'coordinator')
+        with self.assertRaisesRegex(coordination.CoordinationError, "executor:'auto'"):
+            self.plan(self.task(turn='auto-worker'), 'worker')
+        # A manual 25/50/75 snapshot keeps its explicit executor as before.
+        result = self.plan(self.manual_task(turn='manual-coordinator'), 'coordinator')
         self.assertEqual(result['deliverables'][0]['routing']['action'], 'worker')
         self.assertEqual(result['assignments'], [])
-        result = self.plan(self.task(turn='native'), 'native-agent',
+        result = self.plan(self.manual_task(turn='native'), 'native-agent',
                            delegation_reason='Native connector required for the requested review',
                            native_exception={'code': 'native_capability', 'capability': 'connected issue tracker',
                                              'evidence': 'The review needs a connector unavailable in the worker sandbox'})
         self.assertEqual(result['deliverables'][0]['executor'], 'native-agent')
 
     def test_worker_snapshot_uses_actual_fixed_model(self):
-        task = self.task()
+        task = self.manual_task()
         result = self.plan(task, 'worker', features={**self.features, 'model': 'operator-mistake'})
         started = coordination.assignment_started(self.root, task['id'], result['assignments'][0]['id'], 'ws', 'codex', [], effort='medium')
         row = started['assignments'][0]
@@ -270,7 +284,7 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(saved['features'], row['routing_features'])
 
     def test_coordinator_outcome_provides_cost_baseline(self):
-        task = self.task()
+        task = self.manual_task()
         self.plan(task, 'coordinator')
         coordination.observe_coordinator_result(self.root, task['id'], 'fix', 'accepted', 'Verified tests', cost_usd=1.)
         rows = self.service.observations()
@@ -326,7 +340,8 @@ class IntegrationTests(unittest.TestCase):
         for executor in ('auto', 'worker'):
             with self.subTest(executor=executor):
                 settings.set_values(self.root / '.deepseek-team.toml', access='full-access')
-                task = self.task(turn=executor)
+                policy = self.policy if executor == 'auto' else self.manual_policy()
+                task = self.task(policy, turn=executor)
                 plan = self.plan(task, executor)
                 aid = plan['assignments'][0]['id']
                 settings.set_values(self.root / '.deepseek-team.toml', access='read-only')
@@ -337,13 +352,13 @@ class IntegrationTests(unittest.TestCase):
 
     def test_stale_snapshot_cannot_grant_access_but_explicit_cli_override_is_preserved(self):
         settings.set_values(self.root / '.deepseek-team.toml', access='read-only')
-        stale = self.task(self.policy, turn='stale')
+        stale = self.manual_task(turn='stale', access='full-access')
         plan = self.plan(stale, 'worker')
         self.assertTrue(coordination.validate_task(self.root, stale['id']))
         with self.assertRaises(coordination.CoordinationError):
             coordination.assignment_started(self.root, stale['id'], plan['assignments'][0]['id'],
                                              'ws', 'codex', [], effort='medium')
-        explicit = settings.resolve(self.root, delegation_level='auto', access='full-access')
+        explicit = settings.resolve(self.root, delegation_level=75, access='full-access')
         allowed = self.task(explicit, turn='explicit-cli')
         plan = self.plan(allowed, 'worker')
         self.assertEqual(coordination.validate_task(self.root, allowed['id']), [])

@@ -26,6 +26,17 @@ outcomes continue to teach the router. Match its runtime/model/effort/context to
 actual assignment, and keep unknown task attributes unknown. Protected coordinator
 responsibilities keep an explicit coordinator executor.
 
+Orient before you solve. Register the bounded diagnostic, test-plan and implementation slices you
+need before extensively investigating unfamiliar source, and treat an unknown global attribute as
+unknown: decompose it into a bounded diagnostic deliverable instead of claiming a safe
+implementation. Batch every independent, eligible scope into one distribution and launch those
+assignments before duplicating that work yourself, so one plan keeps the overhead down. In a
+SUBSTANTIAL Auto plan every ordinary read or write deliverable must carry `executor: "auto"`; an
+explicit `executor: "coordinator"` or `executor: "worker"` is rejected there. A genuinely small
+single-output task, a manual 25/50/75 profile, a protected coordinator responsibility and a valid
+native exception keep their existing behavior. Never promise a contribution percentage and never
+widen access automatically.
+
 **Auto delegates useful bounded work immediately by default**. Small or medium tasks with low or medium risk, known or partial localization, local or component coupling, clear requirements and declared tests or a reproducer can be assigned from the first session. Manual verification is allowed for read, review, research, diagnostic, test-plan and documentation tasks with explicit acceptance criteria. Implementation requires executable checks and `full-access`.
 
 Unknown costs stay unknown and do not block eligible work; supported poor measured economics still veto delegation. One rework is recorded without a family pause. A rejection or three distinct rework cases within the cooldown window pause the family for the configured `failure_cooldown_seconds` (300 seconds by default). Immediate admission resumes after the pause. Failed implementation never retries automatically.
@@ -48,8 +59,10 @@ rejected work is never described as completed, and when nothing was delegated th
 says so explicitly. After the bullets the coordinator states a coarse approximate
 coordinator/DeepSeek split of ACCEPTED WORK as two whole-number percentages totaling 100 percent, in the
 user's language and labelled exactly "subjective estimate, not measured" (translated). It is
-judged qualitatively from accepted scope and complexity and from coordinator review and rework;
-it is never derived from counts of calls, tasks, deliverables, files, lines, tokens, time or
+judged qualitatively from accepted scope and complexity and from coordinator review and rework.
+Describe the accepted scope and any specific rework first. The split is not a measured delegation
+rate, a performance metric or routing feedback; it only summarizes accepted work. It is never
+derived from counts of calls, tasks, deliverables, files, lines, tokens, time or
 bullets, never copied from a configured Auto/25/50/75 profile, and never presented as measured
 productivity or money/time/token savings. If even a rough estimate lacks supporting evidence the
 summary reports the estimate as unavailable instead of inventing numbers; with no accepted
@@ -120,7 +133,11 @@ never expand write authority.
 For Codex, the installed stable user-level lifecycle hook is active only in projects
 explicitly attached with `deepseek-team init --coordinator codex`. After native
 Codex hook trust, SessionStart/UserPromptSubmit inject the persistent task state,
-including after compaction. Before source mutation, register the distribution:
+including after compaction. The lifecycle hook permits the first recognized source
+inspection with an early-planning reminder and records it as work; a registered
+distribution is required before any further supported source read. Real status/bootstrap
+checks and purely conversational turns stay exempt, and tool recognition is bounded, never
+universal. Before source mutation, register the distribution:
 
 ```bash
 deepseek-team coordination plan --task TASK_ID <<'JSON'
@@ -131,7 +148,7 @@ deepseek-team coordination plan --task TASK_ID <<'JSON'
       "id": "implementation",
       "kind": "implementation",
       "scope": ["src/example.py"],
-      "executor": "worker",
+      "executor": "auto",
       "acceptance": ["focused behavior implemented"],
       "dependencies": [{"kind": "command", "value": "python3"}],
       "checks": ["python3 -m unittest tests.test_example -q"],
@@ -142,16 +159,35 @@ deepseek-team coordination plan --task TASK_ID <<'JSON'
         "runtime": "{runtime}", "model": "deepseek-flash", "effort": "high",
         "context_version": "project-v1"
       }
+    },
+    {
+      "id": "integration",
+      "kind": "integration",
+      "scope": ["src/example.py"],
+      "executor": "coordinator",
+      "integration_of": ["implementation"],
+      "write_scope": ["src/example.py"],
+      "acceptance": ["accepted implementation merged after review"],
+      "dependencies": [{"kind": "path", "value": "src/example.py"}],
+      "checks": ["python3 -m unittest tests.test_example -q"]
     }
   ]
 }
 JSON
 ```
 
-This example explicitly chooses a worker for a manual profile. With profile Auto,
-set its executor to `auto` and inspect the resolved plan. Start a worker only when
-the plan returns a worker assignment; retain a coordinator decision with the coordinator.
-Use the assignment id returned by the plan:
+The first slice is a normal Auto read/write deliverable (`executor: "auto"`): inspect the resolved
+plan and start a worker only when it returns a worker assignment; retain a coordinator decision
+with the coordinator. The second slice is the coordinator integration step: it names the completed
+implementation with `integration_of` and the exact files it will touch with `write_scope`, backed
+by the actual worker changes, or by accepted coordinator edits recorded in the ledger. An
+architecture or security report instead lists `decision_artifacts` with the exact relative `.md`,
+`.rst` or `.txt` files contained in its scope; a protected scope describes read/review context only
+and never grants generic source-write permission. A read-only review never confers integration
+write rights. Newly discovered implementation needs a separately routed deliverable; substantial
+Auto plans use `executor: "auto"`. Corrections within reviewed worker output remain coordinator
+rework and must be reported as such. Under a saved manual profile an ordinary slice may name
+`executor: "worker"` explicitly instead. Use the assignment id returned by the plan:
 
 ```bash
 deepseek-team worker --runtime {runtime} --effort high \

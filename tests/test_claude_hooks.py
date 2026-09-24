@@ -62,15 +62,30 @@ class ClaudeHooksTests(unittest.TestCase):
         return coordination.latest_task(self.repo, 'claude-session')
 
     def plan(self, task, executor='coordinator', scope='a.py'):
-        return coordination.plan_task(self.repo, task['id'], {
+        deliverable = {
+            'id': 'change', 'kind': 'implementation', 'executor': executor,
+            'scope': [scope], 'acceptance': ['value checked'],
+            'dependencies': [], 'checks': [],
+        }
+        if executor == 'auto':
+            # A substantial Auto plan needs a real feature card; the saved routing
+            # decision must resolve this read deliverable to a DeepSeek worker.
+            deliverable['kind'] = 'review'
+            deliverable['features'] = {
+                'kind': 'review', 'domain': 'python', 'operation': 'review',
+                'localization': 'known', 'coupling': 'local', 'verification': 'manual',
+                'clarity': 'clear', 'risk': 'low', 'scope_size': 'small',
+                'runtime': 'claude', 'model': 'deepseek-flash', 'effort': 'high',
+                'context_version': 'claude-hooks-fixture',
+            }
+        planned = coordination.plan_task(self.repo, task['id'], {
             'classification': 'small' if executor == 'coordinator' else 'substantial',
             'small_evidence': 'One constant changes in a single file.',
-            'deliverables': [{
-                'id': 'change', 'kind': 'implementation' if executor == 'coordinator' else 'review',
-                'executor': executor, 'scope': [scope], 'acceptance': ['value checked'],
-                'dependencies': [], 'checks': [],
-            }],
+            'deliverables': [deliverable],
         })
+        if executor == 'auto':
+            self.assertEqual(planned['deliverables'][0]['executor'], 'worker')
+        return planned
 
     def assert_denied(self, result, reason):
         specific = result['hookSpecificOutput']
@@ -177,30 +192,43 @@ class ClaudeHooksTests(unittest.TestCase):
         for tool, key in [('Edit', 'file_path'), ('Write', 'file_path'), ('NotebookEdit', 'notebook_path')]:
             self.assert_denied(self.hook('PreToolUse', tool_name=tool,
                                         tool_input={key: str(self.repo / 'a.py')}), 'distribution')
-        self.assertEqual(self.hook('PreToolUse', tool_name='Read', tool_input={'file_path': 'a.py'}), {})
+        # The first recognized source read of an unclassified task returns a
+        # planning reminder; the next one is denied until a plan exists.
+        reminder = self.hook('PreToolUse', tool_name='Read', tool_input={'file_path': 'a.py'})
+        self.assertIn('early-planning', reminder['hookSpecificOutput']['additionalContext'])
+        self.assert_denied(self.hook('PreToolUse', tool_name='Read',
+                                    tool_input={'file_path': 'b.py'}), 'distribution')
         self.assertEqual(self.hook('PreToolUse', tool_name='Bash',
                                    tool_input={'command': 'deepseek-team off'}), {})
 
     def test_absolute_relative_and_symlink_paths_use_project_scopes(self):
         task = self.start()
-        self.plan(task)
         (self.repo / 'sub').mkdir()
+        # The symlinked scope is checked before any recorded mutation, because a
+        # started deliverable keeps its registered scope and features.
+        (self.repo / 'outside.py').symlink_to(self.root / 'foreign.py')
+        self.plan(task, scope='outside.py')
+        self.assert_denied(self.hook('PreToolUse', tool_name='Write',
+                                    tool_input={'file_path': str(self.repo / 'outside.py')}), 'scope')
+        self.plan(task, scope='a.py')
         for path in (str(self.repo / 'a.py'), 'a.py', 'sub/../a.py'):
             self.assertEqual(self.hook('PreToolUse', tool_name='Edit',
                                        tool_input={'file_path': path}), {})
         self.assertEqual(self.hook('PreToolUse', cwd=str(self.repo / 'sub'), tool_name='Write',
                                    tool_input={'file_path': '../a.py'}), {})
-        (self.repo / 'outside.py').symlink_to(self.root / 'foreign.py')
-        self.plan(task, scope='outside.py')
-        self.assert_denied(self.hook('PreToolUse', tool_name='Write',
-                                    tool_input={'file_path': str(self.repo / 'outside.py')}), 'scope')
 
     def test_absolute_and_dot_prefixed_plan_scopes_match_native_file_paths(self):
-        task = self.start()
-        for scope in (str(self.repo / 'a.py'), './a.py'):
-            self.plan(task, scope=scope)
-            self.assertEqual(self.hook('PreToolUse', tool_name='Edit',
-                                       tool_input={'file_path': str(self.repo / 'a.py')}), {})
+        self.start()
+        # A recorded mutation freezes the registered scope, so each spelling is
+        # checked on its own task instead of replanning one deliverable.
+        for index, scope in enumerate((str(self.repo / 'a.py'), './a.py')):
+            with self.subTest(scope=scope):
+                session = 'scope-' + str(index)
+                self.hook('UserPromptSubmit', prompt='Implement the feature', session_id=session)
+                task = coordination.latest_task(self.repo, session)
+                self.plan(task, scope=scope)
+                self.assertEqual(self.hook('PreToolUse', session_id=session, tool_name='Edit',
+                                           tool_input={'file_path': str(self.repo / 'a.py')}), {})
 
     def test_plan_mode_can_write_native_plan_but_not_source_or_symlink_escape(self):
         self.start()
@@ -232,7 +260,7 @@ class ClaudeHooksTests(unittest.TestCase):
 
     def test_unplanned_scope_and_pending_worker_are_blocked(self):
         task = self.start()
-        self.plan(task, executor='worker')
+        self.plan(task, executor='auto')
         self.assert_denied(self.hook('PreToolUse', tool_name='Edit',
                                     tool_input={'file_path': str(self.repo / 'a.py')}), 'pending worker')
         self.assert_denied(self.hook('PreToolUse', tool_name='Write',
@@ -240,7 +268,7 @@ class ClaudeHooksTests(unittest.TestCase):
 
     def test_stop_checks_pending_and_undisposed_results_without_looping(self):
         task = self.start()
-        planned = self.plan(task, executor='worker')
+        planned = self.plan(task, executor='auto')
         aid = planned['assignments'][0]['id']
         blocked = self.hook('Stop', stop_hook_active=False)
         self.assertEqual(blocked['decision'], 'block')

@@ -190,8 +190,10 @@ class ScopeConflictTests(_HookCase):
 
     def test_known_nonmatching_file_does_not_conflict_with_worker_glob(self):
         (self.repo / 'src/notes.md').write_text('notes\n')
+        # Ordinary documentation authority on the exact file replaces the bare
+        # integration scope, which is a protected context boundary now.
         self.submit([
-            _deliverable('integration', 'integration', ['src']),
+            _deliverable('notes', 'documentation', ['src/notes.md']),
             _deliverable('worker-impl', 'implementation', ['src/*.py'], executor='worker'),
         ])
         self.assertEqual(self.write('src/notes.md'), {})

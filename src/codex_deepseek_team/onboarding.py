@@ -131,4 +131,9 @@ def run(runtimes, *, no_key=False, with_sandbox=False):
     print('Local setup checks passed. Native hook trust/session loading still requires /hooks.')
     print(f'Attach your project explicitly: deepseek-team init --coordinator {runtime_arg} /path/to/project')
     print(f'Then in that project: deepseek-team doctor --runtime {runtime_arg} --offline')
+    print('Fresh Auto access is read-only: workers inspect and report, they do not change the project.')
+    print('To let them implement inside an isolated copy, opt in explicitly from that project:')
+    print('deepseek-team config set --project --access full-access')
+    print('After upgrading the package, refresh each attached project with init for the matching '
+          f'runtime: deepseek-team init --coordinator {runtime_arg} /path/to/project')
     return 0
