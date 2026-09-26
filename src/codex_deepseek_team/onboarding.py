@@ -1,12 +1,13 @@
 """User-level setup with explicit Linux prerequisite checks."""
 import getpass
 import os
+from pathlib import Path
 import platform
 import shutil
 import subprocess
 import sys
 
-from . import claude_config, config, doctor, sandbox, worker
+from . import claude_config, config, doctor, project, sandbox, settings, worker
 
 
 def _configure(runtimes):
@@ -25,6 +26,40 @@ def _configure(runtimes):
               else 'Claude coordination hooks already installed.')
         print('Claude model, permissions, authentication and unrelated hooks were preserved.')
         print('Start a new Claude session and check /hooks; native settings may disable hooks.')
+
+
+def _current_repository():
+    """Nearest ancestor with a Git metadata entry; never scans for managed blocks."""
+    current = Path.cwd().resolve()
+    for candidate in (current, *current.parents):
+        metadata = candidate / '.git'
+        if metadata.is_dir() or metadata.is_file():
+            return candidate
+    return None
+
+
+def _refresh_current_repository():
+    """Refresh both owned blocks in the current repository only.
+
+    This never attaches a fresh or unrelated repository: only blocks that already
+    exist are re-rendered. A failed refresh makes setup incomplete.
+    Other attached projects refresh on their next session or prompt.
+    """
+    repository = _current_repository()
+    if repository is None:
+        return True
+    try:
+        policy = settings.resolve(repository)
+        changed, problem = project.refresh_attached(repository, policy, coordinator='both')
+    except (settings.SettingsError, project.ProjectError) as error:
+        print('Managed instruction refresh skipped: ' + str(error))
+        return False
+    if problem:
+        print('Managed instruction refresh failed: ' + problem)
+        return False
+    elif changed:
+        print('Refreshed the managed instruction block(s) in the current repository.')
+    return True
 
 
 def _ubuntu_sandbox():
@@ -114,6 +149,9 @@ def run(runtimes, *, no_key=False, with_sandbox=False):
     """Configure selected runtimes without inferring hook trust or attaching a project."""
     _prerequisites(runtimes, with_sandbox)
     _configure(runtimes)
+    if not _refresh_current_repository():
+        print('Setup incomplete: resolve the managed instruction refresh error and rerun setup.')
+        return 78
     runtime_arg = 'both' if len(runtimes) == 2 else runtimes[0]
     code = doctor.main(['--runtime', runtime_arg, '--offline'])
     if code:
@@ -134,6 +172,9 @@ def run(runtimes, *, no_key=False, with_sandbox=False):
     print('Fresh Auto access is read-only: workers inspect and report, they do not change the project.')
     print('To let them implement inside an isolated copy, opt in explicitly from that project:')
     print('deepseek-team config set --project --access full-access')
-    print('After upgrading the package, refresh each attached project with init for the matching '
-          f'runtime: deepseek-team init --coordinator {runtime_arg} /path/to/project')
+    print('After upgrading the package, rerun setup once per installed runtime to refresh the '
+          'user-level hook definitions. New sessions then refresh the managed blocks in each '
+          'attached project automatically.')
+    print('Use init only for a first attachment: '
+          f'deepseek-team init --coordinator {runtime_arg} /path/to/project')
     return 0

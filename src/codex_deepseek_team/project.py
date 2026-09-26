@@ -306,6 +306,28 @@ def apply_refresh(prepared):
     return written
 
 
+def refresh_attached(root, policy, coordinator='both'):
+    """Refresh only managed blocks that already exist; never create a file.
+
+    Reuses :func:`prepare_refresh` and :func:`apply_refresh` so every target is
+    read, owned and validated before anything is written. A partial failure
+    attempts to restore pre-images without overwriting concurrent changes;
+    blocked rollback is included in the diagnostic. Missing and foreign files without an owned
+    block are skipped, so this never attaches an unrelated repository. Returns
+    ``(written, problem)`` where ``written`` counts files actually changed and
+    ``problem`` is an actionable diagnostic when refresh did not complete.
+    """
+    try:
+        prepared = prepare_refresh(root, policy, coordinator)
+    except ProjectError as error:
+        return 0, str(error)
+    try:
+        written = apply_refresh(prepared)
+    except ProjectError as error:
+        return 0, str(error)
+    return len(written), ''
+
+
 def detach(root, coordinator='codex'):
     """Remove managed blocks; return True when any target changed."""
     runtimes = _coordinators(coordinator)

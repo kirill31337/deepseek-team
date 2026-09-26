@@ -99,6 +99,7 @@ A few notes:
 - On Ubuntu, the very first setup may need to install the sandbox package and a named AppArmor profile. Use `deepseek-team setup --runtime codex --with-sandbox --no-key` for that explicit, administrator-authorized step. Ordinary setup never invokes `sudo`; on other distributions install the system prerequisites yourself.
 - For Claude Code, substitute `claude` for `codex` in `--runtime` and `--coordinator`, or pass `both` to prepare both coordinators.
 - Codex owns native hook trust: review and trust the installed hook once with `/hooks`. In Claude Code, start a fresh session and check `/hooks` there. The package cannot trust hooks for you, and after an update you should restart the session so refreshed guidance loads.
+- Attached projects keep their own managed blocks: on each session start and prompt, an explicitly attached project checks and, when stale, updates both existing `AGENTS.md` and `CLAUDE.md` blocks from the current packaged template and effective settings. Unattached projects are never created, scanned or registered.
 
 ## What gets delegated
 
@@ -151,7 +152,7 @@ Once setup and attachment are done, you do not run workers by hand. Ask in your 
 
 The coordinator splits that into bounded assignments, runs them through the worker queue and reports the accepted work.
 
-Final-summary guidance ships with the package for both Codex and Claude Code. While DeepSeek Team is enabled, summaries of performed work include short bullets separating the coordinator's personal work from accepted DeepSeek results, including any rework or failed attempts, and then an approximate coordinator/DeepSeek split in whole-number percentages labelled **“subjective estimate, not measured.”** The split reflects accepted scope and complexity with review and rework; it is never derived from call, task, file, line, token or time counts and is not router feedback. Updating the package refreshes hook guidance; refresh existing project instructions with `deepseek-team init --coordinator both /path/to/project` (use `codex` or `claude` for a single coordinator).
+Final-summary guidance ships with the package for both Codex and Claude Code. While DeepSeek Team is enabled, summaries of performed work include short bullets separating the coordinator's personal work from accepted DeepSeek results, including any rework or failed attempts, and then an approximate coordinator/DeepSeek split in whole-number percentages labelled **“subjective estimate, not measured.”** The split reflects accepted scope and complexity with review and rework; it is never derived from call, task, file, line, token or time counts and is not router feedback. Session start injects the current policy for Codex and Claude Code; when a block refresh changes or fails, the next prompt supplies fresh guidance so a stale loaded block does not linger. Updating the package refreshes hook guidance, each attached project refreshes its own blocks at the next session or prompt, and `setup` refreshes the blocks in its current repository. Run `init` only to attach a project for the first time or to deliberately repair its blocks.
 
 ## Current defaults
 
@@ -176,6 +177,8 @@ deepseek-team status  # show the saved and effective state
 
 The optional manual **25/50/75** profiles are target distributions, not measured quotas. Saved manual profiles retain priority over Auto, while recorded outcomes continue to inform learning. With `access=auto`, profile 25 uses read-only and profiles 50/75 use full-access. An explicitly saved `read-only` setting always takes priority. See the [routing guide](https://github.com/kirill31337/deepseek-team/blob/main/docs/ROUTING.md) for how admission, evidence and feedback work.
 
+The package ships the delegation rules and the managed blocks. Each project keeps its own access, manual profile, `effort`, `max_workers` and `off` state, and its private lessons journal stays local, so an upgrade refreshes the shipped rules but never changes those saved choices, exports full-access settings or learned rules, or promises an identical delegation split.
+
 ## Isolation
 
 <a id="workspace-and-branch-hygiene"></a>
@@ -199,17 +202,15 @@ These checks make no provider requests. Local readiness does not validate the ke
 
 ## Update and uninstall
 
-Upgrade the released package through the same manager, then re-run the local setup steps:
+Upgrade the released package through the same manager, then run `setup` once for each coordinator runtime you installed:
 
 ```bash
 pipx upgrade deepseek-team
-deepseek-team setup --runtime codex --no-key
-cd /path/to/project
-deepseek-team init --coordinator codex .
+deepseek-team setup --runtime codex --no-key   # or claude / both
 deepseek-team doctor --runtime codex --offline
 ```
 
-Run `init` for each attached project to refresh its managed instructions; your own instruction text and saved preferences are preserved. With uv, use `uv tool upgrade deepseek-team`. In a virtual environment, use its `python -m pip install --upgrade deepseek-team`. Keep one install channel per machine; a local-clone pipx installation is refreshed with `pipx install --force .` from the updated clone.
+`setup` updates the selected user-level hooks and refreshes both managed instruction files (`AGENTS.md` and `CLAUDE.md`) in the repository you run it from when they are already attached. Every other attached project refreshes its own blocks automatically on its next session or prompt, so repeating `init` in each existing project is no longer required; run `init` only to attach a project for the first time or to deliberately repair its managed blocks. Only the package-owned blocks are rewritten, so your own instruction text and saved settings are preserved. Installing or upgrading with pip, pipx or uv does not run setup automatically. Run `setup` to update hook definitions; native trust is reviewed separately in the coordinator. A project that stays closed refreshes when you next open it. With uv, use `uv tool upgrade deepseek-team`. In a virtual environment, use its `python -m pip install --upgrade deepseek-team`. Keep one install channel per machine; a local-clone pipx installation is refreshed with `pipx install --force .` from the updated clone.
 
 To remove DeepSeek Team, detach each project before uninstalling. If you also want to delete the saved DeepSeek key, run `deepseek-team auth remove` while the command is still installed.
 

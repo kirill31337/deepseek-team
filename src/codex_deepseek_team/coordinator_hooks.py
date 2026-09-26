@@ -57,6 +57,27 @@ def _lessons_due_reminder(root) -> str:
         return ''
 
 
+def _refresh_diagnostic(problem: str, runtime: str) -> str:
+    """Report incomplete refresh without claiming a blocked rollback succeeded."""
+    return ('DeepSeek Team could not refresh the managed instruction block(s): ' + problem
+            + ' Review the affected files and repair the reported problem, then rerun '
+            f'deepseek-team init --coordinator {runtime} . from the repository root. '
+            'The current policy below applies to this session.')
+
+
+def _binding_diagnostic(error, runtime: str) -> str:
+    """Startup/prompt diagnostic for a malformed owned binding we never adopt."""
+    return ('DeepSeek Team found a malformed managed-block binding for ' + runtime + ': '
+            + str(error) + ' This project is not treated as attached and the file was not '
+            'modified. Repair or remove the conflicting block, then rerun '
+            'deepseek-team init --coordinator ' + runtime + ' . from the repository root '
+            'to attach it cleanly.')
+
+
+def _with_diagnostic(text: str, diagnostic: str) -> str:
+    return diagnostic + '\n' + text if diagnostic else text
+
+
 def _paths_from_apply_patch(command: str) -> list[str]:
     return re.findall(r"^\*\*\* (?:(?:Update|Add|Delete) File|Move to): (.+)$", command, re.M)
 
@@ -230,19 +251,44 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
     if root is None:
         return {}
     try:
-        if not project.is_attached(root, runtime):
-            return {}
-    except project.ProjectError:
-        return {}
-    if not activation.resolve(root).enabled:
+        attached = project.is_attached(root, runtime)
+    except project.ProjectError as error:
+        # A malformed owned binding is never adopted: surface it on the lifecycle
+        # events and leave every related event otherwise untouched.
         if event in ('SessionStart', 'UserPromptSubmit'):
-            return _context(activation.DISABLED_GUIDANCE, event)
+            return _context(_binding_diagnostic(error, runtime), event)
+        return {}
+    if not attached:
+        return {}
+    lifecycle = event in ('SessionStart', 'UserPromptSubmit')
+    policy = None
+    resolve_error = None
+    diagnostic = ''
+    refresh_changed = False
+    if lifecycle:
+        # Refresh both existing owned blocks from the current settings before the
+        # events that preload project instructions, so a stale or disabled snapshot
+        # cannot govern this turn. Off resolves to the disabled policy and bypasses
+        # the ledger/routing/delegation gates below.
+        try:
+            policy = settings.resolve(root)
+        except settings.SettingsError as error:
+            resolve_error = error
+        if policy is not None:
+            refresh_changed, problem = project.refresh_attached(root, policy)
+            if problem:
+                diagnostic = _refresh_diagnostic(problem, runtime)
+        enabled = policy.enabled if policy is not None else activation.resolve(root).enabled
+        if not enabled:
+            return _context(_with_diagnostic(activation.DISABLED_GUIDANCE, diagnostic), event)
+        if policy is None:
+            raise resolve_error
+    elif not activation.resolve(root).enabled:
         return {}
     session = str(payload.get("session_id") or "")
     if not session:
         return {}
     if event == "UserPromptSubmit":
-        policy = settings.resolve(root)
         task = coordination.begin_turn(
             root, session_id=session, turn_id=str(payload.get("turn_id") or uuid.uuid4().hex),
             prompt=str(payload.get("prompt") or ""), policy=policy, runtime=runtime)
@@ -281,9 +327,15 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
             "Record worker dispositions with cause/severity/summary/prevention when a result "
             "needs corrections (deepseek-team coordination use --rework-json FILE|-), and "
             "review the private journal when a lessons review is due.\n"
-            + settings.final_reporting_guidance()
-            + settings.rework_guidance(runtime)
         )
+        if refresh_changed or diagnostic:
+            # The on-disk snapshot changed or could not be refreshed; inject the
+            # complete current policy so a preloaded stale file cannot govern this
+            # turn. settings.instructions already carries the reporting/rework text.
+            text = text + settings.instructions(policy, runtime)
+        else:
+            text = text + settings.final_reporting_guidance() + settings.rework_guidance(runtime)
+        text = _with_diagnostic(text, diagnostic)
         guidance = _lessons_guidance(root)
         if guidance:
             text = text + "\n" + guidance
@@ -291,7 +343,6 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
     task = (coordination.active_task(root, session)
             or coordination.latest_task(root, session))
     if event == "SessionStart":
-        policy = settings.resolve(root)
         base = (
             f"DeepSeek Team effective profile: {str(policy.delegation_level) + '%' if policy.delegation_level != 'auto' else 'Auto'}/"
             f"{policy.effective_access}; effort={policy.effort}. "
@@ -310,14 +361,12 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
             base += "No active coordination task is recorded for this session."
         if payload.get("source") == "compact":
             base += " This state is restored from the persistent ledger after compaction."
-        if runtime == 'claude':
-            # Claude SessionStart already appends settings.instructions, which now
-            # includes the shared reporting contract and the graded-review rubric;
-            # do not duplicate either full text.
-            base += '\n' + settings.instructions(policy, runtime)
-        else:
-            base += '\n' + settings.final_reporting_guidance()
-            base += '\n' + settings.rework_guidance(runtime)
+        # Both runtimes inject the complete current policy on session start, so the
+        # current loaded policy overrides any stale snapshot. settings.instructions
+        # already carries the shared reporting contract and the graded-review rubric;
+        # they are never appended a second time.
+        base += '\n' + settings.instructions(policy, runtime)
+        base = _with_diagnostic(base, diagnostic)
         guidance = _lessons_guidance(root)
         if guidance:
             base += '\n' + guidance

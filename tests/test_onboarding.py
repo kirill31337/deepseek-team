@@ -16,6 +16,12 @@ class SetupTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
+        # Run setup from an isolated non-repository directory: setup refreshes the
+        # current repository's owned blocks, and the package checkout must not be
+        # rewritten by these tests.
+        previous = os.getcwd()
+        self.addCleanup(os.chdir, previous)
+        os.chdir(self.root)
         self.codex = self.root / 'codex'
         self.claude = self.root / 'claude'
         environment = mock.patch.dict(os.environ, {
