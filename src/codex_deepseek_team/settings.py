@@ -375,6 +375,46 @@ def final_reporting_guidance() -> str:
     return FINAL_REPORTING_GUIDANCE
 
 
+REWORK_GUIDANCE = (
+    '### Graded review and corrective work\n'
+    'Grade each assignment yourself after reviewing its actual diff and declared checks; the '
+    'coordinator supplies the assessment and a worker never self-grades. Record the operational '
+    'outcome with `coordination use --disposition ... --evidence ...`, add the structured cause '
+    'with `coordination use --rework-json FILE` when the result needed corrections, and add the '
+    'explicit assessment with `coordination use --quality-json FILE` in the same call. An assessment is exactly '
+    '`{grade, attribution, evidence}`: grades `met` (1.0), `minor_gaps` (0.8), `major_gaps` '
+    '(0.3), `unusable` (0.0) and `unassessable` (neutral); attribution is `worker`, `shared`, '
+    '`coordinator`, `environment` or `unknown`. Only worker or shared attribution with an '
+    'assessable grade supplies a quality score, and shared evidence must name the '
+    'worker-attributable gap against the supplied requirements or acceptance criteria. These '
+    'rubric weights are declared heuristics, not measured probabilities or work-share '
+    'percentages. Missing brief or context, or requirements changed during the assignment, is '
+    'neutral for worker quality on its own; a cosmetic or preference edit still counts as `met`, '
+    'while a low editing cost never excuses a serious defect. Omitted quality keeps the legacy '
+    'binary reading for compatibility, and older outcomes may be reassessed only by appending an '
+    'explicit assessment: recorded history is never rewritten, and if several explicit '
+    'assessments exist the lowest scored worker grade is retained. New independent successful '
+    'assignments add positive evidence and can restore the class rating; old evidence loses '
+    'weight over time, while duplicate feedback never manufactures another success.\n'
+    'Corrections: record the concrete defect evidence and the original `needs-rework` first, then '
+    'route a bounded correction brief as its own assignment; it links the original assignment, '
+    'states the concrete defect and the context the first attempt lacked, and carries executable '
+    'acceptance checks. Substantive corrections normally return to DeepSeek; a minor bounded '
+    'correction may be performed by the coordinator with its concrete reason recorded. '
+    'Correction size and worker quality are separate judgements. No blind retries, no direct '
+    'resume of a completed assignment, no `off` bypass, no sandbox bypass and no access '
+    'widening; architecture, security, integration and final verification stay with the '
+    'coordinator.\n'
+)
+
+
+def rework_guidance(runtime: str = 'codex') -> str:
+    """Shared graded-review and corrective-work contract for both runtimes."""
+    if runtime not in ('codex', 'claude'):
+        raise SettingsError('Instruction runtime must be codex or claude.')
+    return REWORK_GUIDANCE
+
+
 def instructions(policy: Policy, runtime: str = 'codex') -> str:
     if runtime not in ('codex', 'claude'):
         raise SettingsError('Instruction runtime must be codex or claude.')
@@ -459,7 +499,8 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
         'coordinator edits recorded in the ledger. A read-only review never confers integration '
         'write rights. Newly discovered implementation needs a separately routed deliverable; '
         'substantial Auto plans use executor: "auto". Corrections within reviewed worker output '
-        'remain coordinator rework and must be reported as such.\n'
+        'remain coordinator rework when performed by the coordinator; substantive corrections '
+        'normally return to DeepSeek.\n'
     )
 
     full_profiles = {
@@ -532,7 +573,9 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
             'quota or periodic coordinator holdout. Missing data and unknown prices do not block '
             'suitable work and never imply measured savings; supported poor economics still veto '
             'delegation. A rejected result or three distinct recent rework cases pause only that '
-            'family for the configured cooldown (300 seconds by default). One rework is recorded '
+            'family for the configured cooldown (300 seconds by default). Explicit assessments restrict '
+            'these failures to worker/shared major_gaps or unusable; cosmetic, minor-gap and '
+            'neutral assessments never trigger the pause. One rework is recorded '
             'without pausing the family; after a pause immediate admission resumes. '
             'There is no automatic paid exploration outside the '
             'normal task stream and no automatic permission widening; keep the resolved access and explicit executor '
@@ -604,5 +647,6 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
         + 'While a worker runs, work only on independent scope. Review the actual diff and recorded '
           'checks without repeating the whole investigation or rewriting correct code. DeepSeek workers never '
           'stage, commit, push, publish, deploy, access production services or delegate.\n'
+        + rework_guidance(runtime)
         + final_reporting_guidance()
     )

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -107,9 +108,26 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
                 development.write_launch(control, binary, runtime, env, writable=writable,
                                          effort=effort)
                 if coord_task:
+                    # Bounded pre-execution evidence for the lessons journal: the
+                    # prompt digest plus a redacted brief, the workspace baseline and
+                    # the coordinator-prepared content fingerprints. No credential or
+                    # raw model output is captured here.
+                    fingerprints = {}
+                    if coord_before is not None:
+                        fingerprints = {name: coord_before[name] for name in prepared_changes
+                                        if name in coord_before}
+                    execution = {
+                        'prompt_sha256': hashlib.sha256(
+                            task.encode('utf-8', errors='replace')).hexdigest(),
+                        'prompt_brief': api.redact(task, key).strip()[:600],
+                        'model': api.MODEL,
+                        'base_head': copy.metadata.get('base_head'),
+                        'git_digest': copy.metadata.get('git_digest'),
+                        'prepared_fingerprints': fingerprints,
+                    }
                     coordination.assignment_started(
                         copy.source, coord_task, coord_assignment, copy.id, runtime,
-                        prepared_changes, effort=effort)
+                        prepared_changes, effort=effort, execution=execution)
                     coord_started = True
                 provider = None
                 execution_started = False

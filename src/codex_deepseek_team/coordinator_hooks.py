@@ -8,7 +8,8 @@ import re
 import time
 import uuid
 
-from . import activation, coordination, coordinator_activity, project, scope_matching, settings
+from . import (activation, coordination, coordinator_activity, lessons, project,
+                 scope_matching, settings)
 from .shell_mutation import classify_shell_mutation
 
 
@@ -22,6 +23,38 @@ def _deny(reason: str) -> dict:
         "permissionDecision": "deny",
         "permissionDecisionReason": reason,
     }}
+
+
+def _sync_lessons_feedback(root, task_id: str) -> None:
+    """Retry the durable lessons outbox; a hook never fails on it."""
+    try:
+        coordination.sync_lessons_feedback(root, task_id)
+    except coordination.CoordinationError:
+        pass  # The unrecorded event stays queued for the next prompt/status call.
+
+
+def _lessons_guidance(root) -> str:
+    """Advisory root-specific rules for a coordinator prompt or session start.
+
+    Reuses the lessons service renderer; unreadable private state never breaks a
+    lifecycle hook. Matching rules reach the coordinator before it chooses a
+    brief, while the assignment snapshot records which rules were actually
+    selected - it is not proof that the coordinator followed them.
+    """
+    try:
+        return lessons.render_guidance(root)
+    except lessons.LessonError:
+        return ''
+
+
+def _lessons_due_reminder(root) -> str:
+    """Nonblocking completed-task reminder; empty unless a review is really due."""
+    try:
+        if not lessons.status(root).get('review_due'):
+            return ''
+        return lessons.render_guidance(root)
+    except lessons.LessonError:
+        return ''
 
 
 def _paths_from_apply_patch(command: str) -> list[str]:
@@ -214,6 +247,7 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
             root, session_id=session, turn_id=str(payload.get("turn_id") or uuid.uuid4().hex),
             prompt=str(payload.get("prompt") or ""), policy=policy, runtime=runtime)
         coordination.sync_routing_feedback(root, task['id'])
+        _sync_lessons_feedback(root, task['id'])
         effort_context = (
             "Effort policy is auto: choose low, high or max for each DeepSeek assignment "
             "from task complexity and pass it explicitly (the legacy medium spelling is "
@@ -243,9 +277,16 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
             "Record worker acceptance/rework via coordination use and verified coordinator/native-agent "
             "outcomes via coordination result before completion. An unplanned turn with no work closes "
             "without a distribution plan; an existing unfinished task remains open. "
-            "Supply measured total --cost-usd only when known; never invent subscription costs.\n"
+            "Supply measured total --cost-usd only when known; never invent subscription costs. "
+            "Record worker dispositions with cause/severity/summary/prevention when a result "
+            "needs corrections (deepseek-team coordination use --rework-json FILE|-), and "
+            "review the private journal when a lessons review is due.\n"
             + settings.final_reporting_guidance()
+            + settings.rework_guidance(runtime)
         )
+        guidance = _lessons_guidance(root)
+        if guidance:
+            text = text + "\n" + guidance
         return _context(text, event)
     task = (coordination.active_task(root, session)
             or coordination.latest_task(root, session))
@@ -271,10 +312,15 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
             base += " This state is restored from the persistent ledger after compaction."
         if runtime == 'claude':
             # Claude SessionStart already appends settings.instructions, which now
-            # includes the shared reporting contract; do not duplicate the full text.
+            # includes the shared reporting contract and the graded-review rubric;
+            # do not duplicate either full text.
             base += '\n' + settings.instructions(policy, runtime)
         else:
             base += '\n' + settings.final_reporting_guidance()
+            base += '\n' + settings.rework_guidance(runtime)
+        guidance = _lessons_guidance(root)
+        if guidance:
+            base += '\n' + guidance
         return _context(base, event)
     if event == 'PreToolUse':
         native = _check_native_dispatch(root, task, payload)
@@ -283,6 +329,7 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
     if task is None:
         return {}
     coordination.sync_routing_feedback(root, task['id'])
+    _sync_lessons_feedback(root, task['id'])
     if runtime == 'claude' and payload.get('permission_mode') == 'plan':
         # Native plan files are written before a source-work distribution exists.
         # Do not exempt source edits merely because Claude is in plan mode.
@@ -362,6 +409,7 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
         return {}
     if event == "Stop":
         reasons = []
+        completed = False
         for unfinished in coordination.unfinished_tasks(root, session):
             # Closing a newer draft or completed plan must not hide older work.
             if coordination.close_unstarted_task(root, unfinished['id']):
@@ -384,6 +432,7 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
                 reasons.append(unfinished['id'] + ': ' + ' '.join(task_reasons))
             else:
                 coordination.complete_task(root, unfinished['id'])
+                completed = True
         if reasons:
             reason = " ".join(reasons)
             if not payload.get("stop_hook_active"):
@@ -391,6 +440,14 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
             # Bound our own retry without vetoing another hook's continuation.
             # The ledger stays unfinished and the runtime receives a warning.
             return {"systemMessage": "DeepSeek Team task remains unfinished. " + reason}
+        if completed:
+            # Advisory, never a veto: a due lessons review only adds a
+            # nonblocking systemMessage at a completed-task boundary.
+            reminder = _lessons_due_reminder(root)
+            if reminder:
+                return {"continue": True,
+                        "systemMessage": "DeepSeek Team delegation lessons review is due. "
+                                         + reminder}
         return {"continue": True}
     return {}
 

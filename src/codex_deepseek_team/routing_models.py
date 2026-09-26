@@ -8,6 +8,10 @@ import re
 import time
 
 from .effort import CANONICAL_EFFORTS, DEFAULT_EFFORT, LEGACY_EFFORT_ALIASES, normalize_effort
+from .routing_quality import (ASSESSMENT_KEYS as QUALITY_KEYS,
+                              ATTRIBUTIONS as QUALITY_ATTRIBUTIONS,
+                              GRADES as QUALITY_GRADES,
+                              MAX_EVIDENCE_CHARS as MAX_QUALITY_EVIDENCE)
 
 
 class RoutingError(Exception):
@@ -41,6 +45,7 @@ DEFAULT_CONFIG = {
     'min_local_evidence': 5., 'external_weight_cap': 5., 'source_weight_cap': 2.,
     'half_life_days': 90., 'max_evidence_age_days': 365., 'min_similarity': .6,
     'minimum_savings_fraction': .1,
+    'quality_min_evidence': 10., 'quality_min_success_probability': .7,
     'monthly_experiment_budget_usd': 0., 'per_experiment_limit_usd': 0.,
     'failure_cooldown_seconds': 300.,
 }
@@ -108,13 +113,14 @@ def validate_config(value: dict, base=None) -> dict:
         result[key] = number(result[key], key)
     if not 0 < result['confidence'] < 1:
         raise RoutingError('confidence must be strictly between zero and one.')
-    for key in ('min_similarity', 'minimum_savings_fraction'):
+    for key in ('min_similarity', 'minimum_savings_fraction', 'quality_min_success_probability'):
         if not 0 <= result[key] <= 1:
             raise RoutingError(f'{key} must be between zero and one.')
-    for key in ('half_life_days', 'max_evidence_age_days'):
+    for key in ('half_life_days', 'max_evidence_age_days', 'quality_min_evidence'):
         if result[key] <= 0:
             raise RoutingError(f'{key} must be positive.')
-    for key in ('external_weight_cap', 'source_weight_cap', 'min_local_evidence'):
+    for key in ('external_weight_cap', 'source_weight_cap', 'min_local_evidence',
+                'quality_min_evidence'):
         if result[key] > 10000:
             raise RoutingError(f'{key} exceeds the supported evidence bound.')
     if result['failure_cooldown_seconds'] > 2592000:
@@ -122,9 +128,33 @@ def validate_config(value: dict, base=None) -> dict:
     return result
 
 
+def validate_quality(value) -> dict | None:
+    """Validate one explicit graded quality assessment or ``None`` when absent.
+
+    An assessment is exactly ``{grade, attribution, evidence}`` with bounded
+    nonempty evidence. A caller-supplied numeric score is never accepted: the
+    rubric weight is derived from the declared grade.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != QUALITY_KEYS:
+        raise RoutingError('Quality assessment must contain exactly grade, attribution and evidence.')
+    grade, attribution, evidence = value['grade'], value['attribution'], value['evidence']
+    if not isinstance(grade, str) or grade not in QUALITY_GRADES:
+        raise RoutingError('Unknown quality grade.')
+    if not isinstance(attribution, str) or attribution not in QUALITY_ATTRIBUTIONS:
+        raise RoutingError('Unknown quality attribution.')
+    if not isinstance(evidence, str) or not evidence.strip():
+        raise RoutingError('Quality evidence must be a nonempty bounded string.')
+    if len(evidence) > MAX_QUALITY_EVIDENCE:
+        raise RoutingError('Quality evidence exceeds the supported 4000 characters.')
+    return {'grade': grade, 'attribution': attribution, 'evidence': evidence}
+
+
 def validate_observation(value: dict, now=None) -> dict:
     allowed = {'id', 'case_id', 'origin', 'source_id', 'source_family', 'features', 'action',
-               'outcome', 'observed_at', 'cost_usd', 'duration_seconds', 'reliability', 'decision_id'}
+               'outcome', 'observed_at', 'cost_usd', 'duration_seconds', 'reliability', 'decision_id',
+               'quality'}
     required = {'id', 'case_id', 'origin', 'features', 'action', 'outcome', 'observed_at'}
     if not isinstance(value, dict) or set(value) - allowed or required - set(value):
         raise RoutingError('Observation has missing or unsupported fields.')
@@ -136,6 +166,11 @@ def validate_observation(value: dict, now=None) -> dict:
     if result['outcome'] not in ('accepted', 'rework', 'rejected', 'infrastructure', 'cancelled', 'unknown'):
         raise RoutingError('Invalid observation outcome.')
     result['features'] = validate_features(result['features'])
+    # Historical observations without quality must normalize without gaining a
+    # field so stored fingerprints and exact replays stay compatible.
+    quality = validate_quality(result.pop('quality', None))
+    if quality is not None:
+        result['quality'] = quality
     result['observed_at'] = number(result['observed_at'], 'observed_at', 0, (time.time() if now is None else now) + 60)
     for key in ('cost_usd', 'duration_seconds'):
         result[key] = None if result.get(key) is None else number(result[key], key)

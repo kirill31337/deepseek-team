@@ -52,6 +52,9 @@ def main(argv=None):
     if argv and argv[0] == 'routing':
         from . import routing_cli
         return routing_cli.main(argv)
+    if argv and argv[0] == 'lessons':
+        from . import lessons_cli
+        return lessons_cli.main(argv)
     if argv and argv[0] in ('config', 'workspace'):
         from . import delegation_cli
         return delegation_cli.main(argv)
@@ -104,6 +107,7 @@ def main(argv=None):
     sandbox_commands.add_parser('install-apparmor', help='Install/reload only the package-owned named AppArmor profile.')
     sandbox_commands.add_parser('remove-apparmor', help='Remove only an unchanged package-owned AppArmor profile.')
     commands.add_parser('config', help='Manage delegation profiles; use config --help.')
+    commands.add_parser('lessons', help='Inspect the private rework journal and apply reviewed delegation lessons.')
     commands.add_parser('workspace', help='Prepare and inspect owned development copies; use workspace --help.')
     commands.add_parser('doctor', help='Check local setup; use doctor --help for runtime/live options.')
     commands.add_parser('worker', help='Run a worker; use worker --help for runtime/read/write options.')

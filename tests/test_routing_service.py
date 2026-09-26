@@ -159,5 +159,118 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(len(saved['posterior']['evidence_digest']), 64)
 
 
+    # -- learned quality routing -------------------------------------------
+    def quality_history(self, outcomes=('rework',) * 12, *, at=None, tag='base', **changes):
+        """Distinct reviewed assignments in one comparable task class."""
+        stamp = time.time() - 7200 if at is None else at
+        for index, outcome in enumerate(outcomes):
+            self.service.observe(self.observation(
+                id=f'quality-{tag}-{index}-{outcome}', case_id=f'quality-case-{tag}-{index}',
+                outcome=outcome, observed_at=stamp, **changes))
+
+    def test_learned_quality_veto_needs_sufficient_effective_support(self):
+        settings.set_values(self.root / settings.PROJECT_FILE, access='full-access')
+        self.quality_history(['rework'] * 8)
+        small = self.service.predict(self.features)
+        self.assertEqual(small['action'], 'worker')
+        self.assertFalse(small['quality']['sufficient'])
+        self.assertFalse(small['quality']['veto'])
+        self.quality_history(['rework'] * 4, at=time.time() - 7100, tag='more')
+        poor = self.service.predict(self.features)
+        self.assertEqual(poor['action'], 'coordinator')
+        self.assertIn('learned_quality_below_threshold', poor['reason_codes'])
+        self.assertTrue(poor['quality']['sufficient'])
+        self.assertTrue(poor['quality']['veto'])
+        self.assertLess(poor['quality']['posterior']['upper'], .7)
+        stored = self.service.decision(poor['id'])
+        self.assertEqual(stored['quality'], poor['quality'])
+        json.dumps(stored['quality'])
+
+    def test_repeated_feedback_for_one_assignment_never_inflates_support(self):
+        settings.set_values(self.root / settings.PROJECT_FILE, access='full-access')
+        stamp = time.time() - 7200
+        self.service.observe(self.observation(id='dup-1', case_id='one-assignment',
+                                              outcome='rework', observed_at=stamp))
+        for index in range(20):
+            self.service.observe(self.observation(id=f'dup-{index + 2}', case_id='one-assignment',
+                                                  outcome='accepted', observed_at=stamp + index))
+        decision = self.service.predict(self.features)
+        self.assertEqual(decision['quality']['posterior']['matched_local'], 1)
+        self.assertFalse(decision['quality']['sufficient'])
+        self.assertEqual(decision['action'], 'worker')
+
+    def test_learned_quality_veto_only_applies_to_effective_auto(self):
+        settings.set_values(self.root / settings.PROJECT_FILE, access='full-access')
+        self.quality_history()
+        auto = self.service.predict(self.features)
+        self.assertEqual(auto['action'], 'coordinator')
+        self.assertIn('learned_quality_below_threshold', auto['reason_codes'])
+        for mode in ('shadow', 'advisory'):
+            with self.subTest(mode=mode):
+                self.service.configure({'mode': mode})
+                decision = self.service.predict(self.features)
+                self.assertEqual(decision['action'], 'worker')
+                self.assertNotIn('learned_quality_below_threshold', decision['reason_codes'])
+                self.assertTrue(decision['quality']['veto'])
+        settings.set_values(self.root / settings.PROJECT_FILE, delegation_level=75)
+        self.service.configure({'mode': 'auto'})
+        manual = self.service.predict(self.features)
+        self.assertEqual(manual['action'], 'worker')
+        self.assertNotIn('learned_quality_below_threshold', manual['reason_codes'])
+        self.assertTrue(manual['quality']['veto'])
+
+    def test_eligibility_and_verification_reasons_precede_learned_quality(self):
+        self.quality_history()
+        blocked = self.service.predict(self.features)
+        self.assertEqual(blocked['reason_codes'], ['write_requires_full_access'])
+        self.assertTrue(blocked['quality']['veto'])
+        settings.set_values(self.root / settings.PROJECT_FILE, access='full-access')
+        binding = {'task_id': 'task-123', 'deliverable_id': 'implementation', 'plan_hash': 'a' * 64}
+        undeclared = self.service.predict(self.features, binding=binding, verification_ready=False)
+        self.assertEqual(undeclared['reason_codes'], ['declared_verification_required'])
+        self.assertTrue(undeclared['quality']['veto'])
+
+    def test_queued_start_recomputes_current_learned_quality(self):
+        settings.set_values(self.root / settings.PROJECT_FILE, access='full-access')
+        decision = self.service.predict(self.features)
+        self.assertEqual(decision['action'], 'worker')
+        self.assertFalse(decision['quality']['veto'])
+        self.quality_history()
+        with self.assertRaisesRegex(RoutingError, 'quality'):
+            self.service.validate_start(decision['id'])
+        fresh = self.service.predict(self.features)
+        self.assertEqual(fresh['action'], 'coordinator')
+        self.assertIn('learned_quality_below_threshold', fresh['reason_codes'])
+        self.assertTrue(fresh['quality']['veto'])
+        # The same current rule refuses to pick up the decision made before the
+        # poor history existed, so decisions and queued starts agree.
+        with self.assertRaisesRegex(RoutingError, 'quality'):
+            self.service.validate_start(decision['id'])
+
+    def test_already_running_work_is_not_recancelled_by_learned_quality(self):
+        settings.set_values(self.root / settings.PROJECT_FILE, access='full-access')
+        decision = self.service.predict(self.features)
+        self.quality_history()
+        self.service.validate_start(decision['id'], already_running=True)
+
+    def test_configure_exposes_and_persists_the_quality_settings(self):
+        config = self.service.configure({'quality_min_evidence': 12.5,
+                                         'quality_min_success_probability': .8})
+        self.assertEqual(config['quality_min_evidence'], 12.5)
+        self.assertEqual(config['quality_min_success_probability'], .8)
+        self.assertEqual(RoutingService(self.root).config()['quality_min_evidence'], 12.5)
+        with self.assertRaises(RoutingError):
+            self.service.configure({'quality_min_evidence': 0.})
+        with self.assertRaises(RoutingError):
+            self.service.configure({'quality_min_success_probability': 1.5})
+
+    def test_every_decision_records_the_quality_assessment(self):
+        decision = self.service.predict(self.features)
+        self.assertIn('quality', decision)
+        self.assertFalse(decision['quality']['veto'])
+        self.assertEqual(decision['quality']['posterior']['matched_local'], 0)
+        self.assertEqual(self.service.decision(decision['id'])['quality'], decision['quality'])
+        json.dumps(decision['quality'])
+
 if __name__ == '__main__':
     unittest.main()

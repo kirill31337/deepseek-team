@@ -13,9 +13,19 @@ from unittest import mock
 from codex_deepseek_team import coordination_cli, routing_cli
 
 
+def _stats_case(case_id, *, outcome='accepted', kind='implementation', observed_at=None):
+    return {'id': 'obs-' + case_id, 'case_id': case_id, 'origin': 'local',
+            'source_id': 'local', 'source_family': 'local', 'action': 'worker',
+            'outcome': outcome, 'observed_at': observed_at or time.time(), 'reliability': 1.0,
+            'features': {'kind': kind, 'domain': 'python', 'operation': 'extend',
+                         'runtime': 'codex', 'model': 'deepseek-flash', 'effort': 'high',
+                         'context_version': 'default'}}
+
+
 class FakeRoutingService:
     instances = []
     export_failure = False
+    observations_data = []
 
     def __init__(self, root):
         self.root = root
@@ -29,6 +39,10 @@ class FakeRoutingService:
     def config(self):
         self.calls.append(('config',))
         return {'mode': 'auto', 'failure_cooldown_seconds': 300.}
+
+    def observations(self):
+        self.calls.append(('observations',))
+        return list(self.__class__.observations_data)
 
     def configure(self, changes):
         self.calls.append(('configure', changes))
@@ -81,6 +95,7 @@ class RoutingCliTests(unittest.TestCase):
     def setUp(self):
         FakeRoutingService.instances.clear()
         FakeRoutingService.export_failure = False
+        FakeRoutingService.observations_data = []
         self.service = mock.patch.object(routing_cli, 'RoutingService', FakeRoutingService)
         self.service.start()
         self.addCleanup(self.service.stop)
@@ -303,6 +318,36 @@ class RoutingCliTests(unittest.TestCase):
 
 
 
+    def test_stats_table_reads_only_observations_and_config(self):
+        FakeRoutingService.observations_data = [_stats_case('case-1')]
+        code, output, errors = self.invoke(['routing', 'stats', '--path', '/tmp/project'])
+        self.assertEqual((code, errors), (0, ''))
+        self.assertIn('CATEGORY', output)
+        self.assertIn('implementation', output)
+        self.assertIn('assignment', output)
+        self.assertEqual(FakeRoutingService.instances[-1].calls,
+                         [('observations',), ('config',)])
+
+    def test_stats_json_exposes_counts_and_passes_sort(self):
+        FakeRoutingService.observations_data = [_stats_case('case-1')]
+        code, output, errors = self.invoke(
+            ['routing', 'stats', '--path', '/tmp/project', '--json', '--sort', 'cases'])
+        self.assertEqual((code, errors), (0, ''))
+        payload = json.loads(output)
+        self.assertEqual(payload['sort'], 'cases')
+        self.assertEqual(payload['categories'][0]['category'], 'implementation')
+        self.assertEqual(payload['categories'][0]['accepted'], 1)
+        self.assertEqual(FakeRoutingService.instances[-1].calls,
+                         [('observations',), ('config',)])
+
+    def test_stats_rejects_unknown_sort_before_service_use(self):
+        code, output, errors = self.invoke(
+            ['routing', 'stats', '--path', '/tmp/project', '--sort', 'bogus'])
+        self.assertEqual(code, 64)
+        self.assertIn('error', errors)
+        self.assertEqual(FakeRoutingService.instances, [])
+
+
 class CoordinationCliTests(unittest.TestCase):
     def invoke(self, argv):
         with mock.patch('sys.stdout', new_callable=io.StringIO) as output, \
@@ -405,6 +450,32 @@ class RoutingCliServiceIntegrationTests(unittest.TestCase):
         ])
         self.assertEqual((code, errors), (0, ''))
         self.assertEqual(json.loads(output)['added'], 1)
+
+    def test_stats_reads_real_observations_without_recording_anything(self):
+        service = routing_cli.RoutingService(self.root)
+        service.observe({
+            'id': 'stats-case-1', 'case_id': 'stats-case-1', 'origin': 'local',
+            'source_id': 'local', 'source_family': 'local',
+            'features': {'kind': 'implementation', 'domain': 'python', 'operation': 'extend',
+                         'runtime': 'codex', 'model': 'deepseek-flash', 'effort': 'high',
+                         'context_version': 'default'},
+            'action': 'worker', 'outcome': 'accepted', 'observed_at': int(time.time()) - 100,
+            'reliability': 1.0,
+        })
+        before = service.observations()
+        code, output, errors = self.invoke(
+            ['routing', 'stats', '--path', str(self.root), '--json'])
+        self.assertEqual((code, errors), (0, ''))
+        payload = json.loads(output)
+        self.assertEqual(payload['categories'][0]['category'], 'implementation')
+        self.assertEqual(payload['categories'][0]['accepted'], 1)
+        self.assertEqual(service.observations(), before)
+        self.assertEqual(service.status()['decisions'], 0)
+
+        code, output, errors = self.invoke(['routing', 'stats', '--path', str(self.root)])
+        self.assertEqual((code, errors), (0, ''))
+        self.assertIn('CATEGORY', output)
+        self.assertIn('implementation', output)
 
     def test_export_streams_real_service_format(self):
         code, output, errors = self.invoke([

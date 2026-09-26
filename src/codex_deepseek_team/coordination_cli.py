@@ -7,6 +7,53 @@ import sys
 from . import coordination
 
 
+MAX_FEEDBACK_BYTES = 64 * 1024
+
+
+def _read_feedback(source, label):
+    """Read one structured feedback object from FILE or stdin before any mutation.
+
+    The read is bounded, duplicate object keys are rejected for both feedback
+    inputs and ``null`` keeps the same explicit-omission meaning as an absent
+    flag. Nothing is read for the second stdin source: the caller rejects two
+    ``-`` sources before either one is opened.
+    """
+    try:
+        if source == '-':
+            stream = getattr(sys.stdin, 'buffer', sys.stdin)
+            raw = stream.read(MAX_FEEDBACK_BYTES + 1)
+            if isinstance(raw, str):
+                raw = raw.encode('utf-8')
+        else:
+            with Path(source).open('rb') as handle:
+                raw = handle.read(MAX_FEEDBACK_BYTES + 1)
+    except (OSError, UnicodeError, ValueError):
+        raise coordination.CoordinationError(
+            f'Cannot read the {label} JSON input; nothing was changed.', 64) from None
+    if not isinstance(raw, (bytes, bytearray)):
+        raise coordination.CoordinationError(
+            f'Cannot read the {label} JSON input; nothing was changed.', 64)
+    if len(raw) > MAX_FEEDBACK_BYTES:
+        raise coordination.CoordinationError(
+            f'{label.capitalize()} JSON exceeds the 64 KiB limit; nothing was changed.', 64)
+    def reject_duplicates(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                raise ValueError('duplicate JSON field')
+            result[key] = value
+        return result
+    try:
+        payload = json.loads(raw.decode('utf-8'), object_pairs_hook=reject_duplicates)
+    except (ValueError, UnicodeError, RecursionError):
+        raise coordination.CoordinationError(
+            f'{label.capitalize()} JSON must be one JSON object; nothing was changed.', 64) from None
+    if payload is not None and not isinstance(payload, dict):
+        raise coordination.CoordinationError(
+            f'{label.capitalize()} JSON must be one object or null; nothing was changed.', 64)
+    return payload
+
+
 def main(argv):
     parser = argparse.ArgumentParser(prog='deepseek-team coordination')
     subs = parser.add_subparsers(dest='command', required=True)
@@ -30,6 +77,14 @@ def main(argv):
     use.add_argument('--evidence', required=True)
     use.add_argument('--cost-usd', type=float,
                      help='Measured total cost including worker, review and rework; omit if unknown.')
+    use.add_argument('--rework-json', metavar='FILE',
+                     help="Structured cause/severity/summary/prevention correction as JSON "
+                          "from FILE, or - for stdin. Older omissions stay unknown.")
+    use.add_argument('--quality-json', metavar='FILE',
+                     help="Explicit graded assessment {grade, attribution, evidence} as JSON "
+                          "from FILE, or - for stdin. Grades: met (1.0), minor_gaps (0.8), "
+                          "major_gaps (0.3), unusable (0.0), unassessable (neutral). Null keeps "
+                          "the legacy binary reading. At most one feedback flag may read stdin.")
 
     result = subs.add_parser('result', help='Record a verified coordinator or native-agent outcome and optional total cost.')
     result.add_argument('--path', type=Path, default=Path.cwd())
@@ -68,8 +123,17 @@ def main(argv):
             }, indent=2))
             return 78 if issues else 0
         if args.command == 'use':
+            if args.rework_json == '-' and args.quality_json == '-':
+                raise coordination.CoordinationError(
+                    'Only one feedback JSON source may read stdin (-); pass a file for the '
+                    'other. Nothing was changed.', 64)
+            rework = (_read_feedback(args.rework_json, 'rework')
+                      if args.rework_json else None)
+            quality = (_read_feedback(args.quality_json, 'quality')
+                       if args.quality_json else None)
             task = coordination.use_result(args.path, args.task, args.assignment,
-                                           args.disposition, args.evidence, cost_usd=args.cost_usd)
+                                           args.disposition, args.evidence,
+                                           cost_usd=args.cost_usd, rework=rework, quality=quality)
             print(coordination.summary(task))
             return 0
         if args.command == 'result':
@@ -92,6 +156,7 @@ def main(argv):
         else:
             raise coordination.CoordinationError('status requires --task or --session.', 64)
         coordination.sync_routing_feedback(args.path, task['id'])
+        coordination.sync_lessons_feedback(args.path, task['id'])
         if args.json:
             print(json.dumps(task, indent=2))
         else:

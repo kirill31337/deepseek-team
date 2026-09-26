@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import time
 
+from . import routing_quality
 from .routing_models import (
     DEFAULT_CONFIG,
     PROTECTED_KINDS,
@@ -207,15 +208,22 @@ def _start_cooldown(conn, family_id, failure_at, cooldown_until):
 
 
 def record_outcome(conn, row, observations, config):
-    """Start or extend a family cooldown for a local worker quality failure.
+    """Start or extend a family cooldown for a substantive local worker failure.
 
     A local worker rejection pauses immediately. Rework pauses only once at
-    least :data:`REWORK_LIMIT` distinct local worker rework cases appear in the
-    same task family within the trailing cooldown window. Acceptance and
-    neutral outcomes never pause and never clear an existing pause. Timestamps
-    always come from the observation, never from the wall clock, and the
-    monotonic upsert cannot shorten an existing pause. Returns whether a pause
-    was recorded.
+    least :data:`REWORK_LIMIT` distinct substantive local worker rework cases
+    appear in the same task family within the trailing cooldown window. The
+    family keeps its existing context identity, while an assignment's
+    qualification uses all of its graded assessments for the same runtime,
+    model and canonical effort, whichever context version recorded them.
+
+    An explicit graded assessment qualifies the case: only scored worker/shared
+    ``major_gaps`` or ``unusable`` assessments are substantive failures, while
+    cosmetic, minor-gap, neutral and non-worker attributions never pause.
+    Acceptance and neutral outcomes never pause and never clear an existing
+    pause. Timestamps always come from the observation, never from the wall
+    clock, and the monotonic upsert cannot shorten an existing pause. Returns
+    whether a pause was recorded.
     """
     if row.get('origin') != 'local' or row.get('action') != 'worker':
         return False
@@ -224,23 +232,40 @@ def record_outcome(conn, row, observations, config):
         return False
     seconds = _cooldown_seconds(config)
     timestamp = number(row['observed_at'], 'observed_at')
+    family = _family(row['features'])
+    card = validate_features(row['features'])
+    identity = tuple(card[field] for field in routing_quality.QUALITY_IDENTITY)
+    family_cases, case_history = {}, {}
+    for item in observations:
+        if (item.get('origin') != 'local' or item.get('action') != 'worker'
+                or not isinstance(item.get('features'), dict)):
+            continue
+        item_card = validate_features(item['features'])
+        item_family = tuple(item_card[field] for field in FAMILY_FIELDS)
+        if item_family == family:
+            family_cases.setdefault(item.get('case_id'), []).append(item)
+        if tuple(item_card[field] for field in routing_quality.QUALITY_IDENTITY) == identity:
+            case_history.setdefault(item.get('case_id'), []).append(item)
+    resolved = routing_quality.case_quality(
+        case_history.get(row.get('case_id')) or (row,))
+    if resolved['kind'] == 'explicit':
+        if resolved['grade'] not in routing_quality.SUBSTANTIVE_GRADES:
+            return False
+    elif resolved['kind'] == 'neutral':
+        return False
     triggered = outcome == 'rejected'
     if not triggered:
-        family = _family(row['features'])
         start = timestamp - seconds
         cases = set()
-        for item in observations:
-            if (item.get('origin') != 'local' or item.get('action') != 'worker'
-                    or item.get('outcome') != 'rework'):
+        for case_id, items in family_cases.items():
+            if not any(item.get('outcome') == 'rework'
+                       and isinstance(item.get('observed_at'), (int, float))
+                       and start <= item['observed_at'] <= timestamp for item in items):
                 continue
-            at = item.get('observed_at')
-            if not isinstance(at, (int, float)) or at < start or at > timestamp:
-                continue
-            if _family(item['features']) != family:
-                continue
-            cases.add(item['case_id'])
-            if len(cases) >= REWORK_LIMIT:
-                break
+            if routing_quality.case_substantive(case_history.get(case_id) or items):
+                cases.add(case_id)
+                if len(cases) >= REWORK_LIMIT:
+                    break
         triggered = len(cases) >= REWORK_LIMIT
     if not triggered:
         return False

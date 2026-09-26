@@ -13,6 +13,7 @@ import itertools
 import math
 import time
 
+from . import routing_quality
 from .routing_models import RoutingError, normalized_features, validate_config, validate_features
 
 _IDENTITY = ("runtime", "model", "effort", "context_version")
@@ -107,18 +108,32 @@ def _case_key(row):
             *(row["features"][key] for key in _IDENTITY))
 
 
-def _case_outcomes(observations, now, *, corrections=True):
+def _quality_case_key(row):
+    """Graded-quality identity shared with the learned assessment and cooldown.
+
+    Unlike :func:`_case_key` it omits ``context_version``: one reviewed
+    assignment stays one quality case across context versions. Rows must carry
+    canonical features, which :func:`_canonical_observations` guarantees.
+    """
+    return routing_quality.quality_case_key(row)
+
+
+def _case_outcomes(observations, now, *, corrections=True, key=None):
     """Keep the earliest observed failure, or the first acceptance if none.
 
 With corrections=False this selects initial evaluation forecast events only;
 future corrections must never move those forecasts to a later timestamp.
+``key`` overrides the case identity; the chronological evaluation groups
+retrospective targets by graded-quality identity while contextual forecasts
+keep the exact-context identity above.
 """
+    case_key = _case_key if key is None else key
     selected = {}
     order = lambda r: (r["observed_at"], r["outcome"] == "accepted", r["id"])
     for row in sorted(observations, key=order):
         if row["observed_at"] > now or row["outcome"] not in _LABELLED:
             continue
-        key = _case_key(row)
+        key = case_key(row)
         previous = selected.get(key)
         if previous is None or (corrections and previous["outcome"] == "accepted"
                                 and row["outcome"] != "accepted"):
@@ -155,9 +170,26 @@ def _similarity(features, other):
     return matches / len(_SOFT_CONTEXT)
 
 
+def _graded_cases(observations, now):
+    """Group every known event per case for case-level graded quality.
+
+    Context versions are provenance here: a later explicit grade under another
+    context version belongs to the same assignment, so it reaches that
+    assignment's earlier forecast-context evidence. Evidence selection and
+    similarity still require the exact context version below, and cost identity
+    is untouched.
+    """
+    grouped = defaultdict(list)
+    for row in observations:
+        if row["observed_at"] <= now:
+            grouped[_quality_case_key(row)].append(row)
+    return grouped
+
+
 def _weighted(features, observations, config, now, *, for_cost=False):
     result = []
     selected = _cost_outcomes(observations, now) if for_cost else _case_outcomes(observations, now)
+    cases = None if for_cost else _graded_cases(observations, now)
     for row in selected:
         age = (now - row["observed_at"]) / 86400.
         if age > config["max_evidence_age_days"]:
@@ -168,6 +200,14 @@ def _weighted(features, observations, config, now, *, for_cost=False):
         weight = similarity * row["reliability"] * 2. ** (-age / config["half_life_days"])
         if weight <= 0:
             continue
+        if cases is not None:
+            # Graded explicit quality replaces this case's binary inference;
+            # neutral explicit quality contributes no success or failure mass.
+            score = routing_quality.case_score(cases.get(_quality_case_key(row), (row,)), row)
+            if score is None:
+                continue
+            if score != (1.0 if row["outcome"] == "accepted" else 0.0):
+                row = dict(row, _score=score)
         result.append((row, weight))
     return _cap_external(result, config)
 
@@ -186,19 +226,25 @@ def _cap_external(weighted, config):
             for row, weight in weighted]
 
 
+def _mass_score(row):
+    """Fractional success mass for one case; legacy rows keep the binary rule."""
+    score = row.get("_score")
+    return (1.0 if row["outcome"] == "accepted" else 0.0) if score is None else score
+
+
 def _posterior(weighted, config, *, intervals=True, evidence_ids=True):
     rows = [(row, weight) for row, weight in weighted if row["action"] == "worker"
             and row["outcome"] in _LABELLED and weight > 0]
-    alpha = 1. + math.fsum(weight for row, weight in rows if row["outcome"] == "accepted")
-    beta = 1. + math.fsum(weight for row, weight in rows if row["outcome"] != "accepted")
+    alpha = 1. + math.fsum(weight * _mass_score(row) for row, weight in rows)
+    beta = 1. + math.fsum(weight * (1. - _mass_score(row)) for row, weight in rows)
     tail = (1. - config["confidence"]) / 2.
     return {"mean": alpha / (alpha + beta),
             "lower": _beta_quantile(tail, alpha, beta) if intervals else None,
             "upper": 1. - _beta_quantile(tail, beta, alpha) if intervals else None,
             "alpha": alpha, "beta": beta,
             "local_effective": math.fsum(w for r, w in rows if r["origin"] == "local"),
-            "local_failure_effective": math.fsum(w for r, w in rows
-                if r["origin"] == "local" and r["outcome"] != "accepted"),
+            "local_failure_effective": math.fsum(w * (1. - _mass_score(r)) for r, w in rows
+                if r["origin"] == "local"),
             "external_effective": math.fsum(w for r, w in rows if r["origin"] == "external"),
             "matched_local": sum(r.get("_count", 1) for r, _ in rows if r["origin"] == "local"),
             "matched_external": sum(r.get("_count", 1) for r, _ in rows if r["origin"] == "external"),
@@ -331,8 +377,11 @@ identity and task family, rather than all preceding cases. No outcomes are prelo
         identity = tuple(row["features"][key] for key in _IDENTITY + _ANCHORS)
         context = tuple(row["features"][key] for key in _CONTEXT)
         family = row["source_family"] if row["origin"] == "external" else ""
+        # Quality buckets stay homogeneous in their success mass so an
+        # aggregated bucket carries one exact fractional score.
         key = (kind, context, row["origin"], family, row["action"],
-               row["outcome"] if kind == "quality" else "")
+               row["outcome"] if kind == "quality" else "",
+               row.get("_score") if kind == "quality" else None)
         latest_key = (identity, key)
         bucket = self.latest_bucket.get(latest_key)
         if bucket is None or ((now - bucket.anchor) / 86400.) / bucket.half_life > 256.:
@@ -377,18 +426,69 @@ identity and task family, rather than all preceding cases. No outcomes are prelo
             _, entry = heapq.heappop(self.expiry)
             self._remove(entry, now)
 
+    def _rescore_quality(self, state, case_state, now):
+        """Apply the case-level graded score to one exact-context evidence entry.
+
+        The representative row keeps its own context version, so the entry still
+        matches only that context in a forecast, while the score comes from the
+        assignment's graded history across context versions.
+        """
+        if case_state["assessed"] is not None:
+            score = case_state["assessed"][0]
+        elif case_state["explicit"]:
+            score = None
+        else:
+            score = 1.0 if state["representative"]["outcome"] == "accepted" else 0.0
+        graded = (str(state["representative"]["id"]), score)
+        if graded == state["graded"]:
+            return
+        if state["entry"] is not None:
+            self._remove(state["entry"], now)
+            state["entry"] = None
+        state["graded"] = graded
+        if score is not None:
+            state["entry"] = self._add(
+                dict(state["representative"], _score=score), "quality", now)
+
     def learn(self, batch, now):
         # The caller's timestamp batch is sorted with tied failures first.
         for row in batch:
-            key = _case_key(row)
             if row["outcome"] not in _LABELLED:
                 continue
+            # Graded quality is case-level across context versions, while the
+            # retained representative keeps the exact context identity per
+            # version so contextual matching stays unchanged.
+            case_state = self.quality_latest.get(_quality_case_key(row))
+            if case_state is None:
+                case_state = {"explicit": False, "assessed": None, "contexts": {}}
+                self.quality_latest[_quality_case_key(row)] = case_state
+            changed = False
+            assessment = row.get("quality")
+            if isinstance(assessment, dict):
+                if not case_state["explicit"]:
+                    case_state["explicit"] = True
+                    changed = True
+                score = routing_quality.assessment_score(assessment)
+                if score is not None:
+                    candidate = (score, row.get("observed_at", 0.), str(row.get("id", "")))
+                    if case_state["assessed"] is None or candidate < case_state["assessed"]:
+                        case_state["assessed"] = candidate
+                        changed = True
+            state = case_state["contexts"].get(_case_key(row))
+            if state is None:
+                state = {"failed": False, "entry": None, "representative": None, "graded": None}
+                case_state["contexts"][_case_key(row)] = state
             failed = row["outcome"] != "accepted"
-            previous = self.quality_latest.get(key)
-            if previous is None or (failed and not previous[0]):
-                if previous:
-                    self._remove(previous[1], now)
-                self.quality_latest[key] = failed, self._add(row, "quality", now)
+            # Failure-dominant representative selection, preserved per context.
+            if state["representative"] is None or (failed and not state["failed"]):
+                state["representative"], state["failed"] = row, failed
+            if changed:
+                # A new or lower explicit grade applies to every context version
+                # of the assignment, but only from this batch onward.
+                for item in case_state["contexts"].values():
+                    self._rescore_quality(item, case_state, now)
+            else:
+                self._rescore_quality(state, case_state, now)
         # Costs have a separate tie rule: latest timestamp, then greatest total,
         # then ID. A labelled total always takes priority over partial spending.
         for row in sorted(batch, key=lambda r: (r.get("cost_usd") if r.get("cost_usd") is not None else -1., r["id"])):
@@ -445,13 +545,18 @@ the executor actually observed, without simulating a routing policy.
 Forecasts retain their original timestamp/probability. Their reported targets
 and costs are corrected retrospectively using events known by the evaluation
 cutoff. Training incorporates each correction only at its observed timestamp,
-so a later failure cannot influence an earlier forecast.
+so a later failure cannot influence an earlier forecast. Reported targets and
+graded quality use the assignment's quality identity, which excludes the
+provenance-only ``context_version``; probabilities, matched evidence and costs
+keep their original exact-context identity.
 """
     config, now = validate_config(config), _timestamp(now)
     all_rows = sorted((r for r in _canonical_observations(observations) if r["observed_at"] <= now),
                       key=lambda r: (r["observed_at"], r["outcome"] == "accepted", r["id"]))
     rows = list(_case_outcomes(all_rows, now, corrections=False))
-    targets = {_case_key(row): row for row in _case_outcomes(all_rows, now)}
+    targets = {_quality_case_key(row): row
+               for row in _case_outcomes(all_rows, now, key=_quality_case_key)}
+    cases = _graded_cases(all_rows, now)
     totals = {_case_key(row): row for row in _cost_outcomes(all_rows, now)}
     # Group globally by case, even if a source mirror or later execution context
     # would otherwise create a distinct posterior observation.
@@ -477,24 +582,37 @@ so a later failure cannot influence an earlier forecast.
                 forecasts[cache_key] = evidence.forecast(row["features"], excluded_case, timestamp)
             prediction = forecasts[cache_key]
             probability = prediction["posterior"]["mean"]
-            target = targets[_case_key(row)]
+            target = targets[_quality_case_key(row)]
+            resolved = routing_quality.case_quality(cases.get(_quality_case_key(row), (target,)))
+            if resolved["kind"] == "explicit":
+                quality_score = resolved["score"]
+            elif resolved["kind"] == "neutral":
+                quality_score = None
+            else:
+                quality_score = routing_quality.legacy_score(target["outcome"])
             predictions.append({"id": row["id"], "case_id": row["case_id"],
                                 "observed_at": row["observed_at"], "probability": probability,
                                 "observed_action": row["action"],
                                 "economics": prediction["economics"],
                                 "outcome": target["outcome"], "outcome_id": target["id"],
-                                "outcome_observed_at": target["observed_at"]})
+                                "outcome_observed_at": target["observed_at"],
+                                "quality_score": quality_score, "quality_kind": resolved["kind"]})
             observed_rows.append(dict(row, outcome=target["outcome"],
                                       cost_usd=totals[_case_key(row)].get("cost_usd")))
         evidence.learn(batch, timestamp)
     scored = [p for p in predictions if p["observed_action"] == "worker"]
+    # Neutral explicit quality supplies no success or failure mass and is
+    # excluded from the scoring metrics; legacy rows keep the binary target.
+    graded = [p for p in scored if p["quality_score"] is not None]
     bins = [[] for _ in range(10)]
     brier, loss = [], []
-    for prediction in scored:
-        p, y = prediction["probability"], int(prediction["outcome"] == "accepted")
+    for prediction in graded:
+        p, y = prediction["probability"], prediction["quality_score"]
         brier.append((p - y) ** 2)
         bounded = max(1e-15, min(1. - 1e-15, p))
-        loss.append(-math.log(bounded) if y else -math.log1p(-bounded))
+        # Fractional rubric credit uses the same cross-entropy as the binary
+        # legacy rule, which it reproduces exactly at y in {0, 1}.
+        loss.append(-(y * math.log(bounded) + (1. - y) * math.log1p(-bounded)))
         bins[min(9, int(p * 10))].append((p, y))
     calibration = [{"lower": i / 10, "upper": (i + 1) / 10, "count": len(bucket),
                     "mean_probability": math.fsum(p for p, _ in bucket) / len(bucket) if bucket else None,
@@ -513,9 +631,17 @@ so a later failure cannot influence an earlier forecast.
             "total_cost_usd": math.fsum(costs),
             "mean_cost_usd": math.fsum(c / len(costs) for c in costs) if costs else None,
         }
+    quality_cases = {
+        "explicit": sum(p["quality_kind"] == "explicit" for p in scored),
+        "legacy": sum(p["quality_kind"] == "legacy" for p in scored),
+        "neutral": sum(p["quality_kind"] == "neutral" for p in scored),
+        "clean_first_pass": sum(p["outcome"] == "accepted" for p in scored),
+        "scored": len(graded),
+    }
     return {"evaluated_cases": len(scored), "observed_cases": len(predictions),
-            "brier_score": math.fsum(brier) / len(scored) if scored else None,
-            "log_loss": math.fsum(loss) / len(scored) if scored else None,
+            "brier_score": math.fsum(brier) / len(graded) if graded else None,
+            "log_loss": math.fsum(loss) / len(graded) if graded else None,
             "calibration": calibration,
             "observed_outcomes": observed_outcomes,
+            "quality_cases": quality_cases,
             "predictions": predictions}

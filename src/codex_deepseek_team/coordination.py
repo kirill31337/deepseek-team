@@ -21,13 +21,14 @@ import tempfile
 import time
 from typing import Any
 
-from . import scope_matching, settings
+from . import lessons, scope_matching, settings
 from . import verification
 from .config import sync_directory
 from .effort import DEFAULT_EFFORT, normalize_effort, normalize_policy_effort
 from .native_delegation import validate_native_exception
 from .routing import RoutingService
-from .routing_models import RoutingError, fingerprint, number, validate_features
+from .routing_models import (RoutingError, fingerprint, number, validate_features,
+                            validate_quality)
 
 WORKER_WRITE_KINDS = {"implementation", "test", "fixture", "documentation", "metadata"}
 WORKER_READ_KINDS = {"review", "research", "diagnostic", "test_plan"}
@@ -38,6 +39,13 @@ PROTECTED_COORDINATOR_KINDS = {
 TECHNICAL_RETENTION = {
     "runner_unavailable", "dependency_unavailable", "environment_incompatible",
 }
+# Bounded execution evidence accepted by :func:`assignment_started`. Unknown keys
+# are rejected so a raw prompt, credential or model output can never be stored by
+# accident; ``prompt_sha256`` is validated as a digest on purpose.
+EXECUTION_CONTEXT_KEYS = ("prompt_sha256", "prompt_brief", "base_head", "git_digest",
+                          "prepared_fingerprints", "model")
+LESSONS_EVIDENCE_LIMIT = 4000
+OUTCOME_CONTEXT_LIMIT = 512 * 1024
 # Optional plan metadata that also becomes part of a deliverable's identity, so an
 # accepted or started scope cannot silently change by replanning. They stay
 # optional: read-only protected plans do not need a mutation authorization.
@@ -863,9 +871,339 @@ def assignment_queue_state(root: Path, task_id: str, assignment_id: str, state: 
         _atomic(_task_path(root, task_id), task)
 
 
+def _lessons_guard(action, *, code: int = 64):
+    """Run one lessons service call, converting its errors to coordination errors."""
+    try:
+        return action()
+    except lessons.LessonError as error:
+        raise CoordinationError(str(error), code) from None
+
+
+def _bounded_snapshot_value(value, *, depth: int = 4, text: int = 400, items: int = 50):
+    """Deep-copy JSON-ish evidence with hard per-level bounds."""
+    if isinstance(value, str):
+        return value[:text]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if depth <= 0:
+        return None
+    if isinstance(value, dict):
+        bounded = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= 20:
+                break
+            bounded[str(key)[:80]] = _bounded_snapshot_value(
+                item, depth=depth - 1, text=text, items=items)
+        return bounded
+    if isinstance(value, (list, tuple)):
+        return [_bounded_snapshot_value(item, depth=depth - 1, text=text, items=items)
+                for item in list(value)[:items]]
+    return str(value)[:text]
+
+
+def _context_bytes(value) -> int:
+    try:
+        return len(json.dumps(value, sort_keys=True, separators=(",", ":"),
+                              ensure_ascii=True, allow_nan=False, default=str).encode("utf-8"))
+    except (TypeError, ValueError, RecursionError):
+        raise CoordinationError("Outcome context must be JSON serializable.", 64) from None
+
+
+def _bounded_outcome_context(context: dict, limit: int = OUTCOME_CONTEXT_LIMIT) -> dict:
+    """Keep one outcome event inside the lessons context budget.
+
+    Rule content is preserved whenever it fits; only a pathological ruleset is
+    compacted to ids/when/trimmed text and explicitly flagged as truncated.
+    """
+    if _context_bytes(context) <= limit:
+        return context
+    context = dict(context)
+    block = dict(context.get("lessons") or {})
+    rules = []
+    for rule in block.get("rules") or []:
+        if not isinstance(rule, dict):
+            continue
+        rules.append({
+            "id": str(rule.get("id"))[:lessons.MAX_IDENTIFIER],
+            "when": _bounded_snapshot_value(rule.get("when") or {}, depth=2, text=120, items=10),
+            "condition": str(rule.get("condition"))[:200],
+            "action": str(rule.get("action"))[:200],
+            "evidence": [str(case)[:2 * lessons.MAX_IDENTIFIER + 1]
+                         for case in (rule.get("evidence") or [])][:lessons.MAX_EVIDENCE_CASES],
+        })
+    block["rules"] = rules
+    block["rules_truncated"] = True
+    context["lessons"] = block
+    if _context_bytes(context) > limit:
+        raise CoordinationError("Outcome context exceeds the lessons context budget.", 64)
+    return context
+
+
+def _execution_inputs(execution) -> dict:
+    """Validate optional bounded pre-execution evidence supplied by the runner."""
+    if execution is None:
+        return {}
+    if not isinstance(execution, dict):
+        raise CoordinationError("Execution context must be an object.", 64)
+    unknown = sorted(set(execution) - set(EXECUTION_CONTEXT_KEYS))
+    if unknown:
+        raise CoordinationError(
+            "Execution context allows only " + ", ".join(EXECUTION_CONTEXT_KEYS) + ".", 64)
+    value = {}
+    digest = execution.get("prompt_sha256")
+    if digest is not None:
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise CoordinationError(
+                "prompt_sha256 must be the lowercase SHA-256 digest of the task prompt.", 64)
+        value["prompt_sha256"] = digest
+    brief = execution.get("prompt_brief")
+    if brief is not None:
+        if not isinstance(brief, str) or "\x00" in brief:
+            raise CoordinationError("prompt_brief must be bounded text without NUL bytes.", 64)
+        value["prompt_brief"] = brief[:600]
+    for key in ("base_head", "git_digest", "model"):
+        item = execution.get(key)
+        if item is None:
+            continue
+        if (not isinstance(item, str) or not item.strip() or len(item) > 128
+                or "\x00" in item):
+            raise CoordinationError(f"{key} must be a bounded non-empty string.", 64)
+        value[key] = item
+    fingerprints = execution.get("prepared_fingerprints")
+    if fingerprints is not None:
+        if not isinstance(fingerprints, dict):
+            raise CoordinationError("prepared_fingerprints must be an object.", 64)
+        bounded = {}
+        for name, fingerprint in list(fingerprints.items())[:200]:
+            if (not isinstance(name, str) or not name or len(name) > 300 or "\x00" in name
+                    or not isinstance(fingerprint, str) or not fingerprint
+                    or len(fingerprint) > 128):
+                raise CoordinationError(
+                    "prepared_fingerprints entries must be bounded strings.", 64)
+            bounded[name] = fingerprint
+        value["prepared_fingerprints"] = bounded
+    return value
+
+
+def _declared_features(item) -> dict:
+    return dict(item.get("features")) if isinstance(item.get("features"), dict) else {}
+
+
+def _actual_features(item, runtime, effort, execution_inputs) -> dict:
+    features = {"kind": item.get("kind")}
+    features.update(_declared_features(item))
+    features["runtime"] = runtime
+    features["effort"] = effort or DEFAULT_EFFORT
+    if execution_inputs.get("model"):
+        features["model"] = execution_inputs["model"]
+    return features
+
+
+def _lessons_rules_block(snapshot) -> dict:
+    """Preserve the exact validated rule snapshot inside the outcome context.
+
+    The lessons service already caps rule identifiers, evidence case references
+    and text at its own contract limits; those exact limits are reused here so a
+    valid identifier or evidence reference is never silently altered. Larger
+    values can only come from a malformed store and stay bounded.
+    """
+    rules = []
+    for rule in snapshot.get("rules") or []:
+        if not isinstance(rule, dict):
+            continue
+        rules.append({
+            "id": str(rule.get("id"))[:lessons.MAX_IDENTIFIER],
+            "when": _bounded_snapshot_value(rule.get("when") or {}, depth=2, text=120, items=10),
+            "condition": str(rule.get("condition") or "")[:lessons.MAX_TEXT],
+            "action": str(rule.get("action") or "")[:lessons.MAX_TEXT],
+            "evidence": [str(case)[:2 * lessons.MAX_IDENTIFIER + 1]
+                         for case in (rule.get("evidence") or [])][:lessons.MAX_EVIDENCE_CASES],
+        })
+    return rules
+
+
+def _unknown_lessons_block() -> dict:
+    return {"version": None, "rule_ids": [], "rules": [], "captured": False,
+            "note": "unknown: this outcome predates pre-execution lesson snapshots"}
+
+
+def _deliverable_snapshot(item) -> dict:
+    declared = _declared_features(item)
+    return {"id": item.get("id"), "kind": item.get("kind"),
+            "scope": _bounded_snapshot_value(item.get("scope") or [], text=300, items=200),
+            "acceptance": _bounded_snapshot_value(item.get("acceptance") or []),
+            "dependencies": _bounded_snapshot_value(item.get("dependencies") or []),
+            "checks": _bounded_snapshot_value(item.get("checks") or []),
+            "features": _bounded_snapshot_value(declared) if declared else None}
+
+
+def _execution_snapshot(root: Path, task: dict, item: dict, workspace_id: str, runtime: str,
+                        prepared_changes, effort: str | None, execution, *,
+                        started_at: float) -> dict:
+    """Capture the immutable pre-execution context of one attempt.
+
+    Records the original deliverable, actual runtime/effort, source/workspace and
+    prepared evidence, and the advisory rules selected before execution. Missing
+    values stay ``None``/unknown instead of being filled in from later state.
+    """
+    inputs = _execution_inputs(execution)
+    matching = _actual_features(item, runtime, effort, inputs)
+    snapshot = _lessons_guard(lambda: lessons.snapshot(root, matching))
+    execution_block = {
+        "workspace_id": workspace_id,
+        "runtime": runtime,
+        "effort": matching["effort"],
+        "model": matching.get("model"),
+        "source_head": task.get("base_head"),
+        "base_head": inputs.get("base_head"),
+        "git_digest": inputs.get("git_digest"),
+        "prepared_changes": sorted(set(str(name)[:300] for name in prepared_changes))[:200],
+        "prepared_fingerprints": inputs.get("prepared_fingerprints") or {},
+        "prompt_sha256": inputs.get("prompt_sha256"),
+        "prompt_brief": inputs.get("prompt_brief"),
+        "started_at": started_at,
+    }
+    return {
+        "deliverable": _deliverable_snapshot(item),
+        "features": _bounded_snapshot_value(matching, text=200, items=50),
+        "execution": execution_block,
+        "lessons": {"version": snapshot["version"], "rule_ids": list(snapshot["rule_ids"]),
+                    "rules": _lessons_rules_block(snapshot), "captured": True,
+                    "advisory": True},
+    }
+
+
+def _changes_patch_reference(workspace_id):
+    """Return a private reference to a retained change patch, or None when unknown."""
+    if not isinstance(workspace_id, str) or re.fullmatch(r"[0-9a-f]{32}", workspace_id) is None:
+        return None
+    from . import workspace as workspace_module
+    try:
+        copy = workspace_module.load(_state_root(), workspace_id)
+    except (workspace_module.WorkspaceError, OSError):
+        return None
+    try:
+        descriptor = os.open(copy.path.parent / "changes.patch",
+                             os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(descriptor)
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600):
+            return None
+        digest = hashlib.sha256()
+        size = 0
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            digest.update(chunk)
+    except OSError:
+        return None
+    finally:
+        os.close(descriptor)
+    return {"file": "changes.patch", "workspace_id": workspace_id,
+            "sha256": digest.hexdigest(), "bytes": size}
+
+
+def _outcome_context(task: dict, row: dict, item: dict, disposition: str,
+                     quality: dict | None = None) -> dict:
+    """Assemble one idempotent outcome context from the stored attempt snapshot.
+
+    An explicit graded assessment is part of the context, so the lessons event
+    key changes exactly when the assessment changes: an exact replay stays
+    idempotent while a corrected assessment is appended as its own event.
+    """
+    snapshot = row.get("execution_snapshot")
+    if isinstance(snapshot, dict):
+        deliverable = snapshot.get("deliverable") or _deliverable_snapshot(item)
+        features = dict(snapshot.get("features") or {})
+        if not features:
+            features = _actual_features(item, row.get("runtime") or "unknown",
+                                        row.get("effort"), {})
+        execution = dict(snapshot.get("execution") or {})
+        lessons_block = dict(snapshot.get("lessons") or {}) or _unknown_lessons_block()
+    else:
+        deliverable = _deliverable_snapshot(item)
+        features = _actual_features(item, row.get("runtime") or "unknown",
+                                    row.get("effort"), {})
+        execution = {
+            "workspace_id": row.get("workspace_id"),
+            "runtime": row.get("runtime"),
+            "effort": row.get("effort"),
+            "model": None,
+            "source_head": task.get("base_head"),
+            "base_head": None,
+            "git_digest": None,
+            "prepared_changes": sorted(set(row.get("prepared_changes") or [])),
+            "prepared_fingerprints": {},
+            "prompt_sha256": None,
+            "prompt_brief": None,
+            "started_at": row.get("started_at"),
+        }
+        lessons_block = _unknown_lessons_block()
+    execution.update(
+        finished_at=row.get("finished_at"),
+        error_kind=row.get("error_kind"),
+        exit_code=row.get("exit_code"),
+        result_summary=_bounded_snapshot_value(row.get("result_summary")),
+        checks=_bounded_snapshot_value(list(row.get("checks") or [])),
+        worker_changes=_bounded_snapshot_value(list(row.get("worker_changes") or []),
+                                               text=300, items=200),
+        changes_patch=_changes_patch_reference(row.get("workspace_id")),
+    )
+    context = {
+        "disposition": disposition,
+        "features": features,
+        "deliverable": deliverable,
+        "execution": execution,
+        "lessons": lessons_block,
+    }
+    if quality is not None:
+        context["quality"] = quality
+    return _bounded_outcome_context(context)
+
+
+def sync_lessons_feedback(root: Path, task_id: str) -> None:
+    """Replay the durable lessons outbox; SQLite event keys deduplicate replay."""
+    with _lock(root):
+        task = load_task(root, task_id)
+        changed = False
+        for owner in [*task.get("assignments", []), *task.get("deliverables", [])]:
+            for entry in owner.get("lessons_feedback", []):
+                if not isinstance(entry, dict) or entry.get("recorded"):
+                    continue
+                event = entry.get("event")
+                if not isinstance(event, dict) or set(event) != {
+                        "task_id", "assignment_id", "disposition", "evidence", "context", "rework"}:
+                    raise CoordinationError(
+                        "Unrecorded lessons feedback is malformed; inspect the task ledger.", 78)
+                _lessons_guard(lambda event=event: lessons.record_outcome(
+                    root, task_id=event["task_id"], assignment_id=event["assignment_id"],
+                    disposition=event["disposition"], evidence=event["evidence"],
+                    context=event["context"], rework=event.get("rework")))
+                entry["recorded"] = True
+                changed = True
+        if changed:
+            _atomic(_task_path(root, task_id), task)
+
+
 def assignment_started(root: Path, task_id: str, assignment_id: str,
                        workspace_id: str, runtime: str,
-                       prepared_changes: list[str], effort: str | None = None) -> dict:
+                       prepared_changes: list[str], effort: str | None = None,
+                       execution: dict | None = None) -> dict:
+    """Start one attempt and snapshot its original context before execution.
+
+    ``execution`` is optional, bounded pre-execution evidence supplied by the
+    managed runner: the prompt digest and a redacted bounded brief, workspace
+    base head/digest, prepared content fingerprints and the actual model. Unknown
+    keys are rejected so raw prompts, credentials or model output can never be
+    stored here. A resume of the same running attempt keeps its original
+    snapshot; a failed explicit continuation keeps the earlier snapshot in
+    ``attempt_history``.
+    """
     if effort is not None:
         canonical_effort = normalize_effort(effort)
         if canonical_effort is None:
@@ -909,7 +1247,8 @@ def assignment_started(root: Path, task_id: str, assignment_id: str,
             history = row.setdefault('attempt_history', [])
             history.append({key: row.get(key) for key in ('status', 'workspace_id', 'runtime', 'effort',
                 'started_at', 'finished_at', 'checks', 'disposition', 'error_kind', 'exit_code',
-                'failure_stage', 'preparation_cause', 'routing_features', 'routing_decision_id')})
+                'failure_stage', 'preparation_cause', 'routing_features', 'routing_decision_id',
+                'execution_snapshot', 'worker_changes', 'result_summary')})
         if item.get('features'):
             declared = validate_features(item['features'])
             features = validate_features(dict(item['features'], runtime=runtime,
@@ -927,10 +1266,14 @@ def assignment_started(root: Path, task_id: str, assignment_id: str,
                 raise CoordinationError(error.message, error.code) from None
             row['routing_features'] = features
             row['routing_decision_id'] = decision['id']
+        now = time.time()
+        snapshot = _execution_snapshot(root, task, item, workspace_id, runtime,
+                                       prepared_changes, effort, execution, started_at=now)
         row.update(status="running", workspace_id=workspace_id, runtime=runtime,
                    effort=effort, prepared_changes=sorted(set(prepared_changes)),
-                   started_at=time.time(), disposition=None, error_kind=None, exit_code=None,
-                   failure_stage=None, preparation_cause=None, queue_state='running')
+                   started_at=now, disposition=None, error_kind=None, exit_code=None,
+                   failure_stage=None, preparation_cause=None, queue_state='running',
+                   execution_snapshot=snapshot)
         task.update(status="active", updated_at=time.time())
         _atomic(_task_path(root, task_id), task)
         return task
@@ -1041,31 +1384,76 @@ def assignment_preparation_failed(root: Path, task_id: str, assignment_id: str,
 
 
 def use_result(root: Path, task_id: str, assignment_id: str,
-               disposition: str, evidence: str, *, cost_usd: float | None = None) -> dict:
+               disposition: str, evidence: str, *, cost_usd: float | None = None,
+               rework: dict | None = None, quality: dict | None = None) -> dict:
+    """Record the coordinator disposition and queue its durable lessons event.
+
+    ``rework`` is validated by the lessons service and ``quality`` by the closed
+    routing assessment contract before any ledger mutation. An attached
+    structured correction is still not a clean result when the outer disposition
+    is ``incorporated``/``reproduced``: the routing observation is recorded as
+    operational ``rework`` and the service counts that case as rework. An
+    explicit assessment replaces the case's legacy binary inference, so an
+    explicit ``met`` still earns full quality credit after a corrected result.
+    Older compilations without ``rework``/``quality`` stay explicitly unknown;
+    provider/environment/cancelled outcomes stay neutral even with an attached
+    assessment. Both events are written to durable outboxes in the same atomic
+    ledger update and replayed idempotently afterwards, so a crash between the
+    stores cannot lose or duplicate one.
+    """
     if disposition not in ("incorporated", "reproduced", "rejected", "needs-rework"):
         raise CoordinationError("Invalid result disposition.", 64)
     if not evidence.strip():
         raise CoordinationError("Result disposition requires evidence.", 64)
+    try:
+        rework = lessons.validate_rework(rework)
+    except lessons.LessonError as error:
+        raise CoordinationError(str(error), 64) from None
+    try:
+        quality = validate_quality(quality)
+    except RoutingError as error:
+        raise CoordinationError(error.message, error.code) from None
+    if cost_usd is not None:
+        try:
+            number(cost_usd, "cost_usd")
+        except RoutingError as error:
+            raise CoordinationError(error.message, error.code) from None
+    recorded_evidence = evidence[:LESSONS_EVIDENCE_LIMIT]
     with _lock(root):
         task = load_task(root, task_id)
         row = _assignment(task, assignment_id)
         if row.get("status") not in ("succeeded", "failed"):
             raise CoordinationError("Cannot disposition an unfinished assignment.", 64)
+        item = assignment_deliverable(task, assignment_id)
+        context = _outcome_context(task, row, item, disposition, quality=quality)
         row["disposition"] = {"kind": disposition, "evidence": evidence[:2000],
                               "at": time.time()}
+        row.setdefault("lessons_feedback", []).append({
+            "event": {"task_id": task_id, "assignment_id": assignment_id,
+                      "disposition": disposition, "evidence": recorded_evidence,
+                      "context": context, "rework": rework},
+            "recorded": False,
+        })
         if row.get('routing_features'):
             outcome = {'incorporated': 'accepted', 'reproduced': 'accepted',
                        'rejected': 'rejected', 'needs-rework': 'rework'}[disposition]
+            # A structured correction on an accepted disposition is an
+            # operational rework: it was incorporated but needed correction.
+            # An explicit graded assessment still replaces this legacy binary
+            # inference, so an explicit ``met`` keeps full quality credit.
+            if rework is not None and outcome == 'accepted':
+                outcome = 'rework'
             if row.get('error_kind') in ('provider', 'environment'):
                 outcome = 'infrastructure'
             elif row.get('error_kind') == 'cancelled':
                 outcome = 'cancelled'
             _queue_feedback(task, row, action='worker', outcome=outcome, cost_usd=cost_usd,
                             features=row['routing_features'], decision_id=row.get('routing_decision_id'),
-                            started_at=row.get('started_at', task['created_at']))
+                            started_at=row.get('started_at', task['created_at']), quality=quality)
         task["updated_at"] = time.time()
         _atomic(_task_path(root, task_id), task)
     sync_routing_feedback(root, task_id)
+    sync_lessons_feedback(root, task_id)
     return load_task(root, task_id)
 
 
@@ -1096,20 +1484,34 @@ def abandon_assignment(root: Path, task_id: str, assignment_id: str,
         raise CoordinationError(error.message, error.code) from None
 
 
-def _queue_feedback(task, owner, *, action, outcome, cost_usd, features, decision_id, started_at):
+def _queue_feedback(task, owner, *, action, outcome, cost_usd, features, decision_id, started_at,
+                    quality=None):
+    """Append one durable routing observation, deduplicating an exact retry.
+
+    A legacy caller that omits ``quality`` keeps the original observation shape
+    without a ``quality`` key so stored fingerprints stay compatible. A changed
+    assessment is a distinct event: the previous observation is preserved and a
+    new one is appended, so an earlier explicit grade can never be silently
+    replaced by a later one.
+    """
     try:
         cost = None if cost_usd is None else number(cost_usd, 'cost_usd')
     except RoutingError as error:
         raise CoordinationError(error.message, error.code) from None
     events = owner.setdefault('routing_feedback', [])
-    if events and events[-1]['observation']['outcome'] == outcome and events[-1]['observation']['cost_usd'] == cost:
-        return
+    if events:
+        previous = events[-1].get('observation') or {}
+        if (previous.get('outcome') == outcome and previous.get('cost_usd') == cost
+                and previous.get('quality') == quality):
+            return
     now = time.time()
     case_id = fingerprint([task['id'], owner['id']])
     observation = {'id': f'feedback-{case_id[:32]}-{len(events)}', 'case_id': case_id,
                    'origin': 'local', 'features': features, 'action': action, 'outcome': outcome,
                    'observed_at': now, 'cost_usd': cost, 'duration_seconds': max(0., now - started_at),
                    'decision_id': decision_id}
+    if quality is not None:
+        observation['quality'] = quality
     events.append({'observation': observation, 'recorded': False})
 
 

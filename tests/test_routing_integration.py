@@ -8,7 +8,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from codex_deepseek_team import activation, coordination, settings
+from codex_deepseek_team import activation, coordination, routing_stats, settings
 from codex_deepseek_team.routing import RoutingService
 
 
@@ -206,6 +206,38 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(len(self.service.observations()), 1)
         saved = coordination.load_task(self.root, task['id'])
         self.assertTrue(saved['assignments'][0]['routing_feedback'][0]['recorded'])
+
+    def test_two_assignments_in_one_user_task_teach_two_cases_after_rework(self):
+        self.enable_auto()
+        task = self.task()
+        deliverables = [dict(id=name, kind='implementation', executor='auto',
+            scope=[f'src/{name}.py'], acceptance=['Declared check passes'],
+            checks=['python3 -V'], dependencies=[], features=self.features)
+            for name in ('first', 'second')]
+        plan = coordination.plan_task(self.root, task['id'],
+            dict(classification='substantial', deliverables=deliverables))
+        self.assertEqual(len(plan['assignments']), 2)
+        for index, assignment in enumerate(plan['assignments']):
+            aid = assignment['id']
+            coordination.assignment_started(self.root, task['id'], aid, f'ws-{index}',
+                                             'codex', [], effort='high')
+            coordination.assignment_finished(self.root, task['id'], aid, 'succeeded',
+                                               'Result ready', [], [])
+            if index:
+                coordination.use_result(self.root, task['id'], aid, 'needs-rework',
+                                        'Coordinator reproduced a defect')
+            coordination.use_result(self.root, task['id'], aid, 'incorporated',
+                                    'Final result verified')
+        observations = self.service.observations()
+        self.assertEqual(len(observations), 3)
+        self.assertEqual(len({row['case_id'] for row in observations}), 2)
+        quality = self.service.predict(self.features, record=False)['quality']
+        self.assertEqual(quality['posterior']['matched_local'], 2)
+        self.assertAlmostEqual(quality['posterior']['local_failure_effective'], 1., places=3)
+        self.assertFalse(quality['sufficient'])
+        summary = routing_stats.summarize(observations, self.service.config())
+        item = summary['categories'][0]
+        self.assertEqual((item['cases'], item['accepted'], item['rework']), (2, 1, 1))
 
     def test_coordinator_feedback_freezes_scope_and_survives_replan(self):
         task = self.manual_task()
@@ -547,6 +579,9 @@ else:
 
     def test_quality_cooldown_expires_without_erasing_failure_history(self):
         self.enable_auto()
+        # This case isolates the short failure cooldown: the learned-quality veto
+        # requires more effective local cases than this history provides.
+        self.service.configure({'quality_min_evidence': 100.})
         now = time.time()
         for index in range(30):
             self.service.observe(dict(id=f'failure-{index}', case_id=f'failed-case-{index}',
@@ -584,6 +619,77 @@ else:
         self.assertEqual(self.plan(self.task(turn='no-checks'), checks=[])['deliverables'][0]['executor'], 'coordinator')
         self.assertEqual(self.plan(self.task(turn='high-risk'), features={**self.features, 'risk': 'high'})['deliverables'][0]['executor'], 'coordinator')
         self.assertEqual(self.service.observations(), [])
+
+    def test_learned_quality_retains_auto_work_while_manual_profile_keeps_priority(self):
+        self.enable_auto()
+        now = time.time()
+        for index in range(12):
+            self.service.observe(dict(id=f'poor-{index}', case_id=f'poor-case-{index}',
+                origin='local', features=self.features, action='worker', outcome='rework',
+                observed_at=now - 7200))
+        retained = self.plan(self.task())
+        self.assertEqual(retained['deliverables'][0]['executor'], 'coordinator')
+        self.assertIn('learned_quality_below_threshold',
+                      retained['deliverables'][0]['routing']['reason_codes'])
+        decision = self.service.decision(retained['deliverables'][0]['routing']['decision_id'])
+        self.assertTrue(decision['quality']['sufficient'])
+        self.assertTrue(decision['quality']['veto'])
+        self.assertLess(decision['quality']['posterior']['upper'], .7)
+        # An explicit manual 25/50/75 choice still keeps its executor and starts.
+        manual = self.manual_task(turn='manual-priority')
+        planned = self.plan(manual, 'worker')
+        self.assertEqual(planned['deliverables'][0]['executor'], 'worker')
+        self.assertEqual(len(planned['assignments']), 1)
+        coordination.assignment_started(self.root, manual['id'], planned['assignments'][0]['id'],
+                                         'ws', 'codex', [], effort='medium')
+        self.assertEqual(coordination.load_task(self.root, manual['id'])['assignments'][0]['status'],
+                         'running')
+
+    def test_learned_quality_recovers_through_aging_and_new_results_replenish_it(self):
+        self.enable_auto()
+        now = time.time()
+        for index in range(12):
+            self.service.observe(dict(id=f'old-{index}', case_id=f'old-case-{index}',
+                origin='local', features=self.features, action='worker', outcome='rework',
+                observed_at=now - 3600))
+        blocked = self.plan(self.task(turn='before-aging'))
+        self.assertEqual(blocked['deliverables'][0]['executor'], 'coordinator')
+        self.service.configure({'max_evidence_age_days': 1.})
+        with patch('codex_deepseek_team.routing.time.time', return_value=now + 2 * 86400):
+            recovered = self.plan(self.task(turn='aged-out'))
+        self.assertEqual(recovered['deliverables'][0]['executor'], 'worker')
+        self.assertIn('immediate_eligible', recovered['deliverables'][0]['routing']['reason_codes'])
+        for index in range(12):
+            self.service.observe(dict(id=f'new-{index}', case_id=f'new-case-{index}',
+                origin='local', features=self.features, action='worker', outcome='rework',
+                observed_at=now - 3600))
+        replenished = self.plan(self.task(turn='replenished'))
+        self.assertEqual(replenished['deliverables'][0]['executor'], 'coordinator')
+        self.assertIn('learned_quality_below_threshold',
+                      replenished['deliverables'][0]['routing']['reason_codes'])
+
+    def test_queued_auto_start_rechecks_learned_quality_without_mutating_plan(self):
+        self.enable_auto()
+        task = self.task()
+        plan = self.plan(task)
+        self.assertEqual(plan['deliverables'][0]['executor'], 'worker')
+        aid = plan['assignments'][0]['id']
+        decision_id = plan['deliverables'][0]['routing']['decision_id']
+        decision = self.service.decision(decision_id)
+        self.assertFalse(decision['quality']['veto'])
+        now = time.time()
+        for index in range(12):
+            self.service.observe(dict(id=f'late-{index}', case_id=f'late-case-{index}',
+                origin='local', features=self.features, action='worker', outcome='rework',
+                observed_at=now - 7200))
+        with self.assertRaisesRegex(coordination.CoordinationError, 'quality'):
+            coordination.assignment_started(self.root, task['id'], aid, 'ws', 'codex', [],
+                                             effort='medium')
+        self.assertEqual(coordination.load_task(self.root, task['id']), plan)
+        self.assertEqual(self.service.decision(decision_id), decision)
+        other_family = self.plan(self.task(turn='other-family'),
+                                 features={**self.features, 'domain': 'rust'})
+        self.assertEqual(other_family['deliverables'][0]['executor'], 'worker')
 
 
 if __name__ == '__main__':

@@ -5,7 +5,17 @@ from pathlib import Path
 import sys
 import subprocess
 
-from . import project, settings, workspace
+from . import lessons, project, settings, workspace
+
+
+def _lessons_guidance(root):
+    """Read-only root-specific advisory guidance; never hides instructions on error."""
+    if root is None:
+        return ''
+    try:
+        return lessons.render_guidance(root)
+    except lessons.LessonError as error:
+        return 'Delegation lessons state is unavailable: ' + str(error)
 
 
 def policy_options(parser):
@@ -136,6 +146,10 @@ def main(argv):
                 print(settings.describe(policy))
                 if getattr(args, 'instructions', False):
                     print(settings.instructions(policy, args.runtime))
+                    if policy.enabled:
+                        guidance = _lessons_guidance(root)
+                        if guidance:
+                            print(guidance)
         else:
             if args.command == 'check':
                 report = workspace.check_source(args.path)

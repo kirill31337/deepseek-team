@@ -8,7 +8,7 @@ import io
 import time
 import uuid
 
-from . import routing_admission, routing_estimator, settings
+from . import routing_admission, routing_estimator, routing_learning, settings
 from .routing_models import (RoutingError, WRITE_KINDS, canonical, fingerprint, identifier, read_json,
                              number, validate_config, validate_features, validate_observation)
 from .routing_store import RoutingStore, evidence_keys
@@ -125,8 +125,8 @@ class RoutingService:
                 previous = routing_admission.bound_decision(db, binding, features)
                 if previous is not None:
                     return previous
-            decision = routing_estimator.forecast(features, self.store.all(db, 'observations'),
-                                                   config, now=now)
+            observations = self.store.all(db, 'observations')
+            decision = routing_estimator.forecast(features, observations, config, now=now)
             reason = routing_admission.ineligible_reason(features, access)
             if not policy.enabled or config['mode'] == 'off':
                 reason = 'routing_disabled'
@@ -136,6 +136,10 @@ class RoutingService:
                 reason = reason or 'quality_failure_cooldown'
             if routing_admission.economic_veto(decision, config):
                 reason = reason or 'insufficient_measured_savings'
+            quality = routing_learning.assess_quality(features, observations, config, now=now)
+            if reason is None and policy.adaptive and policy.enabled and config['mode'] == 'auto' \
+                    and quality['veto']:
+                reason = 'learned_quality_below_threshold'
             decision['action'] = 'coordinator' if reason else 'worker'
             decision['reason_codes'] = [reason or 'immediate_eligible']
             evidence_ids = decision['posterior'].get('evidence_ids', [])
@@ -144,7 +148,8 @@ class RoutingService:
             decision.update(id='decision-' + uuid.uuid4().hex, created_at=now,
                             features=features, feature_hash=fingerprint(features),
                             config=config, mode=config['mode'], access=access,
-                            enabled=policy.enabled, algorithm_version=3, binding=binding)
+                            enabled=policy.enabled, algorithm_version=3, binding=binding,
+                            quality=quality)
             if record:
                 self.store.put(db, 'decisions', decision['id'], decision)
                 if binding is not None:
@@ -212,16 +217,21 @@ class RoutingService:
                 raise RoutingError('Current access does not permit this queued writing assignment.', 78)
             if already_running:
                 return  # Reconcile the same owned workspace; do not create a new assignment.
-            if self._config(db)['mode'] != 'auto':
+            config = self._config(db)
+            if config['mode'] != 'auto':
                 raise RoutingError('Current routing mode does not permit a new automatic worker start.', 78)
             if decision['action'] != 'worker':
                 raise RoutingError('Recorded routing decision does not assign this work to a worker.', 78)
             if routing_admission.cooling(db, decision['features']):
                 raise RoutingError('Task family is in a quality failure cooldown; inspect and replan later.', 78)
-            forecast = routing_estimator.forecast(decision['features'], self.store.all(db, 'observations'),
-                                                  self._config(db))
-            if routing_admission.economic_veto(forecast, self._config(db)):
+            now = time.time()
+            observations = self.store.all(db, 'observations')
+            forecast = routing_estimator.forecast(decision['features'], observations, config, now=now)
+            if routing_admission.economic_veto(forecast, config):
                 raise RoutingError('Measured economics no longer support this queued assignment.', 78)
+            quality = routing_learning.assess_quality(decision['features'], observations, config, now=now)
+            if current.adaptive and quality['veto']:
+                raise RoutingError('Learned local quality evidence no longer supports this queued assignment.', 78)
 
     def status(self):
         with self._transaction() as db:

@@ -4,7 +4,7 @@
 
 DeepSeek Team can combine a bounded prior from imported public results with outcomes observed in the current project. Auto immediately admits eligible work while keeping statistical uncertainty visible. It stores routing state privately for each project and records explainable decisions. It does not fine-tune a model, promise a benchmark score, or treat a public leaderboard percentage as the probability of success on your code.
 
-Every command takes `--path PROJECT`. Commands return JSON so results can be inspected or passed to other tools. `status` reports the current state; `config --json` prints the effective routing configuration.
+Every command takes `--path PROJECT`. Most commands return JSON so results can be inspected or passed to other tools; `stats` shows a table by default and supports `--json`. `status` reports the current state; `config --json` prints the effective routing configuration.
 
 ```bash
 deepseek-team routing status --path /path/to/repository --json
@@ -19,7 +19,7 @@ Routing is not a trained neural classifier and not a fixed delegation percentage
 flowchart TD
     T[Task] --> C["Classifier: the coordinator fills a feature card before execution"]
     C --> E["Estimator: probability of acceptance without rework, with uncertainty"]
-    E --> S["Immediate admission: task criteria, access, cooldown and measured economics"]
+    E --> S["Admission: task criteria, access, cooldown, measured economics and learned local quality"]
     S --> R["Router: worker or coordinator, within access and admission rules"]
     R --> X["Execution, coordinator review and integration"]
     X --> O["Observed outcome and actual total cost"]
@@ -32,23 +32,44 @@ The frontier coordinator classifies each task itself, before any worker runs. It
 
 - `kind`, `domain` and `operation` define the comparable task family.
 - `localization` (`known`/`partial`/`unknown`), `coupling` (`local`/`component`/`cross-component`/`unknown`), `risk`, `scope_size`, `clarity` and `verification` describe the known scope.
-- `runtime`, `model`, `effort` and `context_version` identify the execution conditions, so results from one execution identity are not silently reused for another.
+- `runtime`, `model`, `effort` and `context_version` identify the execution conditions for the exact-context forecast. The separate local quality assessment pools task-specific `context_version` values, as described below.
 
 Unspecified task attributes such as domain, operation, risk and verification stay `unknown`; the coordinator should not guess them into certainty. Execution fields have documented defaults (`codex`, `deepseek-flash`, `high`, context `default`), where `effort` uses the concrete levels `low`/`high`/`max` and the legacy value `medium` is accepted as an alias of `high`; a plan supplies its kind and runtime. The coordinator must check these against the actual assignment. A case whose task family is unknown cannot transfer evidence to another task. Protected work stays with the coordinator: architecture, security, integration, final verification, commit/push, production and secret signing.
 
-### Estimator — acceptance without rework, with uncertainty
+### Estimator — graded quality with uncertainty
 
-From comparable recorded cases the estimator produces the probability that a worker result is accepted without rework, together with the uncertainty around that probability. It does not predict a universal delegation percentage.
+From comparable recorded cases the estimator produces a rubric-based quality estimate with uncertainty. It is not a calibrated probability of acceptance without rework. It does not predict a universal delegation percentage.
 
 A case counts only when its known `kind`, `domain`, `operation` and its execution identity (`runtime`, `model`, `effort`, `context_version`) match. The remaining traits — `localization`, `coupling`, `verification`, `clarity`, `risk`, `scope_size` — contribute similarity weights, so more matches mean more weight. As enough comparable local outcomes accumulate, they can outweigh the capped imported evidence, and every observation loses weight as it ages, with the same half-life for successes and failures. A later failure for the same case dominates an earlier acceptance, and repeated attempts at one case do not become independent successes. `infrastructure`, `cancelled` and `unknown` outcomes carry no quality label.
 
-The calculation uses two weighted counts: accepted worker results and quality failures. A Beta(1,1) prior starts the estimate without a preference for success or failure. Each comparable outcome adds weight to the appropriate count. The average estimate is `(1 + success weight) / (2 + success weight + failure weight)`; a probability interval expresses how much uncertainty remains. Few observations produce a broad interval, so one successful task is insufficient to establish reliability.
+The calculation uses two weighted counts: accepted worker results and quality failures. A Beta(1,1) prior starts the estimate without a preference for success or failure. A graded case contributes `weight × score` to success mass and `weight × (1 − score)` to failure mass; neutral cases contribute neither. Cases without explicit assessment keep the legacy binary contribution. The average estimate is `(1 + success weight) / (2 + success weight + failure weight)`; a probability interval expresses how much uncertainty remains. Few observations produce a broad interval, so one successful task is insufficient to establish reliability. This exact-context forecast is descriptive on its own; it does not pick an executor by itself.
 
-Public evidence enters only through explicit import: the operator supplies an HTTPS provenance URL and the SHA-256 of the exact bytes, and the estimate caps how much a single source family and all external sources together may contribute. No public scores are bundled or seeded, and no hook scrapes them in the background. This is passive statistics over recorded outcomes: there is no model fine-tuning and no paid learning job.
+Public evidence enters only through explicit import: the operator supplies an HTTPS provenance URL and the SHA-256 of the exact bytes, and the estimate caps how much a single source family and all external sources together may contribute. No public scores are bundled or seeded, and no hook scrapes them in the background. This is offline statistics over recorded outcomes: there is no model fine-tuning and no paid learning job.
+
+### Local quality assessment — pooled veto for a task class
+
+Beside the exact-context forecast, Auto uses a separate local quality assessment to notice a task class that DeepSeek keeps failing. It is deliberately coarser. `runtime`, `model`, `effort`, `kind`, `domain` and `operation` must match exactly, and the six soft-context traits — `localization`, `coupling`, `verification`, `clarity`, `risk`, `scope_size` — carry weight through the same configured similarity threshold. `context_version` is treated as provenance here rather than a matching barrier: pooling across per-task context markers is what lets a class-level judgement form at all. The exact-context forecast above is unchanged and still requires `context_version` to match.
+
+The assessment reuses the tested estimator internals: the same Beta(1,1) prior, configured confidence, evidence aging and similarity weighting, canonical `effort` normalization and first-failure case semantics. Only local observations count, so imported external data can never trigger this veto. `infrastructure`, `cancelled` and `unknown` outcomes, and coordinator outcomes, stay unlabelled and never count as worker quality failures.
+
+Two policy defaults gate the veto, and both must hold before it applies:
+
+- `quality_min_evidence` (`10.0` effective local cases) — the minimum aged support the class must reach.
+- `quality_min_success_probability` (`0.70`) — the configured credible-interval threshold.
+
+The veto fires only when the effective local support is at least `quality_min_evidence` **and** the upper end of the configured credible interval is below `quality_min_success_probability`. Little evidence or a wide interval never vetoes eligible work, so a new or thinly sampled class is admitted exactly as before. These are policy defaults for the check, not optimal values measured from a benchmark.
+
+Because the local sample ages like the forecast sample, the veto recovers on its own: once the effective support drops below the minimum, eligible work is admitted again and new results replenish the class. There are no additional paid probes, forced retries, quota counters or separate recovery-ticket subsystem in this change. Model, effort and genuinely different task classes learn separately, and the assessment is recorded as its own `quality` field on a decision while existing observation rows are left untouched, so the behavior stays auditable.
 
 ### Router — immediate executor choice
 
-Recommendations and assignments use one admission path. The router checks permissions, protected responsibilities, task features, active family cooldowns and supported poor measured economics. Eligible work receives `worker`; other work receives `coordinator` with a recorded reason. Missing quality history or prices do not prevent an eligible assignment. The acceptance estimate, uncertainty and available economics remain visible; they do not guarantee quality or savings.
+Recommendations and assignments use one admission path. The router checks permissions, protected responsibilities, task features, active family cooldowns, supported poor measured economics and the local learned-quality veto. Eligible work receives `worker`; other work receives `coordinator` with a recorded reason.
+
+The learned-quality veto applies only under effective `auto`, and it runs after the eligibility, disabled-routing, verification, cooldown and economics reasons, reporting the reason code `learned_quality_below_threshold`. Insufficient or uncertain local evidence never vetoes. Explicit worker or coordinator choices and saved manual `25`/`50`/`75` profiles retain priority. Recommendations never widen the current read-only policy. Before a queued start, the coordinator rechecks access; a previously explicit CLI override is retained only while the saved policy is unchanged.
+
+Start validation recomputes the current assessment for a new queued start, so a start admitted earlier can be held back once a poor class history is recorded. Already-running work is never cancelled retroactively, and an explicit option is not overridden. Because the threshold depends on aged support, the veto also lifts by itself as the evidence ages out.
+
+Missing quality history or prices do not prevent an eligible assignment. The acceptance estimate, uncertainty and available economics remain visible; they do not guarantee quality or savings.
 
 The economic veto needs comparable measured total costs for both executors, with effective cost support of at least `max(1, min_local_evidence)` each. Measured savings below `minimum_savings_fraction` (10% by default) block admission. Missing costs remain unknown.
 
@@ -56,7 +77,7 @@ In `auto` mode, a plan's `executor: auto` resolves to a concrete executor. Expli
 
 ### Feedback loop
 
-After each assignment the coordinator records what actually happened: an observed outcome (`accepted` means accepted without rework; `rework` and `rejected` are quality failures; `infrastructure`, `cancelled` and `unknown` stay unlabelled) and the actual total cost. Those observed worker and coordinator results become the evidence for later estimates. The system compares real recorded outcomes; it does not estimate a counterfactual result for the executor that was not chosen.
+After each assignment the coordinator records what actually happened: an observed outcome (legacy quality treats `accepted` as success and `rework`/`rejected` as failure; `infrastructure`, `cancelled` and `unknown` stay unlabelled) and the actual total cost. An explicit quality assessment supplied with `coordination use --quality-json` replaces that binary reading for the case: operational rework caused by a brief or context gap, or by changed requirements, is neutral for worker quality on its own, while `met` still covers a fully satisfied result with cosmetic edits. Those observed worker and coordinator results become the evidence for later estimates. The system compares real recorded outcomes; it does not estimate a counterfactual result for the executor that was not chosen.
 
 At a cold start, immediate admission allows eligible bounded work without waiting for history. Quality and cost estimates keep updating; unknown cost never becomes claimed savings.
 
@@ -77,6 +98,24 @@ Observed only after the work, recorded through the coordination lifecycle:
 - the actual total cost, including the coordinator's review and any rework.
 
 The feature card tells the estimator which cases are comparable before the task runs; the observed outcome is what actually changes later estimates. The card is never rewritten to match the result. See [Runnable synthetic example](#runnable-synthetic-example) for the JSON shape of both.
+
+## Local category statistics
+
+A separate read-only view summarises how DeepSeek has performed per task category in this project:
+
+```bash
+deepseek-team routing stats --path /path/to/repository
+deepseek-team routing stats --path /path/to/repository --json
+deepseek-team routing stats --path /path/to/repository --sort cases
+```
+
+The command groups canonical local observations by `features.kind` and shows, for each category, the score, estimated acceptance probability and interval, the sample and aging-adjusted effective support, and the accepted, rework, rejected and unlabelled counts. Cases older than `max_evidence_age_days` and future observations are excluded. This is descriptive pooled history across task contexts, not the exact-context admission decision: it does not require `context_version` to match, and it neither makes a routing decision nor records feedback or an experiment.
+
+The score is a conservative lower credible bound from the same Beta estimate, so a category with little or unstable history scores lower. Rows are sorted by that bound in descending order by default, then by effective support, then by category, so ties are deterministic; `--sort cases` or `--sort category` orders by those keys instead. `--json` exposes every count together with the interval values.
+
+The case unit is one coordinator-reviewed DeepSeek worker assignment, not the user's whole prompt or session. Distinct assignments inside one coordinator task are distinct cases; several feedback updates or failed and resumed attempts for the same assignment are not independent successes, and the first labelled quality failure for a case stays a failure even after later incorporation. When explicit quality assessments exist, the case keeps the lowest scored worker assessment instead, and a case whose explicit assessments are all neutral stays neutral. `infrastructure`, `cancelled` and `unknown` outcomes stay unlabelled and out of the quality counts.
+
+A category with no usable observations, or with unlabelled records only, reports an unavailable score rather than presenting the Beta prior as measured success.
 
 ## Modes and executor selection
 
@@ -112,16 +151,18 @@ deepseek-team routing configure --path /path/to/repository \
   --max-evidence-age-days 365 \
   --min-similarity 0.60 \
   --minimum-savings-fraction 0.10 \
-  --failure-cooldown-seconds 300
+  --failure-cooldown-seconds 300 \
+  --quality-min-evidence 10 \
+  --quality-min-success-probability 0.70
 ```
 
-Missing quality and cost evidence do not delay an eligible task. Estimator settings control statistics and their interpretation, without imposing a minimum quality history before the first assignment.
+Missing or uncertain quality and cost evidence does not delay an eligible task. Only a sufficiently supported poor local quality history for the class vetoes it under Auto, and aged-out evidence restores admission. Estimator settings control statistics and their interpretation, without imposing a minimum quality history before the first assignment.
 
 ## Immediate admission by default
 
 **Auto delegates useful bounded work immediately by default**. Small or medium tasks with low or medium risk, known or partial localization, local or component coupling, clear requirements and declared tests or a reproducer can be assigned from the first session. Manual verification is allowed for read, review, research, diagnostic, test-plan and documentation tasks with explicit acceptance criteria. Implementation requires executable checks and `full-access`.
 
-Unknown costs stay unknown and do not block eligible work; supported poor measured economics still veto delegation. One rework is recorded without a family pause. A rejection or three distinct rework cases within the cooldown window pause the family for the configured `failure_cooldown_seconds` (300 seconds by default). Immediate admission resumes after the pause. Failed implementation never retries automatically.
+Unknown costs stay unknown and do not block eligible work; supported poor measured economics still veto delegation. One rework is recorded without a family pause. A rejection or three distinct rework cases within the cooldown window pause the family for the configured `failure_cooldown_seconds` (300 seconds by default). With explicit quality, only worker/shared `major_gaps` or `unusable` qualify for a failure pause; cosmetic, minor-gap and neutral cases do not. After the pause, ordinary admission checks resume, including the learned local quality check. Failed implementation never retries automatically.
 
 Fresh Auto access remains **read-only**. To delegate implementation, explicitly opt in:
 
@@ -317,7 +358,7 @@ deepseek-team routing export --path /path/to/repository --output /tmp/routing-ex
 
 `export` streams the current schema-version-3 JSON export format instead of loading the full project history into memory. Without `--output` it writes that JSON directly to stdout. File output is written privately and replaced atomically, so an interrupted export does not replace an existing valid file. Export is a local read operation: it does not run a worker, contact a model provider, or start a paid action.
 
-Evaluation reports chronological calibration, Brier score and log loss, together with factual recorded outcomes and measured costs when available. Predictions describe acceptance probability and uncertainty; they do not choose an executor or score a delegation policy. These summaries do not establish formal correctness or counterfactual savings.
+Evaluation reports chronological calibration, Brier score and log loss, together with factual recorded outcomes and measured costs when available. Predictions describe acceptance probability and uncertainty for the exact-context forecast; they do not choose an executor themselves, and only the routing admission path decides, including the local quality veto described above. These summaries do not establish formal correctness or counterfactual savings.
 
 ## Experiment budgets
 

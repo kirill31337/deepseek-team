@@ -10,6 +10,7 @@ import stat
 import sys
 import tempfile
 
+from . import routing_stats
 from .routing import RoutingService
 from .routing_models import (DEFAULT_CONFIG, MAX_JSON_BYTES, RoutingError, identifier, number,
                              read_json)
@@ -79,6 +80,13 @@ def _parser() -> argparse.ArgumentParser:
 
     evaluate = commands.add_parser('evaluate')
     _add_path(evaluate)
+
+    stats = commands.add_parser('stats', help='Summarize local worker quality by category.')
+    _add_path(stats)
+    stats.add_argument('--json', action='store_true',
+                       help='Emit machine-readable JSON instead of the table.')
+    stats.add_argument('--sort', choices=routing_stats.SORT_CHOICES, default='score',
+                       help='Table/JSON ordering; defaults to the conservative score.')
 
     export = commands.add_parser('export')
     _add_path(export)
@@ -215,6 +223,12 @@ def main(argv) -> int:
             result = service.observe(payload)
         elif args.command == 'evaluate':
             result = service.evaluate()
+        elif args.command == 'stats':
+            result = routing_stats.summarize(service.observations(), service.config(),
+                                             sort=args.sort)
+            if not args.json:
+                print(routing_stats.render_table(result))
+                return 0
         elif args.command == 'export':
             if args.output is None:
                 service.export_to(sys.stdout)

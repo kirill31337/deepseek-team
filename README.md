@@ -107,7 +107,7 @@ Auto delegation admits suitable work immediately; it does not wait for prior his
 - localized to a known or partially known place, with local or component-level coupling;
 - clear about acceptance, with a way to check the result.
 
-Implementation needs an executable check - tests, a build or a reproducer. Review, research and documentation tasks may use manual acceptance criteria instead. Unknown costs never block eligible work, and the coordinator keeps anything whose measured economics do not justify delegation.
+Implementation needs an executable check - tests, a build or a reproducer. Review, research and documentation tasks may use manual acceptance criteria instead. Unknown costs never block eligible work. The coordinator keeps anything whose measured economics do not justify delegation, and under Auto a sufficiently supported poor local quality history for a task class also vetoes it. Missing or uncertain quality history never blocks an eligible task, and aged-out evidence lets admission resume. `deepseek-team routing stats --path PROJECT` summarises that local history by category.
 
 Every delegated subtask - even a small read-only history, search or review request - is planned and routed before another agent is assigned; in Auto a resolved worker decision means DeepSeek. The coordinator's own native subagents are an explicit exception: they need a `delegation_reason` and a `native_exception` (an explicit user request, or a native capability a DeepSeek worker cannot reach), the coordinator attests that evidence, and the native prompt carries `[deepseek-team:TASK_ID:DELIVERABLE_ID]` binding the registered scope.
 
@@ -125,11 +125,11 @@ architecture or security report lists `decision_artifacts` with the exact relati
 or `.txt` files inside its scope. An integration deliverable names the completed implementation
 with `integration_of` and the exact files it writes with `write_scope`, backed by real worker
 changes or by accepted coordinator edits recorded in the ledger. Newly discovered implementation
-needs a separately routed deliverable; substantial Auto plans use `executor: "auto"`. Corrections
-within reviewed worker output remain coordinator rework. A read-only review never confers
+needs a separately routed deliverable; substantial Auto plans use `executor: "auto"`. Minor corrections
+actually performed by the coordinator are reported as coordinator rework; substantive corrections return to DeepSeek. A read-only review never confers
 integration write rights.
 
-The coordinator records what actually happened after reviewing the real diff and the declared checks. One rework is recorded without pausing anything; a rejection, or three distinct recent reworks, pauses only that task family for 300 seconds. Failed implementation is never retried automatically.
+The coordinator records what actually happened after reviewing the real diff and the declared checks. One rework is recorded without pausing anything; a rejection, or three distinct recent reworks, pauses only that task family for 300 seconds. With explicit quality, only worker/shared `major_gaps` or `unusable` qualify; cosmetic, minor-gap and neutral cases do not. Failed implementation is never retried automatically. A review that needs corrections carries a structured cause, severity, summary and prevention (`--rework-json`), and an explicit graded quality assessment (`--quality-json`) records the worker's result separately, so a brief or context gap does not by itself lower worker quality; the coordinator periodically reviews the private per-project journal of these outcomes; see the [delegation lessons guide](https://github.com/kirill31337/deepseek-team/blob/main/docs/DELEGATION_LESSONS.md).
 
 Access is independent of effort and history:
 
@@ -253,6 +253,7 @@ pipx uninstall deepseek-team
 ## Further reading
 
 - [Routing guide](https://github.com/kirill31337/deepseek-team/blob/main/docs/ROUTING.md) - admission, evidence and feedback.
+- [Delegation lessons](https://github.com/kirill31337/deepseek-team/blob/main/docs/DELEGATION_LESSONS.md) - the rework journal, review cadence and bounded rules.
 - [Hardening](https://github.com/kirill31337/deepseek-team/blob/main/docs/HARDENING.md) - coordinator and worker boundaries.
 - [Publishing](https://github.com/kirill31337/deepseek-team/blob/main/docs/PUBLISHING.md) - release-maintainer details.
 - [0.8.2 release notes](https://github.com/kirill31337/deepseek-team/blob/main/docs/releases/0.8.2.md)
