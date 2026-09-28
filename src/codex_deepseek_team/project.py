@@ -15,13 +15,76 @@ from .config import sync_directory
 
 START_MARKER = b"<!-- codex-deepseek-team:managed-block:start -->"
 END_MARKER = b"<!-- codex-deepseek-team:managed-block:end -->"
+LINKED_MARKER = b"<!-- codex-deepseek-team:guidance:linked -->"
 DATA_FILE = Path(__file__).resolve().parent / "data" / "delegation.md"
+LINKED_DATA_FILE = Path(__file__).resolve().parent / "data" / "delegation-linked.md"
+LINKED_GUIDE = ("docs", "agents", "delegation.md")
 DEFAULT_MODE = 0o644
 TARGETS = {'codex': 'AGENTS.md', 'claude': 'CLAUDE.md'}
 
 
 class ProjectError(Exception):
     """Raised for an invalid or ambiguous target; existing content is untouched."""
+
+
+def _linked_guide_path(root):
+    """Validate and return the fixed human-maintained guide; never creates or edits it.
+
+    Refuses symlinked path components, paths that escape the repository root, a
+    missing or non-regular file, and empty or non-UTF-8 content. Any refusal
+    raises :class:`ProjectError` during the pure prepare phase, so no file has
+    been mutated yet.
+    """
+    if root is None:
+        raise ProjectError("linked guidance requires a repository root")
+    root_path = Path(root)
+    guide = root_path
+    for name in LINKED_GUIDE:
+        guide = guide / name
+        try:
+            if guide.is_symlink():
+                raise ProjectError("docs/agents/delegation.md must not traverse symbolic links")
+        except OSError as error:
+            raise ProjectError("cannot inspect docs/agents/delegation.md") from error
+    real_root = os.path.realpath(os.fspath(root_path))
+    real_guide = os.path.realpath(os.fspath(guide))
+    try:
+        inside = os.path.commonpath([real_root, real_guide]) == real_root
+    except ValueError:
+        inside = False
+    if not inside:
+        raise ProjectError("docs/agents/delegation.md must stay inside the repository")
+    try:
+        if not guide.exists():
+            raise ProjectError("docs/agents/delegation.md is missing; create it or remove the linked marker")
+        if not guide.is_file():
+            raise ProjectError("docs/agents/delegation.md must be an ordinary file")
+        with open(guide, "rb") as handle:
+            raw = handle.read()
+    except OSError as error:
+        raise ProjectError("docs/agents/delegation.md must be an ordinary readable file") from error
+    if not raw:
+        raise ProjectError("docs/agents/delegation.md must not be empty")
+    try:
+        raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ProjectError("docs/agents/delegation.md must be nonempty UTF-8 text") from error
+    return guide
+
+
+def _linked_guidance(runtime, root):
+    """Render the compact opt-in bootstrap; validates the guide before returning."""
+    _linked_guide_path(root)
+    try:
+        body = LINKED_DATA_FILE.read_bytes()
+    except OSError as error:
+        raise ProjectError("packaged linked delegation guidance is unavailable") from error
+    return LINKED_MARKER + b"\n" + body.replace(b'{runtime}', runtime.encode('ascii')).strip(b"\n")
+
+
+def _is_linked(span):
+    """True only when the standalone marker owns its own line inside the span."""
+    return any(line.strip() == LINKED_MARKER for line in span.split(b"\n"))
 
 
 def _guidance(runtime='codex', root=None, policy=None):
@@ -39,10 +102,15 @@ def _guidance(runtime='codex', root=None, policy=None):
     return body.replace(b'{runtime}', runtime.encode('ascii')).strip(b"\n") + b'\n\n' + dynamic
 
 
-def _block_bytes(state, runtime='codex', root=None, policy=None):
-    """Render the owned block; a supplied candidate policy skips settings lookup."""
+def _block_bytes(state, runtime='codex', root=None, policy=None, *, linked=False):
+    """Render the owned block; a supplied candidate policy skips settings lookup.
+
+    ``linked`` selects the compact opt-in bootstrap; it is only ever set from the
+    marker already present inside the owned span, never from a CLI flag or schema.
+    """
     metadata = b"<!-- codex-deepseek-team:original:" + state + b" -->\n"
-    return START_MARKER + b"\n" + metadata + _guidance(runtime, root, policy) + b"\n" + END_MARKER + b"\n"
+    guidance = _linked_guidance(runtime, root) if linked else _guidance(runtime, root, policy)
+    return START_MARKER + b"\n" + metadata + guidance + b"\n" + END_MARKER + b"\n"
 
 
 def _repository_root(root):
@@ -154,13 +222,15 @@ def _prepare_attach_from(target, original, mode, runtime, repository, policy=Non
     marks = _locate(content)
     if marks is None:
         state = b"created" if original is None else (b"existing-content" if original else b"existing-empty")
-        block = _block_bytes(state, runtime, repository, policy)
+        block = _block_bytes(state, runtime, repository, policy, linked=False)
         updated = content + (b"\n" if content else b"") + block
     else:
         begin, finish = marks
         state = _original_state(content, begin)
-        block = _block_bytes(state, runtime, repository, policy)
-        updated = content[:begin] + block + content[_owned_span(content, begin, finish, state)[1]:]
+        start, end = _owned_span(content, begin, finish, state)
+        linked = _is_linked(content[begin:end])
+        block = _block_bytes(state, runtime, repository, policy, linked=linked)
+        updated = content[:begin] + block + content[end:]
     return target, original, mode, updated
 
 
