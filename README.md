@@ -100,7 +100,25 @@ A few notes:
 - For Claude Code, substitute `claude` for `codex` in `--runtime` and `--coordinator`, or pass `both` to prepare both coordinators.
 - Codex owns native hook trust: review and trust the installed hook once with `/hooks`. In Claude Code, start a fresh session and check `/hooks` there. The package cannot trust hooks for you, and after an update you should restart the session so refreshed guidance loads.
 - Attached projects keep their own managed blocks: on each session start and prompt, an explicitly attached project checks and, when stale, updates both existing `AGENTS.md` and `CLAUDE.md` blocks from the current packaged template and effective settings. Unattached projects are never created, scanned or registered.
-- A runtime can opt into a shorter **linked** bootstrap by placing the standalone `guidance:linked` marker on its own line inside its managed block, using the same comment prefix as that block's `managed-block:start` marker. The package then regenerates a compact (under 4 KB) block that mandates reading the human-maintained `docs/agents/delegation.md` at the repository root and points at the live `deepseek-team status` and `config show --effective --instructions --runtime codex|claude` commands instead of embedding an effective-profile snapshot. The guide is never generated or overwritten; activating the mode requires a nonempty UTF-8 guide inside the repository. The marker survives `init`, config refresh and automatic session refresh, so the mode persists until you delete it, and `detach` works in both modes.
+- A runtime can opt into a shorter **linked** bootstrap by placing the standalone
+  `guidance:linked` marker on its own line **inside** its existing managed block, using the
+  same comment prefix as that block's `managed-block:start` marker. Place it after the
+  existing `original:...` metadata line; keep the first two block lines unchanged. A marker outside the
+  owned block - in your own text or a fenced example - has no effect. The package then
+  regenerates a compact (under 4 KB) block that mandates reading the human-maintained
+  `docs/agents/delegation.md` at the repository root and points at the live
+  `deepseek-team status` and `config show --effective --instructions --runtime codex|claude`
+  commands instead of embedding an effective-profile snapshot.
+- Before enabling linked mode in a project, upgrade to 0.8.8 or newer and create a nonempty,
+  regular, UTF-8 `docs/agents/delegation.md` at the repository root that holds the actual
+  required delegation protocol - not an empty stub - and keep it under version control. The
+  package validates that guide but never generates or updates its content, so the guide stays
+  a human-maintained responsibility across later upgrades. Activating the mode with a missing,
+  empty, non-UTF-8, symlinked or escaping guide fails and leaves the owned files unchanged.
+- Run `init` to intentionally regenerate that project's block. The marker then survives
+  `init`, config refresh and automatic session refresh, so the mode persists until you delete
+  it, and `detach` works in both modes. Projects without the marker keep the default full mode.
+  The exact marker is shown in the [0.8.8 release notes](https://github.com/kirill31337/deepseek-team/blob/main/docs/releases/0.8.8.md).
 
 ## What gets delegated
 
