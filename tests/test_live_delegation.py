@@ -28,6 +28,9 @@ from codex_deepseek_team.routing import RoutingService
 
 DRIVER = r'''#!/usr/bin/env python3
 import errno,json,os,pathlib,socket,subprocess,sys
+if '--version' in sys.argv:
+    print('disposable-runtime-fixture 1.0')
+    raise SystemExit(0)
 if '--help' in sys.argv:
     print('--strict-config --sandbox --ephemeral --json --ignore-rules danger-full-access '
           '--bare --tools --allowedTools --disallowedTools --permission-mode dontAsk '
@@ -157,31 +160,45 @@ class LiveDemoTests(LiveBase):
         observed = {}
         real_run_checks = development.run_checks
 
-        def spy(layout, env, commands, timeout=120, *, deadline=None):
-            observed['deadline'] = deadline
-            observed['called_at'] = time.monotonic()
-            observed['commands'] = list(commands)
+        def spy(layout, env, commands, timeout=120, *, deadline=None,
+                directory=None, phase='post', redact_values=()):
+            observed[phase] = dict(deadline=deadline, called_at=time.monotonic(),
+                                   commands=list(commands), directory=directory,
+                                   redact_values=tuple(redact_values))
             # Delegate to the real helper: the declared check still runs inside the
-            # sandbox and still expires against its remaining budget.
-            return real_run_checks(layout, env, commands, timeout, deadline=deadline)
+            # sandbox and still expires against the shared remaining budget.
+            return real_run_checks(layout, env, commands, timeout, deadline=deadline,
+                                   directory=directory, phase=phase,
+                                   redact_values=redact_values)
 
         started = time.monotonic()
-        with patch.object(development, 'run_checks', spy):
-            result = managed.run(args, policy, worker, copy)
-        self.assertEqual(result, 124)
-        self.assertEqual(observed['commands'], [check])
+        with patch.object(development, 'run_checks', spy), \
+                patch.object(worker, 'load_api_key', side_effect=AssertionError(
+                    'credential read before the baseline check expired')), \
+                patch.object(worker, 'execute', side_effect=AssertionError(
+                    'model ran before the baseline check expired')):
+            with self.assertRaises(worker.WorkerError) as caught:
+                managed.run(args, policy, worker, copy)
+        self.assertEqual(caught.exception.code, 124)
+        baseline = observed['baseline']
+        self.assertEqual(baseline['commands'], [check])
+        self.assertIsNotNone(baseline['directory'])
+        self.assertEqual(baseline['redact_values'], ())
         # The check received the original absolute job deadline, not a fresh full
         # timeout; the reset-timeout failure mode cannot satisfy both conditions.
-        self.assertEqual(observed['deadline'], args.job_deadline)
-        remaining = args.job_deadline - observed['called_at']
+        self.assertEqual(baseline['deadline'], args.job_deadline)
+        remaining = args.job_deadline - baseline['called_at']
         self.assertGreater(remaining, 0, 'declared check never reached its budget')
-        self.assertLess(remaining, args.timeout, 'no preparation/execution budget was consumed')
+        self.assertLess(remaining, args.timeout, 'no preparation budget was consumed')
         self.assertLess(remaining, 15, 'declared sleep did not exceed the remaining budget')
         self.assertLess(time.monotonic() - started, args.timeout + 5)
         row = coordination.load_task(self.source, task['id'])['assignments'][0]
         self.assertEqual(row['status'], 'failed')
         self.assertEqual(row['error_kind'], 'environment')
-        self.assertEqual(row['checks'][0]['exit_code'], 124)
+        self.assertEqual(row['failure_stage'], 'preparation')
+        self.assertEqual(row['exit_code'], 124)
+        self.assertEqual(row['baseline_checks'][0]['exit_code'], 124)
+        self.assertEqual(row['checks'], [])
 
     def test_preparation_revalidates_policy_and_head_before_credentials(self):
         original_probe = managed.development.probe
@@ -238,9 +255,18 @@ class LiveDemoTests(LiveBase):
         self.assertEqual(planned['assignments'][0]['status'], 'planned')
         aid = planned['assignments'][0]['id']
         args = self.args(self.task('fix', sibling), coord_task=task['id'], coord_assignment=aid)
-        error = (workspace.WorkspaceError('simulated post-start preparation failure')
-                 if failure_point == 'begin' else OSError('simulated workspace save failure'))
-        with patch.object(copy, failure_point, side_effect=error):
+        real_save = copy.save
+        def inject_save():
+            # Preparation saves must succeed; only the post-start execution record
+            # save fails, so the assignment reaches 'running' before the fault.
+            if failure_point == 'save' and copy.metadata.get('operation') == 'execution':
+                raise OSError('simulated workspace save failure')
+            return real_save()
+        patched = (patch.object(copy, 'begin', side_effect=workspace.WorkspaceError(
+                       'simulated post-start preparation failure'))
+                   if failure_point == 'begin'
+                   else patch.object(copy, 'save', side_effect=inject_save))
+        with patched:
             with self.assertRaises((worker.WorkerError, OSError)):
                 managed.run(args, policy, worker, copy)
 
@@ -372,7 +398,10 @@ class LiveDemoTests(LiveBase):
             with self.assertRaises(worker.WorkerError) as caught:
                 managed.run(args, policy, worker, copy)
         key.assert_not_called()
-        self.assertIn('sandbox', str(caught.exception).lower())
+        # The prepared sandbox PATH now rejects the host-only dependency during
+        # coordination readiness, before the in-namespace requirement probe.
+        self.assertIn('dependencies', str(caught.exception).lower())
+        self.assertIn('host-only-jdk', str(caught.exception))
         record = coordination.load_task(self.source, task['id'])
         self.assertTrue(any(row['code'] == 'dependency_unavailable'
                             for row in record['constraints']))

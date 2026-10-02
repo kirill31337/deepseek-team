@@ -1248,7 +1248,9 @@ def assignment_started(root: Path, task_id: str, assignment_id: str,
             history.append({key: row.get(key) for key in ('status', 'workspace_id', 'runtime', 'effort',
                 'started_at', 'finished_at', 'checks', 'disposition', 'error_kind', 'exit_code',
                 'failure_stage', 'preparation_cause', 'routing_features', 'routing_decision_id',
-                'execution_snapshot', 'worker_changes', 'result_summary')})
+                'execution_snapshot', 'worker_changes', 'result_summary', 'baseline_checks',
+                'verification_cause', 'prepared_input_changes', 'verification_runs',
+                'readiness_checks')})
         if item.get('features'):
             declared = validate_features(item['features'])
             features = validate_features(dict(item['features'], runtime=runtime,
@@ -1273,7 +1275,9 @@ def assignment_started(root: Path, task_id: str, assignment_id: str,
                    effort=effort, prepared_changes=sorted(set(prepared_changes)),
                    started_at=now, disposition=None, error_kind=None, exit_code=None,
                    failure_stage=None, preparation_cause=None, queue_state='running',
-                   execution_snapshot=snapshot)
+                   execution_snapshot=snapshot, baseline_checks=[], verification_cause=None,
+                   prepared_input_changes=[], verification_runs=[], readiness_checks=[])
+        row.pop('finished_at', None)
         task.update(status="active", updated_at=time.time())
         _atomic(_task_path(root, task_id), task)
         return task
@@ -1282,9 +1286,17 @@ def assignment_started(root: Path, task_id: str, assignment_id: str,
 def assignment_finished(root: Path, task_id: str, assignment_id: str,
                         status: str, result_summary: str,
                         worker_changes: list[str], checks: list[dict], *,
-                        error_kind: str | None = None, exit_code: int | None = None) -> dict:
+                        error_kind: str | None = None, exit_code: int | None = None,
+                        baseline_checks: list[dict] | None = None,
+                        verification_cause: str | None = None,
+                        prepared_input_changes: list[str] | None = None) -> dict:
     if status not in ("succeeded", "failed"):
         raise CoordinationError("Assignment result status must be succeeded or failed.", 64)
+    if baseline_checks is not None:
+        _validate_check_evidence(baseline_checks)
+    _validate_verification_cause(verification_cause)
+    if prepared_input_changes is not None:
+        _validate_prepared_input_changes(prepared_input_changes)
     with _lock(root):
         task = load_task(root, task_id)
         row = _assignment(task, assignment_id)
@@ -1298,8 +1310,17 @@ def assignment_finished(root: Path, task_id: str, assignment_id: str,
                    worker_changes=sorted(set(worker_changes)), checks=list(checks),
                    finished_at=time.time(), error_kind=error_kind, exit_code=exit_code,
                    queue_state='finished')
+        if baseline_checks is not None:
+            row['baseline_checks'] = list(baseline_checks)
+        if baseline_checks is not None or verification_cause is not None:
+            row['verification_cause'] = verification_cause
+        if prepared_input_changes is not None:
+            row['prepared_input_changes'] = sorted(set(prepared_input_changes))
         if status == 'failed' and row.get('routing_features'):
-            outcome = {'verification': 'rejected', 'provider': 'infrastructure',
+            # A failed project check is operational evidence, not a reviewed
+            # worker quality grade. Missing environment or an already-red
+            # baseline must not create a rejection/cooldown before review.
+            outcome = {'verification': 'unknown', 'provider': 'infrastructure',
                        'environment': 'infrastructure', 'cancelled': 'cancelled'}.get(error_kind, 'unknown')
             _queue_feedback(task, row, action='worker', outcome=outcome, cost_usd=None,
                             features=row['routing_features'], decision_id=row.get('routing_decision_id'),
@@ -1310,13 +1331,124 @@ def assignment_finished(root: Path, task_id: str, assignment_id: str,
     return load_task(root, task_id)
 
 
+def _validate_verification_cause(cause) -> None:
+    if cause not in (None, 'unknown', 'baseline_failure', 'regression_candidate',
+                     'environment', 'timeout', 'launch_failure', 'probe_failure'):
+        raise CoordinationError('Unknown verification evidence cause.', 64)
+
+
+def _validate_prepared_input_changes(names) -> None:
+    if not isinstance(names, list) or len(names) > 10000:
+        raise CoordinationError('Prepared input changes must be a bounded path list.', 64)
+    for name in names:
+        if (not isinstance(name, str) or not name or len(name) > 4096 or
+                Path(name).is_absolute() or '..' in Path(name).parts or
+                '.git' in Path(name).parts or any(char in name for char in '\0\r\n') or
+                '.' in name.split('/')):
+            raise CoordinationError('Prepared input evidence contains an unsafe path.', 64)
+
+
+def _validate_check_evidence(rows) -> None:
+    allowed = {'command', 'exit_code', 'phase', 'stdout_path', 'stderr_path',
+               'stdout_truncated', 'stderr_truncated', 'diagnostic_directory',
+               'duration_seconds', 'error_kind', 'launch_error', 'timed_out',
+               'launch_failed', 'stdout_sha256', 'stderr_sha256'}
+    if not isinstance(rows, list) or len(rows) > 1000:
+        raise CoordinationError('Verification evidence must be a bounded check list.', 64)
+    for row in rows:
+        if (not isinstance(row, dict) or set(row) - allowed or
+                not isinstance(row.get('command'), str) or not row['command'].strip() or
+                '\0' in row['command'] or
+                type(row.get('exit_code')) is not int):
+            raise CoordinationError('Invalid verification check evidence.', 64)
+        for field in ('stdout_truncated', 'stderr_truncated', 'timed_out', 'launch_failed'):
+            if field in row and type(row[field]) is not bool:
+                raise CoordinationError('Verification flags must be boolean.', 64)
+        for field in ('stdout_sha256', 'stderr_sha256'):
+            if field in row and (not isinstance(row[field], str) or
+                    re.fullmatch(r'[0-9a-f]{64}', row[field]) is None):
+                raise CoordinationError('Invalid verification output fingerprint.', 64)
+        if 'duration_seconds' in row and (type(row['duration_seconds']) not in (int, float) or
+                not math.isfinite(row['duration_seconds']) or row['duration_seconds'] < 0):
+            raise CoordinationError('Invalid verification duration.', 64)
+        for field in ('phase', 'error_kind', 'launch_error'):
+            if field in row and (not isinstance(row[field], str) or len(row[field]) > 512 or
+                    any(char in row[field] for char in '\0\r\n')):
+                raise CoordinationError('Invalid verification diagnostic metadata.', 64)
+        for field in ('stdout_path', 'stderr_path', 'diagnostic_directory'):
+            value = row.get(field)
+            if value is not None and (not isinstance(value, str) or not value or
+                    Path(value).is_absolute() or '..' in Path(value).parts):
+                raise CoordinationError('Verification diagnostic path must be relative.', 64)
+    try:
+        size = len(json.dumps(rows, ensure_ascii=True).encode())
+    except (TypeError, ValueError):
+        raise CoordinationError('Invalid verification evidence values.', 64) from None
+    if size > OUTCOME_CONTEXT_LIMIT:
+        raise CoordinationError('Verification evidence is too large.', 64)
+
+
+def record_verification(root: Path, task_id: str, assignment_id: str, run: dict,
+                        *, finished_at: float | None = None) -> dict:
+    """Append check-only evidence without rewriting an attempt or quality case."""
+    allowed = {'id', 'workspace_id', 'status', 'checks', 'verification_cause',
+               'prepared_input_changes', 'at', 'baseline_checks'}
+    if (not isinstance(run, dict) or set(run) - allowed or
+            not isinstance(run.get('id'), str) or
+            re.fullmatch(r'[A-Za-z0-9_.-]{1,128}', run['id']) is None or
+            run.get('status') not in ('passed', 'failed')):
+        raise CoordinationError('Invalid verification-only result.', 64)
+    _validate_check_evidence(run.get('checks'))
+    if not run['checks'] or (run['status'] == 'failed') != any(row['exit_code'] for row in run['checks']):
+        raise CoordinationError('Verification status must match nonempty check evidence.', 64)
+    if 'at' in run and (type(run['at']) not in (int, float) or
+            not math.isfinite(run['at']) or run['at'] < 0):
+        raise CoordinationError('Invalid verification timestamp.', 64)
+    if 'baseline_checks' in run:
+        _validate_check_evidence(run['baseline_checks'])
+    _validate_verification_cause(run.get('verification_cause'))
+    _validate_prepared_input_changes(run.get('prepared_input_changes', []))
+    if finished_at is not None and (type(finished_at) not in (int, float) or
+            not math.isfinite(finished_at) or finished_at < 0):
+        raise CoordinationError('Invalid verification attempt identity.', 64)
+    with _lock(root):
+        task = load_task(root, task_id)
+        row = _assignment(task, assignment_id)
+        # A pending publication belongs to the observed attempt, even if an
+        # explicit continuation has since moved that attempt into history.
+        if finished_at is not None and row.get('finished_at') != finished_at:
+            matches = [entry for entry in row.get('attempt_history', [])
+                       if entry.get('finished_at') == finished_at and
+                       entry.get('workspace_id') == run.get('workspace_id')]
+            if len(matches) != 1:
+                raise CoordinationError('Verification attempt identity is unavailable.', 64)
+            row = matches[0]
+        if row.get('status') not in ('succeeded', 'failed'):
+            raise CoordinationError('Verification-only evidence requires a terminal assignment.', 75)
+        if run.get('workspace_id') != row.get('workspace_id'):
+            raise CoordinationError('Verification evidence belongs to a different workspace.', 64)
+        history = row.setdefault('verification_runs', [])
+        existing = next((entry for entry in history if entry.get('id') == run['id']), None)
+        if existing is not None:
+            if existing != run:
+                raise CoordinationError('Verification run identity already has different evidence.', 64)
+            return task
+        history.append(dict(run))
+        task['updated_at'] = time.time()
+        _atomic(_task_path(root, task_id), task)
+        return task
+
+
 def assignment_preparation_failed(root: Path, task_id: str, assignment_id: str,
                                   result_summary: str, *,
                                   exit_code: int = 78,
                                   workspace_id: str | None = None,
                                   runtime: str | None = None,
                                   effort: str | None = None,
-                                  cause: str = 'environment') -> dict:
+                                  cause: str = 'environment',
+                                  baseline_checks: list[dict] | None = None,
+                                  verification_cause: str | None = None,
+                                  readiness_checks: list[dict] | None = None) -> dict:
     """Close a still-planned assignment that failed before any model execution.
 
     The managed runner calls this when preparation of an owned copy (sandbox,
@@ -1339,6 +1471,11 @@ def assignment_preparation_failed(root: Path, task_id: str, assignment_id: str,
         raise CoordinationError('Preparation failure requires an integer exit code.', 64)
     if cause not in ('environment', 'admission'):
         raise CoordinationError('Unknown preparation failure cause.', 64)
+    _validate_verification_cause(verification_cause)
+    if baseline_checks is not None:
+        _validate_check_evidence(baseline_checks)
+    if readiness_checks is not None:
+        _validate_check_evidence(readiness_checks)
     canonical_effort = None
     if effort is not None:
         canonical_effort = normalize_effort(effort)
@@ -1360,6 +1497,12 @@ def assignment_preparation_failed(root: Path, task_id: str, assignment_id: str,
                    failure_stage='preparation', preparation_cause=cause, exit_code=exit_code,
                    result_summary=summary, finished_at=now,
                    worker_changes=[], checks=[])
+        if baseline_checks is not None:
+            row['baseline_checks'] = list(baseline_checks)
+        if readiness_checks is not None:
+            row['readiness_checks'] = list(readiness_checks)
+        if verification_cause is not None:
+            row['verification_cause'] = verification_cause
         if workspace_id is not None:
             row['workspace_id'] = str(workspace_id)
         if runtime is not None:
@@ -1756,7 +1899,7 @@ def assignment_deliverable(task: dict, assignment_id: str) -> dict:
     raise CoordinationError('Assignment deliverable is missing.', 64)
 
 
-def _command_available(copy, token: str) -> bool:
+def _command_available(copy, token: str, environment: dict | None = None) -> bool:
     if token.startswith('./') or '/' in token:
         path = (copy.path / token).resolve() if not Path(token).is_absolute() else Path(token)
         try:
@@ -1766,12 +1909,13 @@ def _command_available(copy, token: str) -> bool:
     search = os.pathsep.join([
         str(copy.path / '.venv/bin'),
         str(copy.path / 'node_modules/.bin'),
-        os.environ.get('PATH', ''),
+        (os.environ if environment is None else environment).get('PATH', ''),
     ])
     return shutil.which(token, path=search) is not None
 
 
-def ensure_assignment_ready(root: Path, task_id: str, assignment_id: str, copy) -> dict:
+def ensure_assignment_ready(root: Path, task_id: str, assignment_id: str, copy,
+                            *, environment: dict | None = None) -> dict:
     """Fail preparation before provider access when declared prerequisites are absent."""
     task = load_task(root, task_id)
     item = assignment_deliverable(task, assignment_id)
@@ -1787,7 +1931,7 @@ def ensure_assignment_ready(root: Path, task_id: str, assignment_id: str, copy) 
             raise CoordinationError('Dependencies must use kind=command or kind=path.', 64)
         value = str(dep.get('value') or '')
         if dep['kind'] == 'command':
-            if not value or not _command_available(copy, value):
+            if not value or not _command_available(copy, value, environment):
                 missing.append('command:' + value)
         else:
             path = copy.path / value
@@ -1801,7 +1945,7 @@ def ensure_assignment_ready(root: Path, task_id: str, assignment_id: str, copy) 
                 'Empty declared verification command.'
                 if error.reason in ('empty', 'assignment-only')
                 else 'Invalid declared verification command.', 64) from None
-        if not _command_available(copy, executable):
+        if not _command_available(copy, executable, environment):
             missing.append('check-command:' + executable)
     if missing:
         evidence = 'missing declared dependencies/check runtime: ' + ', '.join(sorted(set(missing)))

@@ -14,7 +14,7 @@ import subprocess
 import sys
 import time
 
-from . import relay, sandbox, verification
+from . import check_evidence, relay, sandbox, verification
 
 FULL_INSTRUCTIONS = '''You are an independent implementation worker in an assigned development copy.
 Implement the assigned goal and acceptance criteria. You may create, edit and delete
@@ -38,7 +38,7 @@ class DevelopmentError(Exception):
 
 def runtime_command(binary: str, runtime: str, *, writable: bool,
                     path: str = '/usr/local/bin:/usr/bin:/bin',
-                    effort: str = 'high') -> list[str]:
+                    effort: str = 'high', environment: dict | None = None) -> list[str]:
     from . import worker
     instructions = FULL_INSTRUCTIONS if writable else worker.INSTRUCTIONS
     if runtime == 'codex':
@@ -46,9 +46,16 @@ def runtime_command(binary: str, runtime: str, *, writable: bool,
         args[args.index('--sandbox') + 1] = 'danger-full-access'
         # This bypasses only the *inner* filesystem sandbox: the verified sparse
         # bwrap and isolated network namespace always surround the whole harness.
+        shell_values = [('PATH', path), ('LANG', 'C.UTF-8')]
+        for name in ('JAVA_HOME', 'ANDROID_HOME', 'ANDROID_SDK_ROOT',
+                     'GRADLE_USER_HOME', 'M2_HOME', 'KOTLIN_HOME'):
+            if environment is not None and name in environment:
+                shell_values.append((name, environment[name]))
+        shell_environment = ','.join(name + '=' + json.dumps(value)
+                                     for name, value in shell_values)
         args[-1:-1] = ['-c', 'developer_instructions=' + json.dumps(instructions),
                        '-c', 'model_providers.deepseek.base_url="@DEEPSEEK_TEAM_ENDPOINT@"',
-                       '-c', 'shell_environment_policy.set={PATH=' + json.dumps(path) + ',LANG="C.UTF-8"}']
+                       '-c', 'shell_environment_policy.set={' + shell_environment + '}']
         return args
     if runtime == 'claude':
         tools = 'Read,Glob,Grep,Edit,Write,Bash' if writable else 'Read,Glob,Grep'
@@ -130,7 +137,8 @@ def runtime_roots(executables: list[str]) -> list[Path]:
 
 
 def layout(backend: sandbox.SandboxBackend, work: Path, home: Path, control: Path,
-           executables: list[str], *, writable: bool = True) -> list[str]:
+           executables: list[str], *, writable: bool = True,
+           read_only_roots=()) -> list[str]:
     args = [*backend.prefix, '--die-with-parent', '--new-session', '--unshare-user',
             '--unshare-pid', '--unshare-ipc', '--unshare-uts', '--unshare-net',
             '--disable-userns', '--cap-drop', 'ALL']
@@ -163,14 +171,48 @@ def layout(backend: sandbox.SandboxBackend, work: Path, home: Path, control: Pat
              '--bind' if writable else '--ro-bind', str(work), str(work),
              '--ro-bind', str(work / '.git'), str(work / '.git'),
              '--ro-bind', str(control), '/run/deepseek-team', '--chdir', str(work)]
+    for root in read_only_roots:
+        root = Path(root)
+        if (not root.is_relative_to(work) or root == work or
+                '.git' in root.relative_to(work).parts or root.is_symlink() or
+                not root.resolve().is_relative_to(work.resolve())):
+            raise DevelopmentError('Preparation: unsafe read-only toolchain root.')
+        args += ['--ro-bind', str(root), str(root)]
     return args
 
 
-def probe(args: list[str], env: dict[str, str]) -> None:
+def prepared_context(copy, backend, home: Path, control: Path, binary: str,
+                     runtime: str, *, writable: bool, effort: str = 'high', api=None,
+                     deadline: float | None = None):
+    """Build one disposable environment used by launch, doctor and verification."""
+    from . import toolchains, worker
+    api = worker if api is None else api
+    env = api.child_environment(home, relay.LOCAL_CREDENTIAL, runtime, effort)
+    if runtime == 'codex':
+        api.transient_config(home)
+    else:
+        env['ANTHROPIC_BASE_URL'] = '@DEEPSEEK_TEAM_ENDPOINT@/anthropic'
+        env['ANTHROPIC_API_KEY'] = relay.LOCAL_CREDENTIAL
+    env['PATH'] = ':'.join(str(p) for p in (
+        copy.path / '.venv/bin', copy.path / 'node_modules/.bin',
+        Path(binary).parent, Path(api.sys.executable).parent)) + ':/usr/local/bin:/usr/bin:/bin'
+    env.update(PYTHONDONTWRITEBYTECODE='1', GIT_CONFIG_NOSYSTEM='1',
+               GIT_CONFIG_GLOBAL='/dev/null', GIT_OPTIONAL_LOCKS='0', GIT_TERMINAL_PROMPT='0')
+    env = toolchains.environment_for(copy, env)
+    args = layout(backend, copy.path, home, control, [binary], writable=writable,
+                  read_only_roots=toolchains.read_only_roots(copy))
+    probe(args, env, deadline=deadline)
+    return args, env
+
+
+def probe(args: list[str], env: dict[str, str], *, deadline: float | None = None) -> None:
+    remaining = min(15, deadline - time.monotonic()) if deadline is not None else 15
+    if remaining <= 0:
+        raise DevelopmentError('Preparation: total timeout expired before the sandbox probe.', 124)
     try:
         result = subprocess.run([*args, '--', str(Path(sys.executable).resolve()),
                                  '-I', '-c', 'import http.server, json, socket, threading'], env=env,
-                                text=True, capture_output=True, timeout=15, check=False)
+                                text=True, capture_output=True, timeout=remaining, check=False)
     except (OSError, subprocess.SubprocessError):
         raise DevelopmentError('Preparation: development OS sandbox probe could not run.') from None
     if result.returncode:
@@ -182,7 +224,8 @@ def write_launch(control: Path, binary: str, runtime: str, env: dict[str, str], 
                  writable: bool, effort: str = 'high') -> None:
     shutil.copyfile(Path(relay.__file__), control / 'bridge.py')
     (control / 'bridge.py').chmod(0o400)
-    command = runtime_command(binary, runtime, writable=writable, path=env['PATH'], effort=effort)
+    command = runtime_command(binary, runtime, writable=writable, path=env['PATH'],
+                              effort=effort, environment=env)
     (control / 'launch.json').write_text(json.dumps({'command': command, 'env': env}))
     (control / 'launch.json').chmod(0o400)
 
@@ -222,25 +265,12 @@ def missing_requirements(args: list[str], env: dict[str, str], item: dict) -> li
 
 
 def run_checks(args: list[str], env: dict[str, str], commands: list[str],
-               timeout: float = 120, *, deadline: float | None = None) -> list[dict]:
+               timeout: float = 120, *, deadline: float | None = None,
+               directory: Path | None = None, phase: str = 'post',
+               redact_values=()) -> list[dict]:
     """Run declared verification inside the same sparse/no-network sandbox."""
-    results = []
-    for command in commands:
-        remaining = min(timeout, deadline - time.monotonic()) if deadline is not None else timeout
-        if remaining <= 0:
-            results.append({'command': command, 'exit_code': 124})
-            break
-        try:
-            result = subprocess.run(
-                [*args, '--', '/bin/sh', '-lc', command],
-                env=env, text=True, capture_output=True, timeout=remaining, check=False)
-            results.append({'command': command, 'exit_code': result.returncode})
-        except subprocess.TimeoutExpired:
-            results.append({'command': command, 'exit_code': 124})
-            break
-        if results[-1]['exit_code'] != 0:
-            break
-    return results
+    return check_evidence.run_checks(args, env, commands, timeout, deadline=deadline,
+        directory=directory, phase=phase, redact_values=redact_values)
 
 
 def bridge_command(args: list[str]) -> list[str]:

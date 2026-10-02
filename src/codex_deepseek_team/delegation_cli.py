@@ -5,7 +5,8 @@ from pathlib import Path
 import sys
 import subprocess
 
-from . import lessons, project, settings, workspace
+from . import (check_evidence, lessons, project, runtime_preflight, settings,
+               toolchains, worker, workspace)
 
 
 def _lessons_guidance(root):
@@ -90,17 +91,25 @@ def main(argv):
                                              'blockers; allocates no state or copy.')
         check.add_argument('path', type=Path, nargs='?', default=Path.cwd())
         check.add_argument('--json', action='store_true')
-        for name in ('create', 'show', 'diff', 'prepare', 'import'):
+        for name in ('create', 'show', 'diff', 'prepare', 'import', 'verify'):
             sub = subs.add_parser(name)
             sub.add_argument('--state-dir', type=Path, default=Path.home() / '.local/state/codex-deepseek')
             if name == 'create':
                 sub.add_argument('path', type=Path, nargs='?', default=Path.cwd())
             else:
                 sub.add_argument('id')
-            if name in ('create', 'show'):
+            if name in ('create', 'show', 'verify'):
                 sub.add_argument('--json', action='store_true')
             if name == 'prepare':
                 sub.add_argument('--resume-after-failure', action='store_true')
+                for option in ('tool', 'copy', 'env'):
+                    sub.add_argument('--' + option, action='append', default=[], metavar='NAME=VALUE')
+                sub.add_argument('--probe', action='append', default=[], metavar='COMMAND')
+                sub.add_argument('--save-project', action='store_true')
+            if name == 'verify':
+                sub.add_argument('--check', action='append', metavar='COMMAND')
+                sub.add_argument('--timeout', type=float, default=120,
+                                 help='Per-command ceiling in seconds (default 120).')
             if name == 'import':
                 sub.add_argument('--include', action='append', required=True, metavar='FILE',
                                  help='Explicit repository-relative dirty file to copy; repeat as needed.')
@@ -161,7 +170,40 @@ def main(argv):
             copy = (workspace.create(args.path, args.state_dir) if args.command == 'create'
                     else workspace.load(args.state_dir, args.id))
             if args.command == 'prepare':
-                return workspace.prepare(copy, command, recover=args.resume_after_failure)
+                declarative = bool(args.tool or args.copy or args.env or args.probe or args.save_project)
+                if declarative:
+                    def pairs(values):
+                        result = []
+                        for value in values:
+                            if '=' not in value:
+                                raise workspace.WorkspaceError('Preparation options require NAME=VALUE.', 64)
+                            name, content = value.split('=', 1)
+                            if not name or not content:
+                                raise workspace.WorkspaceError('Preparation names and values must not be empty.', 64)
+                            result.append((name, content))
+                        return result
+                    tools = dict(pairs(args.tool))
+                    environment = dict(pairs(args.env))
+                    copies = pairs(args.copy)
+                    toolchains.prepare(copy, tools=tools, copies=copies, environment=environment,
+                        probes=args.probe, save_project=args.save_project,
+                        recover=args.resume_after_failure)
+                if command:
+                    return workspace.prepare(copy, command, recover=args.resume_after_failure)
+                if not declarative:
+                    raise workspace.WorkspaceError('workspace prepare requires options or -- COMMAND.', 64)
+                print('Prepared toolchains and project inputs for workspace ' + copy.id + '.')
+                return 0
+            if args.command == 'verify':
+                result = workspace.verify_checks(copy, args.check, timeout=args.timeout)
+                if args.json:
+                    print(json.dumps(result, indent=2))
+                else:
+                    print('Verification: ' + result['status'] + '; original worker result retained.')
+                    print('Diagnostic files: ' + str(copy.directory / 'diagnostics'))
+                if result['status'] == 'passed':
+                    return 0
+                return 124 if any(row.get('timed_out') for row in result['checks']) else 65
             if args.command == 'import':
                 imported = workspace.import_paths(copy, args.include)
                 print('Imported coordinator-prepared source: ' + ', '.join(imported))
@@ -176,7 +218,9 @@ def main(argv):
                 if args.command == 'create':
                     print('Committed HEAD copied. Source dirty/untracked/ignored files were preserved and not copied.')
         return 0
-    except (settings.SettingsError, workspace.WorkspaceError, project.ProjectError) as error:
+    except (settings.SettingsError, workspace.WorkspaceError, project.ProjectError,
+            runtime_preflight.RuntimePreflightError, toolchains.ToolchainError,
+            check_evidence.CheckEvidenceError, worker.WorkerError) as error:
         print(str(error), file=sys.stderr)
         return getattr(error, 'code', 78)
     except (OSError, subprocess.SubprocessError):

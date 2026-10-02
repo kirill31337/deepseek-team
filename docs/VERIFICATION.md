@@ -1,3 +1,101 @@
+# Version 0.8.9 verification
+
+Date: 2026-10-02. Scope: stop host-only runtime and toolchain availability from being
+mistaken for readiness inside the managed worker namespace, retain bounded redacted
+check evidence, and allow verification of a failed copy without another model request.
+
+The coordinator ran `PYTHONPATH=src python3 -m unittest discover -s tests -v`:
+**1344 tests in 397.095 seconds, OK with 3 skips** (Claude Code unavailable).
+The 26 incident integration tests all passed, including real Bubblewrap checks,
+stock Debian OpenJDK compilation/security/truststore initialization, read-only tools,
+writable cache persistence and ignored prepared-input attribution. Real installed
+Codex full-access and read-only protocol checks passed.
+
+Wheel and sdist were built with `python -m build --no-isolation` in an isolated
+build environment. All 48 package files in the wheel matched the source byte for
+byte; archive inspection excluded private configuration, credentials, workspace
+records, diagnostics and model logs. A fresh isolated virtual environment installed
+the wheel offline, reported version 0.8.9, accepted prepare/verify CLI help and passed
+full-access `doctor --runtime codex --offline` against `/usr/bin/codex` in real
+Bubblewrap. AppArmor's unprivileged-userns restriction remained enabled (`1`).
+Both artifacts passed `twine check --strict`. The repository's installation
+lifecycle checker passed with **pip, pipx and uv**: initial installation,
+replacement and uninstallation preserved external configuration sentinels,
+verified version 0.8.9 and packaged resources, and removed installed entrypoints.
+No provider requests, production deployment or package publication were performed
+by these final checks; implementation workers used their required private relay.
+
+## What this release changes
+
+- Default runtime selection resolves deduplicated executable candidates in `PATH` order,
+  then `/usr/local/bin` and `/usr/bin`, and selects the first that really runs `--version`
+  and the required capability help in the prepared namespace. An explicit `--codex` /
+  `--claude` pin is probed alone and never replaced by PATH, system or cross-runtime
+  fallback; `runtime=auto` may try Codex then Claude. The probes make no provider request,
+  read no credential and share the job's total deadline, whose expiry is code 124.
+- `workspace prepare` accepts repeatable `--tool NAME=HOST_DIR`, `--copy SOURCE=REL_DEST`,
+  `--env NAME=VALUE`, `--probe COMMAND` and `--save-project`. Tools copy into the
+  read-only `.deepseek-tools/NAME` area, explicit copies stay writable, prepared variables
+  are restricted to `JAVA_HOME`, `ANDROID_HOME`, `ANDROID_SDK_ROOT`, `GRADLE_USER_HOME`,
+  `M2_HOME`, `KOTLIN_HOME` and `PATH` with the literal `{workspace}` placeholder, and
+  smoke probes run only inside the namespace before any model key. The legacy
+  `workspace prepare ID -- COMMAND` form and its host execution are unchanged.
+- Debian/OpenJDK preparation materializes only ordinary files below
+  `/etc/java-[0-9]+-openjdk/` and the exact `/etc/ssl/certs/java/cacerts`; the public
+  `docs` and `src.zip`/`lib/src.zip` links are skipped and every other escaping link fails.
+- Check output is capped at 65,536 bytes per stream, redacted for known sensitive values,
+  drained past the limit, marked truncated and published owner-only under the workspace's
+  private `diagnostics/` directory; a timed-out command's process group is cleaned up.
+- Declared checks are captured as a baseline before the model runs, so a nonzero baseline
+  is evidence rather than a blanket rejection. Failed project checks remain operational
+  `verification` with cause `unknown`, `baseline_failure` or `regression_candidate`;
+  timeout/launch/probe failures are `environment`. Automatic terminal feedback for a
+  failed check is neutral `unknown` until the coordinator reviews the actual diff, and a
+  reviewed explicit quality/disposition remains the only worker-attributable grade.
+- `workspace verify ID [--check COMMAND] [--timeout SECONDS] [--json]` rebuilds the
+  prepared environment and sparse namespace and appends a unique verification run. It
+  never loads the provider key, starts a relay or starts a model, holds the workspace
+  ownership lock, and preserves the original worker status, error, checks and quality.
+  A rerun never rewrites the original failure or creates another quality case.
+  Interrupted ledger publication is replayed idempotently from the private workspace
+  record into its original attempt, including after an explicit continuation.
+- Explicitly registered prepared inputs, including an ignored `local.properties`, are
+  fingerprinted (type, mode and content hash, or a missing marker) and any change is
+  stored privately as `prepared_input_changes`, outside the source patch and regular
+  worker changes. Input content is never stored.
+- `doctor --offline` checks a managed full-access runtime by actually launching a
+  candidate in a disposable empty sparse namespace; it allocates no model job and reads
+  no key. The read-only native Codex and outer read-only Claude boundary is unchanged.
+
+## Manual checks performed for this documentation change
+
+- Rendered `deepseek-team workspace prepare --help` and `workspace verify --help` from the
+  current package and matched every documented option to the actual CLI surface.
+- Verified the copied-tree destinations, prepared-variable allowlist, `{workspace}`
+  placeholder rule, `--probe` ordering before the provider key, `--save-project` recipe
+  replay and the legacy `-- COMMAND` form against the current modules (`toolchains.py`,
+  `runtime_preflight.py`, `check_evidence.py`, `prepared_inputs.py`, `workspace.py`,
+  `development.py`, `managed.py`, `doctor.py`).
+- Verified the Java/Android/Gradle recipes are consistent with the allowed variables and
+  destination rules, and that they claim only visibility and declared probes, never
+  success of an unprepared SDK or build.
+
+## Deliberate limits
+
+- Missing prerequisites can be detected earlier, including a host-successful launcher
+  whose sibling target is absent inside the namespace, but no release can eliminate every
+  external failure.
+- The full-suite and package checks above were performed by the coordinator after
+  integration; the documentation worker's checks are identified separately.
+  Publication remains a separate action.
+- This environment has no Android SDK or affected product projects. Real OpenJDK
+  and namespace reproductions were verified; an Android product build still requires
+  its actual prepared SDK, downloaded dependencies and declared acceptance checks.
+- This release changes no hook definition, delegation/access setting, credential location
+  or publication step, and installs or deploys nothing automatically.
+
+---
+
 # Version 0.8.5 verification
 
 Date: 2026-09-24. Scope: send ordinary Auto read and write work to the saved routing

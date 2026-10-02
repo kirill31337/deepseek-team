@@ -230,15 +230,39 @@ deepseek-team workspace import WORKSPACE_ID --include path/to/needed.py
 ```
 
 Those files are coordinator-prepared source and remain distinct from worker changes.
-Prepare missing SDK/runtime/dependencies explicitly with `workspace prepare`.
+Prepare missing SDK/runtime/dependencies explicitly with `workspace prepare`. The
+declarative form accepts repeatable `--tool NAME=HOST_DIR` (copied into the read-only
+`.deepseek-tools/NAME` area), `--copy SOURCE=REL_DEST` (explicit non-secret files or
+caches, writable in the copy), `--env NAME=VALUE` (only `JAVA_HOME`, `ANDROID_HOME`,
+`ANDROID_SDK_ROOT`, `GRADLE_USER_HOME`, `M2_HOME`, `KOTLIN_HOME` and `PATH`, each rooted
+in the copy through the literal `{workspace}` placeholder) and `--probe COMMAND`
+(smoke commands that run only inside the worker namespace before the provider key).
+`--save-project` stores a private recipe that replays only those declarations into a
+later copy and never executes host commands; the legacy `workspace prepare ID --
+COMMAND` form still runs on the coordinator host with the prepared variables and PATH.
 Full-access never implies access to host-only JDK/SDK/tools, secrets, databases,
-services, or the network. Declared dependencies are probed inside the real sandbox
+services, or the network. Default runtimes are namespace-verified candidates, an explicit
+`--codex`/`--claude` pin is preserved rather than replaced, and runtime selection shares
+the job's total deadline. Declared dependencies are probed inside the real sandbox
 before the provider credential is read; declared checks run in that sandbox after
 the worker. Do not replace missing project dependencies with stubs and report that
 as equivalent verification.
 
+Declared checks are also captured as a baseline before the model runs: a nonzero
+baseline is evidence, not a blanket rejection, so a bugfix assignment may proceed
+against an already-red suite. After the worker, automatic terminal feedback for a
+failed project check is neutral `unknown` until the coordinator reviews the actual diff
+and evidence; only a reviewed explicit quality/disposition grades the worker.
+`workspace verify ID [--check COMMAND] [--timeout SECONDS] [--json]` rebuilds the
+prepared environment and sparse namespace, reruns the declared or supplied checks and
+appends a unique verification run. It never loads the provider credential, starts a
+relay or starts a model, and it preserves the original worker status, error, checks and
+quality. Bounded per-stream output is redacted and published owner-only under the
+workspace's private `diagnostics/` directory.
+
 A failed or interrupted workspace is retained. Inspect it before explicit
-`--resume-after-failure`; do not automatically repeat implementation over unknown
+`--resume-after-failure`; a verification rerun may inspect it without automatically
+resuming implementation. Do not automatically repeat implementation over unknown
 state. The default concurrency limit is eight workers (`max_workers`, configurable 1–64).
 Eligible assignments remain worker-owned when slots are busy; launches wait FIFO.
 Use `config set --project --max-workers N` or `--global` to save a limit, or

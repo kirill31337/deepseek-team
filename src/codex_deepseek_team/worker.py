@@ -464,12 +464,18 @@ def parse_args():
     parser.add_argument('--coord-task', help='Persistent coordination task id for automatic runner accounting.')
     parser.add_argument('--coord-assignment', help='Planned coordination assignment id; must be used with --coord-task.')
     parser.add_argument('--resume-after-failure', action='store_true', help='Explicit continuation after inspecting partial work.')
-    parser.add_argument('--codex', default='codex', help='Codex executable to use.')
-    parser.add_argument('--claude', default='claude', help='Claude Code executable to use.')
+    parser.add_argument('--codex', help='Codex executable to use; an explicit value is pinned.')
+    parser.add_argument('--claude', help='Claude Code executable to use; an explicit value is pinned.')
     parser.add_argument('--state-dir', type=Path,
                         default=Path.home() / '.local/state/codex-deepseek',
                         help='Shared lock directory; keep the same directory for all workers.')
     args = parser.parse_args()
+    args.codex_explicit = args.codex is not None
+    args.claude_explicit = args.claude is not None
+    if args.codex is None:
+        args.codex = 'codex'
+    if args.claude is None:
+        args.claude = 'claude'
     args.attempts_explicit = args.attempts is not None
     if bool(args.coord_task) != bool(args.coord_assignment):
         parser.error('--coord-task and --coord-assignment must be supplied together')

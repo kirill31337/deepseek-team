@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 import urllib.error
 import urllib.request
 
@@ -165,19 +166,28 @@ def check_policy_runtime(runtime, policy):
     """Check the runtime surface that the effective access will actually use."""
     if policy.effective_access != 'full-access':
         return check_runtime(runtime)
-    from codex_deepseek_team import development
-    binary = shutil.which(runtime)
-    if not binary:
-        raise worker.WorkerError(78, f'{runtime} executable is unavailable for managed full-access.')
+    from codex_deepseek_team import development, runtime_preflight
     try:
-        version = subprocess.check_output([binary, '--version'], text=True).strip()
-        development.check_runtime(binary, runtime)
-    except development.DevelopmentError as error:
+        _sb, backend = worker.resolve_os_sandbox('required')
+        with tempfile.TemporaryDirectory(prefix='dst-doctor-runtime-') as directory:
+            root = Path(directory)
+            work, home, control = root / 'work', root / 'home', root / 'control'
+            for path in (work, home, control, work / '.git'):
+                path.mkdir(mode=0o700)
+            empty = SimpleNamespace(path=work, metadata={})
+
+            def context_factory(binary, selected):
+                return development.prepared_context(empty, backend, home, control,
+                    binary, selected, writable=True)
+
+            selection = runtime_preflight.select_runtime(runtime, 'codex', 'claude', context_factory)
+    except (development.DevelopmentError, runtime_preflight.RuntimePreflightError) as error:
         raise worker.WorkerError(error.code, str(error)) from None
     except (OSError, subprocess.SubprocessError):
         raise worker.WorkerError(78, f'{runtime} managed full-access capability check failed.') from None
-    print(version)
-    print(f'Managed {runtime} runtime capabilities: PASS (effective access={policy.effective_access}).')
+    print('Selected managed runtime: ' + selection.binary)
+    print(f'Managed {runtime} namespace and runtime capabilities: PASS '
+          f'(effective access={policy.effective_access}; provider-free).')
 
 
 def coordination_status(runtime, root=None):

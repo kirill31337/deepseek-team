@@ -7,11 +7,21 @@ import time
 from types import SimpleNamespace
 from unittest import mock
 
-from codex_deepseek_team import activation, coordination, development, settings, worker, workspace
+from codex_deepseek_team import (activation, coordination, development,
+                                 runtime_preflight, settings, worker, workspace)
 from tests import test_coordination as fixtures
 
 
 class ManagedPreparationTests(fixtures.CoordinationCase):
+    def disposable_runtime(self):
+        # A real executable probed only through the mocked external namespace
+        # boundary; no host Codex/Claude installation is required.
+        binary = self.root / 'disposable-codex'
+        if not binary.exists():
+            binary.write_text('#!/bin/sh\nexit 0\n')
+            binary.chmod(0o755)
+        return str(binary)
+
     def plan(self, turn_id='1'):
         task = coordination.open_task(self.repo, session_id='managed-preparation', turn_id=turn_id,
                                       prompt='Review a.py', policy=self.policy())
@@ -26,7 +36,8 @@ class ManagedPreparationTests(fixtures.CoordinationCase):
         self.task_id = task['id']
         self.assignment_id = task['assignments'][0]['id']
         return SimpleNamespace(
-            runtime='codex', codex='codex', claude='claude', task='Review a.py',
+            runtime='codex', codex=self.disposable_runtime(), codex_explicit=True,
+            claude='claude', task='Review a.py',
             state_dir=self.state, os_sandbox='required', timeout=0,
             attempts=1, attempts_explicit=False, effort='high', no_wait=False,
             workspace=None, resume_after_failure=False, access=None,
@@ -52,11 +63,10 @@ class ManagedPreparationTests(fixtures.CoordinationCase):
             stack.enter_context(contextlib.chdir(self.repo))
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
             stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
-            stack.enter_context(mock.patch.object(worker, 'resolve_runtime',
-                                                 return_value=('codex', '/usr/bin/true')))
-            stack.enter_context(mock.patch.object(development, 'check_runtime', return_value='test'))
             stack.enter_context(mock.patch.object(worker, 'resolve_os_sandbox',
                                                  return_value=(None, None), side_effect=sandbox_error))
+            stack.enter_context(mock.patch.object(runtime_preflight, 'probe_runtime',
+                                                 return_value='disposable-runtime-fixture 1.0'))
             stack.enter_context(mock.patch.object(development, 'layout', return_value=['test-layout']))
             stack.enter_context(mock.patch.object(development, 'probe', side_effect=probe_error))
             stack.enter_context(mock.patch.object(development, 'missing_requirements', return_value=[]))
@@ -102,13 +112,20 @@ class ManagedPreparationTests(fixtures.CoordinationCase):
         self.assertIn('sandbox unavailable', row['result_summary'])
         self.assertIsNone(row.get('workspace_id'))
 
-    def test_runtime_failure_is_recorded_without_source_copy(self):
+    def test_runtime_failure_retains_failed_owned_copy(self):
         args = self.plan()
-        with self.local_runtime(), mock.patch.object(development, 'check_runtime',
-                side_effect=development.DevelopmentError('runtime unsupported')):
+        with self.local_runtime(), mock.patch.object(runtime_preflight, 'probe_runtime',
+                side_effect=runtime_preflight.RuntimePreflightError('runtime unsupported')):
             with self.assertRaises(worker.WorkerError):
                 worker.run(args)
-        self.assertIn('runtime unsupported', self.assert_preparation_failed()['result_summary'])
+        row = self.assert_preparation_failed()
+        self.assertIn('runtime unsupported', row['result_summary'])
+        # Runtime readiness now fails after the owned copy exists and is retained.
+        copy = workspace.load(self.state, row['workspace_id'])
+        self.assertEqual((copy.metadata['status'], copy.metadata['error_kind']),
+                         ('failed', 'preparation'))
+        with copy.lock(recover=True):
+            self.assertEqual(copy.changes()[0], [])
 
     def test_probe_failure_retains_complete_copy_for_explicit_preparation(self):
         args = self.plan()
@@ -151,9 +168,11 @@ class ManagedPreparationTests(fixtures.CoordinationCase):
     def test_filesystem_error_records_safe_reason_without_exception_payload(self):
         args = self.plan()
         with self.local_runtime(probe_error=OSError('PRIVATE_ERROR_PAYLOAD')):
-            with self.assertRaises(OSError):
+            with self.assertRaises(worker.WorkerError) as caught:
                 worker.run(args)
-        row = self.assert_preparation_failed(code=71)
+        self.assertEqual(caught.exception.code, 78)
+        row = self.assert_preparation_failed()
+        self.assertIn('details withheld', row['result_summary'])
         self.assertNotIn('PRIVATE_ERROR_PAYLOAD', json.dumps(row))
 
     def test_repeated_launch_preserves_terminal_failure_and_allocates_no_copy(self):
@@ -204,7 +223,7 @@ class ManagedPreparationTests(fixtures.CoordinationCase):
                 settings.set_values(self.repo / settings.PROJECT_FILE, access='full-access')
                 args = self.plan(change)
 
-                def change_admission(*unused):
+                def change_admission(*unused, **unused_keywords):
                     if change == 'disabled':
                         activation.set_enabled(self.repo, False)
                     elif change == 'revoked':
@@ -247,7 +266,7 @@ class ManagedPreparationTests(fixtures.CoordinationCase):
         winner = workspace.create(self.repo, self.state)
         expected = {}
 
-        def another_launch_wins(*unused):
+        def another_launch_wins(*unused, **unused_keywords):
             coordination.assignment_started(self.repo, self.task_id, self.assignment_id,
                                             winner.id, 'codex', [], effort='high')
             with winner.lock():

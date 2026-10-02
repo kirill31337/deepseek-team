@@ -15,7 +15,7 @@ import unittest
 from unittest import mock
 
 from codex_deepseek_team import (coordination, development, lessons, relay,
-                                 settings, worker, workspace)
+                                 runtime_preflight, settings, worker, workspace)
 from codex_deepseek_team.lessons import LessonError
 from test_coordination import CoordinationCase
 
@@ -461,20 +461,24 @@ class ManagedRunSnapshotTests(LessonsIntegrationCase):
                                    'item': {'type': 'agent_message', 'text': 'IMPLEMENTED'}})
                     + '\n' + json.dumps({'type': 'turn.completed'}) + '\n', '')
 
+        binary = self.root / 'disposable-codex'
+        binary.write_text('#!/bin/sh\nexit 0\n')
+        binary.chmod(0o755)
         args = SimpleNamespace(
             task='Review a.py only with fixture-key', os_sandbox='required', attempts=1,
             attempts_explicit=False,
-            runtime='codex', codex='codex', claude='claude', state_dir=self.state, timeout=30,
+            runtime='codex', codex=str(binary), codex_explicit=True, claude='claude',
+            state_dir=self.state, timeout=30,
             resume_after_failure=False, coord_task=planned['id'], coord_assignment=assignment_id,
             delegation_level=None, access=None, max_workers=None, effort='high',
             workspace=copy.id, no_wait=False)
         with contextlib.chdir(self.repo), contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()), \
-                mock.patch.object(worker, 'resolve_runtime', return_value=('codex', '/usr/bin/true')), \
                 mock.patch.object(worker, 'resolve_os_sandbox', return_value=(None, None)), \
+                mock.patch.object(runtime_preflight, 'probe_runtime',
+                                  return_value='disposable-runtime-fixture 1.0'), \
                 mock.patch.object(worker, 'load_api_key', return_value='fixture-key'), \
                 mock.patch.object(worker, 'execute', side_effect=fake_execute), \
-                mock.patch.object(development, 'check_runtime', return_value='test'), \
                 mock.patch.object(development, 'layout', return_value=['test-layout']), \
                 mock.patch.object(development, 'probe', return_value=None), \
                 mock.patch.object(development, 'missing_requirements', return_value=[]), \

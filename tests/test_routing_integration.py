@@ -258,7 +258,11 @@ class IntegrationTests(unittest.TestCase):
         aid = result['assignments'][0]['id']
         coordination.assignment_started(self.root, task['id'], aid, 'ws', 'codex', [], effort='medium')
         coordination.assignment_finished(self.root, task['id'], aid, 'failed', 'Tests failed', [], [{'exit_code': 1}])
-        self.assertEqual(self.service.observations()[0]['outcome'], 'rejected')
+        # An automatic project-check failure is neutral operational evidence:
+        # it records ``unknown`` and never rejects the worker or starts a
+        # cooldown until the coordinator explicitly reviews the attempt.
+        self.assertEqual(self.service.observations()[0]['outcome'], 'unknown')
+        self.assertFalse(self.service.status()['admission']['active_cooldowns'])
         with self.assertRaises(coordination.CoordinationError):
             coordination.assignment_started(self.root, task['id'], aid, 'ws', 'codex', [], effort='medium')
         coordination.use_result(self.root, task['id'], aid, 'needs-rework', 'Assertion fails')
@@ -267,7 +271,7 @@ class IntegrationTests(unittest.TestCase):
         coordination.assignment_finished(self.root, task['id'], aid, 'succeeded', 'Corrected', [], [{'exit_code': 0}])
         coordination.use_result(self.root, task['id'], aid, 'incorporated', 'Rework verified')
         observations = self.service.observations()
-        self.assertEqual([row['outcome'] for row in observations], ['rejected', 'rework', 'accepted'])
+        self.assertEqual([row['outcome'] for row in observations], ['unknown', 'rework', 'accepted'])
         self.assertEqual(len({row['case_id'] for row in observations}), 1)
         self.assertLess(self.service.predict(self.features)['posterior']['mean'], .5)
 
@@ -596,12 +600,21 @@ else:
         coordination.assignment_started(self.root, task['id'], aid, 'ws', 'codex', [], effort='medium')
         coordination.assignment_finished(self.root, task['id'], aid, 'failed', 'Checks failed', [],
                                           [{'exit_code': 1}], error_kind='verification')
+        # The automatic verification failure is neutral (``unknown``) and does
+        # not pause the family; only the reviewed rejection below triggers the
+        # cooldown.
+        self.assertEqual(self.service.observations()[-1]['outcome'], 'unknown')
+        self.assertFalse(self.service.status()['admission']['active_cooldowns'])
         coordination.use_result(self.root, task['id'], aid, 'rejected', 'Reproduced quality failure')
         for index in range(10):
             blocked = self.plan(self.task(turn=f'cooldown-{index}'))
             self.assertEqual(blocked['deliverables'][0]['executor'], 'coordinator')
         observations = self.service.observations()
-        self.assertEqual(len(observations), 31)
+        self.assertEqual(len(observations), 32)
+        # 30 seeded failures plus the one reviewed assignment; the neutral and
+        # rejected rows stay one category case, so history is preserved
+        # without inflating the distinct case count.
+        self.assertEqual(len({row['case_id'] for row in observations}), 31)
         self.assertTrue(self.service.status()['admission']['active_cooldowns'])
         with patch('codex_deepseek_team.routing.time.time', return_value=now + 305):
             recovered = self.plan(self.task(turn='cooldown-finished'))

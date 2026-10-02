@@ -208,6 +208,30 @@ Workers require the Linux OS sandbox with Bubblewrap. Full-access work runs in a
 
 Before allocating a copy, the coordinator can run an optional read-only preflight over the committed source: `deepseek-team workspace check --json` reads only committed `HEAD` names and modes, calls no model, creates no copy, and exits `0` when eligible or `78` when blocked. A failed job retains its copy for inspection with `deepseek-team workspace show WORKSPACE_ID`; continuation stays explicit, and there is no automatic cleanup engine. See [Hardening](https://github.com/kirill31337/deepseek-team/blob/main/docs/HARDENING.md) for the full preflight and recovery rules.
 
+## Preparing a toolchain and re-verifying
+
+Workers see only their owned copy, the runtime prefixes they need and a temporary HOME inside a sparse namespace - never the host root, your HOME or installed SDKs. A launcher that works in your shell can therefore fail inside the worker namespace when a sibling target is missing. Preparation copies an explicitly selected toolchain into the owned copy so it is genuinely visible there, and the declared smoke probes decide readiness before the provider key is read.
+
+```bash
+# Declarative preparation: copy a JDK read-only and declare a smoke probe.
+deepseek-team workspace prepare WORKSPACE_ID \
+  --tool JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64 \
+  --env 'JAVA_HOME={workspace}/.deepseek-tools/JAVA_HOME' \
+  --env 'PATH={workspace}/.deepseek-tools/JAVA_HOME/bin' \
+  --probe 'java -version' \
+  --save-project
+
+# Re-run the declared checks without spending another model call.
+deepseek-team workspace verify WORKSPACE_ID --check 'java -version' --timeout 120
+```
+
+- `--tool NAME=HOST_DIR` copies a selected software directory into `.deepseek-tools/NAME`, bound read-only inside the namespace. `--copy SOURCE=REL_DEST` copies explicit non-secret files or caches; caches stay writable in the copy. `--env NAME=VALUE` accepts only `JAVA_HOME`, `ANDROID_HOME`, `ANDROID_SDK_ROOT`, `GRADLE_USER_HOME`, `M2_HOME`, `KOTLIN_HOME` and `PATH`, each rooted in the workspace with the literal `{workspace}` placeholder.
+- `--probe COMMAND` runs only inside the worker namespace, before any model key; a failed probe stops the job. `--save-project` records a private recipe that replays these declarations into a later copy and never executes or replays host commands. The legacy `workspace prepare ID -- COMMAND ARG ...` form is unchanged and still runs on the coordinator host.
+- `workspace verify ID [--check COMMAND] [--timeout SECONDS] [--json]` rebuilds the prepared environment, reruns the declared or supplied checks and appends evidence. It never loads the provider key, starts a relay or starts a model, and it preserves the original worker result. Output is capped at 65,536 bytes per stream, redacted, and kept owner-only under the workspace's private `diagnostics/` directory.
+- Checks are captured as a baseline before the model runs, so an already-red suite does not block a bugfix assignment. A failed project check stays neutral `unknown` until the coordinator reviews the actual diff and evidence.
+
+Realistic Java, Android and Gradle recipes, the Java/security materialization rules and the evidence causes are in the [toolchain guide](https://github.com/kirill31337/deepseek-team/blob/main/docs/TOOLCHAINS.md).
+
 ## Diagnostics
 
 ```bash
@@ -229,7 +253,7 @@ deepseek-team setup --runtime codex --no-key   # or claude / both
 deepseek-team doctor --runtime codex --offline
 ```
 
-`setup` updates the selected user-level hooks and refreshes both managed instruction files (`AGENTS.md` and `CLAUDE.md`) in the repository you run it from when they are already attached. Every other attached project refreshes its own blocks automatically on its next session or prompt, so repeating `init` in each existing project is no longer required; run `init` only to attach a project for the first time or to deliberately repair its managed blocks. Only the package-owned blocks are rewritten, so your own instruction text and saved settings are preserved. Installing or upgrading with pip, pipx or uv does not run setup automatically. Run `setup` to update hook definitions; native trust is reviewed separately in the coordinator. A project that stays closed refreshes when you next open it. With uv, use `uv tool upgrade deepseek-team`. In a virtual environment, use its `python -m pip install --upgrade deepseek-team`. Keep one install channel per machine; a local-clone pipx installation is refreshed with `pipx install --force .` from the updated clone.
+Upgrading from 0.8.7 or 0.8.8 uses the same steps. `setup` updates the selected user-level hooks and refreshes both managed instruction files (`AGENTS.md` and `CLAUDE.md`) in the repository you run it from when they are already attached. Every other attached project refreshes its own blocks automatically on its next session or prompt, so repeating `init` in each existing project is no longer required; run `init` only to attach a project for the first time or to deliberately repair its managed blocks. Only the package-owned blocks are rewritten, so your own instruction text and saved settings are preserved. Installing or upgrading with pip, pipx or uv does not run setup automatically. Run `setup` to update hook definitions; native trust is reviewed separately in the coordinator. A project that stays closed refreshes when you next open it. With uv, use `uv tool upgrade deepseek-team`. In a virtual environment, use its `python -m pip install --upgrade deepseek-team`. Keep one install channel per machine; a local-clone pipx installation is refreshed with `pipx install --force .` from the updated clone.
 
 To remove DeepSeek Team, detach each project before uninstalling. If you also want to delete the saved DeepSeek key, run `deepseek-team auth remove` while the command is still installed.
 
@@ -246,6 +270,7 @@ pipx uninstall deepseek-team
 - [Routing guide](https://github.com/kirill31337/deepseek-team/blob/main/docs/ROUTING.md) - classifier, router, admission, evidence and feedback.
 - [Delegation lessons](https://github.com/kirill31337/deepseek-team/blob/main/docs/DELEGATION_LESSONS.md) - the private journal, review cadence and bounded advisory rules.
 - [Hardening](https://github.com/kirill31337/deepseek-team/blob/main/docs/HARDENING.md) - coordinator and worker boundaries, preflight and recovery.
+- [Toolchains](https://github.com/kirill31337/deepseek-team/blob/main/docs/TOOLCHAINS.md) - prepare SDKs/JDKs, smoke probes, recipes, baseline and re-verification.
 - [Publishing](https://github.com/kirill31337/deepseek-team/blob/main/docs/PUBLISHING.md) - release-maintainer details.
 - [Releases](https://github.com/kirill31337/deepseek-team/releases) - version notes for every release.
 - Russian README: [README.ru.md](https://github.com/kirill31337/deepseek-team/blob/main/README.ru.md)

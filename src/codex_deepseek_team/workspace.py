@@ -69,7 +69,7 @@ def git(root: Path, *args: str, ok=(0,)) -> bytes:
     result = subprocess.run(
         ['git', '--no-pager', '-c', 'core.fsmonitor=false', '-c', 'core.filemode=true',
          '-c', 'core.hooksPath=' + os.devnull, '-c', 'core.attributesFile=' + os.devnull,
-         '-c', 'core.ignoreStat=false', '-C', str(root), *args],
+         '-c', 'core.ignoreStat=false', '-c', 'diff.autoRefreshIndex=false', '-C', str(root), *args],
         env=git_environment(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     if result.returncode not in ok:
         raise WorkspaceError('Git preparation/verification failed; the owned copy is retained.')
@@ -267,8 +267,12 @@ class Workspace:
 
     def changes(self) -> tuple[list[str], int]:
         self.verify()
-        names = git(self.path, 'diff', '--no-ext-diff', '--no-textconv', '--no-renames',
-                    '--name-only', '-z', 'HEAD', '--')
+        # --name-only can report stat-only differences when index refresh is
+        # disabled. --numstat compares content while keeping the index intact.
+        rows = git(self.path, 'diff', '--no-ext-diff', '--no-textconv', '--no-renames',
+                   '--numstat', '-z', 'HEAD', '--')
+        names = b''.join(row.split(b'\t', 2)[2] + b'\0'
+                         for row in rows.split(b'\0') if row)
         names += git(self.path, 'ls-files', '--others', '--exclude-standard', '-z')
         ignored = git(self.path, 'ls-files', '--others', '--ignored', '--exclude-standard', '-z')
         return sorted({os.fsdecode(n) for n in names.split(b'\0') if n}), sum(bool(n) for n in ignored.split(b'\0'))
@@ -532,6 +536,8 @@ def prepare(copy: Workspace, command: list[str], *, recover: bool = False) -> in
         _private(home, create=True)
         env = git_environment()
         env.update(HOME=str(home), PIP_NO_INPUT='1')
+        from . import toolchains
+        env = toolchains.environment_for(copy, env)
         try:
             result = subprocess.run(command, cwd=copy.path, env=env, check=False)
             copy.finish('succeeded' if result.returncode == 0 else 'failed',
@@ -541,3 +547,105 @@ def prepare(copy: Workspace, command: list[str], *, recover: bool = False) -> in
         except BaseException:
             copy.failed('preparation', 78)
             raise
+
+
+def _publish_verifications(copy: Workspace) -> None:
+    """Replay private canonical observations into their original ledger attempt."""
+    from . import coordination
+    pending = copy.metadata.get('pending_verifications', [])
+    if not isinstance(pending, list):
+        raise WorkspaceError('Invalid pending verification evidence.', 64)
+    while pending:
+        entry = pending[0]
+        if (not isinstance(entry, dict) or set(entry) != {
+                'task_id', 'assignment_id', 'finished_at', 'run'}):
+            raise WorkspaceError('Invalid pending verification evidence.', 64)
+        coordination.record_verification(copy.source, entry['task_id'],
+            entry['assignment_id'], entry['run'], finished_at=entry['finished_at'])
+        del pending[0]
+        if not pending:
+            copy.metadata.pop('pending_verifications', None)
+        copy.save()
+
+
+def verify_checks(copy: Workspace, commands: list[str] | None = None,
+                  *, timeout: float = 120) -> dict:
+    """Run explicit checks in the original boundary, without a model or secrets.
+
+    Verification is an appended observation. It does not begin another worker
+    attempt or replace the original status, diff, checks or quality feedback.
+    """
+    from . import (check_evidence, coordination, development, prepared_inputs,
+                   runtime_preflight, toolchains, verification, worker)
+    import uuid
+    if not isinstance(timeout, (int, float)) or not 0 < timeout < float('inf'):
+        raise WorkspaceError('Verification timeout must be a positive finite number.', 64)
+    with copy.lock(recover=True):
+        selected = copy.metadata.get('verification_commands', []) if commands is None else commands
+        if not isinstance(selected, list) or not selected:
+            raise WorkspaceError('No declared checks; pass at least one --check COMMAND.', 64)
+        for command in selected:
+            try:
+                verification.first_executable(command)
+            except verification.CheckCommandError:
+                raise WorkspaceError('Invalid verification command.', 64) from None
+        _publish_verifications(copy)
+        association = None
+        task_id, assignment_id = copy.metadata.get('coord_task'), copy.metadata.get('coord_assignment')
+        if task_id and assignment_id:
+            row = coordination._assignment(coordination.load_task(copy.source, task_id), assignment_id)
+            if row.get('status') not in ('succeeded', 'failed'):
+                raise coordination.CoordinationError('Verification requires a terminal assignment.', 75)
+            if row.get('workspace_id') != copy.id:
+                raise coordination.CoordinationError('Verification belongs to a different workspace.', 64)
+            association = dict(task_id=task_id, assignment_id=assignment_id,
+                               finished_at=row.get('finished_at'))
+        toolchains.apply_saved_recipe(copy)
+        _sb, backend = worker.resolve_os_sandbox('required')
+        state = copy.directory.parent.parent
+        with tempfile.TemporaryDirectory(prefix='verify-', dir=state) as session, \
+                tempfile.TemporaryDirectory(prefix='dst-verify-') as transport:
+            home, control = Path(session), Path(transport)
+            runtime = copy.metadata.get('runtime', 'codex')
+            binary = copy.metadata.get('runtime_binary', runtime)
+            explicit = copy.metadata.get('runtime_explicit', 'runtime_binary' in copy.metadata)
+            if not explicit:
+                binary = runtime
+            writable = copy.metadata.get('effective_access', 'full-access') == 'full-access'
+
+            def context_factory(candidate, candidate_runtime):
+                return development.prepared_context(copy, backend, home, control,
+                    candidate, candidate_runtime, writable=writable,
+                    effort=copy.metadata.get('effort', 'high'))
+
+            selection = runtime_preflight.select_runtime(runtime,
+                binary if runtime == 'codex' else 'codex',
+                binary if runtime == 'claude' else 'claude', context_factory,
+                explicit_codex=runtime == 'codex' and explicit,
+                explicit_claude=runtime == 'claude' and explicit)
+            layout, env = selection.layout, selection.environment
+            directory = copy.directory / 'diagnostics'
+            before = prepared_inputs.input_snapshot(copy)
+            probes = development.run_checks(layout, env, toolchains.probes_for(copy),
+                timeout, directory=directory, phase='verify-probe')
+            checks = []
+            if not any(row['exit_code'] for row in probes):
+                checks = development.run_checks(layout, env, selected, timeout,
+                    directory=directory, phase='verify')
+            baseline = copy.metadata.get('baseline_checks', [])
+            # A recovered environment may verify successfully after an old
+            # baseline timeout; only current infrastructure failures block it.
+            comparison = [] if any(row.get('timed_out') or row.get('launch_failed')
+                                   for row in baseline) else baseline
+            classification = check_evidence.classify_checks(comparison, checks, probes=probes)
+            failed = any(row['exit_code'] for row in [*probes, *checks])
+            run = dict(id=uuid.uuid4().hex, workspace_id=copy.id,
+                status='failed' if failed else 'passed', checks=checks or probes,
+                baseline_checks=baseline, verification_cause=classification['cause'],
+                prepared_input_changes=prepared_inputs.input_changes(copy, before), at=time.time())
+            copy.metadata.setdefault('verification_runs', []).append(run)
+            if association:
+                copy.metadata.setdefault('pending_verifications', []).append(dict(association, run=run))
+            copy.save()
+            _publish_verifications(copy)
+            return run
