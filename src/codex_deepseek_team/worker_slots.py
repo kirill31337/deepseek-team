@@ -146,24 +146,11 @@ def _call(callback: Optional[Callable[[], object]]) -> None:
 
 
 def _open_state(state: Path) -> int:
+    from .state_storage import open_private_directory, StorageError
     try:
-        state.mkdir(mode=0o700, parents=True, exist_ok=True)
-    except OSError:
-        raise SlotError(78, _UNSAFE) from None
-    try:
-        directory = os.open(
-            state, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
-    except OSError:
-        raise SlotError(78, _UNSAFE) from None
-    try:
-        info = os.fstat(directory)
-        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
-                or info.st_mode & 0o077):
-            raise SlotError(78, _UNSAFE)
-    except BaseException:
-        os.close(directory)
-        raise
-    return directory
+        return open_private_directory(state, create=True, label='Worker state root')
+    except StorageError as error:
+        raise SlotError(error.code, str(error)) from None
 
 
 def _open_file(directory: int, name: str, *, create: bool) -> int:

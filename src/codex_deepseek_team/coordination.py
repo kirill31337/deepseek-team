@@ -21,7 +21,7 @@ import tempfile
 import time
 from typing import Any
 
-from . import lessons, scope_matching, settings
+from . import lessons, scope_matching, settings, state_storage
 from . import verification
 from .config import sync_directory
 from .effort import DEFAULT_EFFORT, normalize_effort, normalize_policy_effort
@@ -87,8 +87,11 @@ class CoordinationError(Exception):
 
 
 def _state_root() -> Path:
-    configured = os.environ.get("DEEPSEEK_TEAM_STATE_DIR")
-    return Path(configured).absolute() if configured else Path.home() / ".local/state/codex-deepseek"
+    from .state_storage import state_root, StorageError
+    try:
+        return state_root()
+    except StorageError as error:
+        raise CoordinationError(str(error), error.code) from None
 
 
 def _project_root(root: Path) -> Path:
@@ -103,23 +106,13 @@ def _project_root(root: Path) -> Path:
 def _project_dir(root: Path) -> Path:
     root = _project_root(root)
     state = _state_root()
-    state.mkdir(mode=0o700, parents=True, exist_ok=True)
-    try:
-        os.chmod(state, 0o700)
-    except OSError:
-        pass
-    info = state.lstat()
-    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
-            or info.st_mode & 0o077):
-        raise CoordinationError("Coordination state root must be private and user-owned.")
     key = hashlib.sha256(os.fsencode(str(root))).hexdigest()[:24]
     directory = state / "coordination" / key
-    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     try:
-        os.chmod(directory.parent, 0o700)
-        os.chmod(directory, 0o700)
-    except OSError:
-        pass
+        for path in (state, directory.parent, directory):
+            state_storage.check_private_directory(path, create=True)
+    except state_storage.StorageError as error:
+        raise CoordinationError(str(error), error.code) from None
     marker = directory / "project.json"
     if not marker.exists():
         _atomic(marker, {"path": str(root), "schema": 1})

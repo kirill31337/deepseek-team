@@ -15,7 +15,7 @@ import tempfile
 import time
 import tomllib
 
-from . import sandbox
+from . import sandbox, state_storage
 from .effort import DEFAULT_EFFORT, EFFORT_LEVELS, normalize_effort
 
 
@@ -467,9 +467,13 @@ def parse_args():
     parser.add_argument('--codex', help='Codex executable to use; an explicit value is pinned.')
     parser.add_argument('--claude', help='Claude Code executable to use; an explicit value is pinned.')
     parser.add_argument('--state-dir', type=Path,
-                        default=Path.home() / '.local/state/codex-deepseek',
-                        help='Shared lock directory; keep the same directory for all workers.')
+                        help='Private shared state root; overrides DEEPSEEK_TEAM_STATE_DIR '
+                             'and ~/.local/state/codex-deepseek. Use the same root for all workers.')
     args = parser.parse_args()
+    try:
+        args.state_dir = state_storage.state_root(args.state_dir)
+    except state_storage.StorageError as error:
+        raise WorkerError(error.code, str(error)) from None
     args.codex_explicit = args.codex is not None
     args.claude_explicit = args.claude is not None
     if args.codex is None:

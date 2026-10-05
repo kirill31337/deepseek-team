@@ -14,15 +14,17 @@ from types import SimpleNamespace
 import urllib.error
 import urllib.request
 
-from . import activation, settings, worker
+from . import activation, settings, state_storage, worker
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 
 
-def call(task, cwd=None, runtime='codex', os_sandbox='required'):
-    return subprocess.run([sys.executable, '-P', '-m', 'codex_deepseek_team.worker',
-                           '--runtime', runtime, '--access', 'read-only',
-                           '--os-sandbox', os_sandbox],
+def call(task, cwd=None, runtime='codex', os_sandbox='required', state_dir=None):
+    command = [sys.executable, '-P', '-m', 'codex_deepseek_team.worker',
+               '--runtime', runtime, '--access', 'read-only', '--os-sandbox', os_sandbox]
+    if state_dir is not None:
+        command += ['--state-dir', str(state_storage.state_root(state_dir))]
+    return subprocess.run(command,
                           input=task, text=True, capture_output=True, cwd=cwd,
                           env=dict(os.environ, PYTHONPATH=str(PACKAGE_ROOT)))
 
@@ -216,7 +218,7 @@ def coordination_status(runtime, root=None):
     return installed, attached, trust
 
 
-def live_tests(runtimes=('codex',), os_sandbox='required'):
+def live_tests(runtimes=('codex',), os_sandbox='required', state_dir=None):
     if _delegation_disabled():
         print('Live check disabled by DeepSeek delegation switch.')
         return 69
@@ -233,7 +235,7 @@ def live_tests(runtimes=('codex',), os_sandbox='required'):
     if code:
         print('API probe failed; no worker started.')
         return code
-    state = Path.home() / '.local/state/codex-deepseek'
+    state = state_storage.state_root(state_dir)
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
     for runtime in runtimes:
         with tempfile.TemporaryDirectory(prefix='doctor-', dir=state) as directory:
@@ -242,7 +244,7 @@ def live_tests(runtimes=('codex',), os_sandbox='required'):
             (root / 'evidence.txt').write_text('DEEPSEEK_TEAM_SYNTHETIC_EVIDENCE')
             before = repository_fingerprint(root)
             print(f'Running one {runtime} read-only worker on synthetic data; no total deadline...', flush=True)
-            result = call('Read only evidence.txt. Return its exact content and DEEPSEEK_TEAM_OK. Do not read other files, run tests, use network or write anything.', cwd=root, runtime=runtime, os_sandbox=os_sandbox)
+            result = call('Read only evidence.txt. Return its exact content and DEEPSEEK_TEAM_OK. Do not read other files, run tests, use network or write anything.', cwd=root, runtime=runtime, os_sandbox=os_sandbox, state_dir=state)
             ok = (result.returncode == 0 and 'DEEPSEEK_TEAM_SYNTHETIC_EVIDENCE' in result.stdout
                   and 'DEEPSEEK_TEAM_OK' in result.stdout and before == repository_fingerprint(root))
             print(f'Synthetic {runtime} worker check: ' + ('PASS' if ok else 'FAIL'))
@@ -262,6 +264,9 @@ def main(argv=None):
                         help='Runtime(s) to verify; default: codex.')
     parser.add_argument('--os-sandbox', choices=['required'], default='required',
                         help='Verify the required Bubblewrap/AppArmor containment.')
+    parser.add_argument('--state-dir', type=Path,
+                        help='Check this private state root; otherwise use '
+                             'DEEPSEEK_TEAM_STATE_DIR or ~/.local/state/codex-deepseek.')
     parser.add_argument('--delegation-level', type=delegation_settings.parse_level,
                         choices=delegation_settings.LEVELS,
                         help='Per-diagnostic override; auto adapts per task, 25/50/75 force a fixed profile.')
@@ -278,6 +283,8 @@ def main(argv=None):
         if args.live and not policy.enabled:
             print('Live check disabled by DeepSeek delegation switch.')
             return 69
+        selected_state = state_storage.prepare_storage(args.state_dir)
+        print(f'Worker storage: PASS ({selected_state}; private allocation checked).')
         sandbox, backend = worker.resolve_os_sandbox('required')
         print(f'OS sandbox: PASS ({backend.source}, {backend.bwrap})')
         restriction = sandbox.apparmor_restriction()
@@ -300,12 +307,12 @@ def main(argv=None):
         if 'codex' in runtimes:
             paths = [worker.codex_home() / 'config.toml', worker.codex_home() / 'auth.json']
         before = [path.read_bytes() if path.exists() else None for path in paths]
-        code = live_tests(runtimes, os_sandbox=args.os_sandbox)
+        code = live_tests(runtimes, os_sandbox=args.os_sandbox, state_dir=selected_state)
         unchanged = before == [path.read_bytes() if path.exists() else None for path in paths]
         if paths:
             print('Primary Codex configuration/auth unchanged:', unchanged)
         return code if unchanged else 1
-    except worker.WorkerError as error:
+    except (worker.WorkerError, state_storage.StorageError) as error:
         print(error.message, file=sys.stderr)
         return error.code
     except (OSError, subprocess.SubprocessError):

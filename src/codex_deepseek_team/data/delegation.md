@@ -13,6 +13,18 @@ inspect their results before integration. Check again before every new assignmen
 deepseek-team config show --effective --instructions --runtime {runtime}
 ```
 
+The session/prompt bootstrap checks private worker storage before opening a
+coordination task. Before the first worker in a session, confirm local readiness
+with `deepseek-team doctor --runtime {runtime} --offline`, including read-only
+assignments. Storage must use ordinary current-user-owned directories with mode
+700; symbolic links in the state path or its `workspaces` child are rejected.
+Do not repair this by following a link, deleting retained copies, changing a
+foreign owner or weakening the sandbox. Choose an ordinary state root explicitly.
+`DEEPSEEK_TEAM_STATE_DIR` selects the shared root for the coordinator and commands;
+`--state-dir` overrides worker/workspace/doctor storage for that command only.
+Changing the shared root does not migrate prior coordination tasks: preserve the
+old root and register new work in the newly selected root.
+
 Percentages are target work-distribution profiles, not measured contribution. Never
 derive an "actual percentage" from calls, tasks, files, lines, tokens, time, or a
 subjective list of bullets. Access remains independent of the target profile:

@@ -16,6 +16,7 @@ import time
 import uuid
 
 from .settings import git_environment, project_root, SettingsError
+from . import state_storage
 
 SCHEMA = 'deepseek-team-workspace-v1'
 DEFAULT_STATE = Path.home() / '.local/state/codex-deepseek'
@@ -29,12 +30,10 @@ class WorkspaceError(Exception):
 
 
 def _private(path: Path, *, create: bool = False) -> None:
-    if create:
-        path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    info = path.lstat()
-    if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
-            or info.st_mode & 0o077):
-        raise WorkspaceError(f'Workspace control directory must be private and owned: {path}.')
+    try:
+        state_storage.check_private_directory(path, create=create)
+    except state_storage.StorageError as error:
+        raise WorkspaceError(str(error), error.code) from None
 
 
 def _read(path: Path) -> bytes:
@@ -341,7 +340,7 @@ def changed_since(copy: Workspace, before: dict[str, str]) -> list[str]:
                   if before.get(name) != after.get(name))
 
 
-def create(source: Path, state: Path = DEFAULT_STATE) -> Workspace:
+def create(source: Path, state: Path | None = None) -> Workspace:
     # Preflight committed HEAD before any state directory, copy or fetch exists, so a
     # blocked source names its offenders and never leaves an incomplete retained copy.
     report = check_source(source)
@@ -349,7 +348,10 @@ def create(source: Path, state: Path = DEFAULT_STATE) -> Workspace:
         raise WorkspaceError(_blocked_message(report['blockers']))
     source = Path(report['source'])
     head = report['head']
-    state = Path(state).absolute()
+    try:
+        state = state_storage.state_root(state)
+    except state_storage.StorageError as error:
+        raise WorkspaceError(str(error), error.code) from None
     _private(state, create=True)
     root = state / 'workspaces'
     _private(root, create=True)
@@ -396,7 +398,10 @@ def create(source: Path, state: Path = DEFAULT_STATE) -> Workspace:
 def load(state: Path, identifier: str) -> Workspace:
     if not re.fullmatch(r'[0-9a-f]{32}', identifier):
         raise WorkspaceError('--workspace must be an owned workspace ID, never a foreign directory.')
-    state = Path(state).absolute()
+    try:
+        state = state_storage.state_root(state)
+    except state_storage.StorageError as error:
+        raise WorkspaceError(str(error), error.code) from None
     directory = state / 'workspaces' / identifier
     try:
         for path in (state, state / 'workspaces', directory):

@@ -189,7 +189,7 @@ class SetupTests(unittest.TestCase):
             self.assertFalse(self.codex.exists())
             profile.write_text('installed')
         with mock.patch.object(onboarding.platform, 'freedesktop_os_release', return_value={'ID': 'ubuntu'}), \
-             mock.patch.object(onboarding.os, 'geteuid', return_value=1000), \
+             mock.patch.object(onboarding, 'os', mock.Mock(geteuid=lambda: 1000)), \
              mock.patch('subprocess.run', side_effect=lambda command, **kwargs: commands.append(command)), \
              mock.patch.object(sandbox, 'install_apparmor', side_effect=install_profile):
             code, output = self.call('--with-sandbox', '--no-key')
@@ -208,7 +208,7 @@ class SetupTests(unittest.TestCase):
             self.probe.side_effect = [sandbox.SandboxError(78, 'missing'), backend, backend]
             with self.subTest(uid=uid), \
                  mock.patch.object(onboarding.platform, 'freedesktop_os_release', return_value={'ID': 'ubuntu'}), \
-                 mock.patch.object(onboarding.os, 'geteuid', return_value=uid), \
+                 mock.patch.object(onboarding, 'os', mock.Mock(geteuid=lambda: uid)), \
                  mock.patch('subprocess.run') as run, \
                  mock.patch.object(sandbox, 'install_apparmor', side_effect=AssertionError('unnecessary profile load')):
                 code, output = self.call('--with-sandbox', '--no-key')

@@ -15,6 +15,15 @@ deepseek-team status
 deepseek-team config show --effective --instructions --runtime {runtime}
 ```
 
+The session/prompt bootstrap also checks private worker storage. Before the first
+worker, run `deepseek-team doctor --runtime {runtime} --offline`, even for read-only
+work. If storage is a symbolic link, has a foreign owner or unsafe permissions,
+choose an ordinary private state root; preserve the link, retained copies and
+old ledger. `DEEPSEEK_TEAM_STATE_DIR` selects the shared root for coordinator and
+commands; a worker/workspace/doctor `--state-dir` overrides only that command's
+storage. A new shared root requires new coordination work; existing tasks are
+never migrated automatically. Keep the mandatory worker sandbox.
+
 - `deepseek-team off` stays authoritative: while disabled, continue locally and do
   not delegate. Fresh or current access is never widened automatically, and
   read-only never becomes write access.

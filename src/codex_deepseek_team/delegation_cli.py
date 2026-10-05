@@ -93,7 +93,9 @@ def main(argv):
         check.add_argument('--json', action='store_true')
         for name in ('create', 'show', 'diff', 'prepare', 'import', 'verify'):
             sub = subs.add_parser(name)
-            sub.add_argument('--state-dir', type=Path, default=Path.home() / '.local/state/codex-deepseek')
+            sub.add_argument('--state-dir', type=Path,
+                             help='Private state root; defaults to DEEPSEEK_TEAM_STATE_DIR '
+                                  'or ~/.local/state/codex-deepseek.')
             if name == 'create':
                 sub.add_argument('path', type=Path, nargs='?', default=Path.cwd())
             else:
