@@ -11,7 +11,7 @@ from unittest import mock
 
 from codex_deepseek_team import (activation, cli, config, coordination,
                                  coordinator_hooks, doctor, project, sandbox,
-                                 state_storage, worker, worker_slots, workspace)
+                                 settings, state_storage, worker, worker_slots, workspace)
 
 
 class StorageTests(unittest.TestCase):
@@ -201,6 +201,79 @@ class StorageTests(unittest.TestCase):
                                       session_id='storage-fresh', source='startup'))
         self.assertEqual((self.state / 'workspaces').stat().st_mode & 0o777, 0o700)
         self.assertEqual(list((self.state / 'workspaces').iterdir()), [])
+
+    def assert_failed_storage_lifecycle(self, source, reason):
+        for runtime in ('codex', 'claude'):
+            for event in ('UserPromptSubmit', 'PreToolUse', 'Stop'):
+                with self.subTest(runtime=runtime, event=event):
+                    result = coordinator_hooks.handle(dict(
+                        hook_event_name=event, cwd=str(source),
+                        session_id='storage-stale-' + runtime, turn_id='next',
+                        prompt='Inspect source', tool_name='Write',
+                        tool_input={'file_path': str(source / 'a.py'), 'content': 'x'}),
+                        runtime=runtime)
+                    output = result['hookSpecificOutput']
+                    self.assertIn(reason, output['additionalContext'])
+                    self.assertIn('Continue locally', output['additionalContext'])
+                    self.assertNotIn('permissionDecision', output)
+                    self.assertNotIn('decision', result)
+
+    def test_failed_bootstrap_tool_and_stop_preserve_public_root(self):
+        source = self.repository()
+        project.attach(source, coordinator='both')
+        self.state.mkdir(mode=0o755)
+        self.state.chmod(0o755)
+        self.assert_failed_storage_lifecycle(source, 'permissions')
+        with self.assertRaises(coordination.CoordinationError):
+            coordination.latest_task(source, 'storage-stale-codex')
+        self.assertEqual(self.state.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(list(self.state.iterdir()), [])
+
+    def test_failed_bootstrap_tool_and_stop_preserve_linked_root_target(self):
+        source = self.repository()
+        project.attach(source, coordinator='both')
+        target = self.root / 'retained-state'
+        target.mkdir(mode=0o755)
+        target.chmod(0o755)
+        (target / 'retained').write_text('keep')
+        self.state.symlink_to(target, target_is_directory=True)
+        self.assert_failed_storage_lifecycle(source, 'symbolic link')
+        with self.assertRaises(coordination.CoordinationError):
+            coordination.latest_task(source, 'storage-stale-codex')
+        self.assertTrue(self.state.is_symlink())
+        self.assertEqual(target.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(sorted(p.name for p in target.iterdir()), ['retained'])
+        self.assertEqual((target / 'retained').read_text(), 'keep')
+
+    def test_failed_bootstrap_tool_and_stop_preserve_linked_ancestor(self):
+        source = self.repository()
+        project.attach(source, coordinator='both')
+        target = self.root / 'retained-parent'
+        target.mkdir(mode=0o700)
+        alias = self.root / 'alias'
+        alias.symlink_to(target, target_is_directory=True)
+        os.environ['DEEPSEEK_TEAM_STATE_DIR'] = str(alias / 'state')
+        self.assert_failed_storage_lifecycle(source, 'symbolic link')
+        with self.assertRaises(coordination.CoordinationError):
+            coordination.latest_task(source, 'storage-stale-codex')
+        self.assertTrue(alias.is_symlink())
+        self.assertEqual(list(target.iterdir()), [])
+
+    def test_failed_bootstrap_tool_and_stop_leave_old_tasks_untouched(self):
+        source = self.repository()
+        project.attach(source, coordinator='both')
+        target = self.link_storage()
+        for runtime in ('codex', 'claude'):
+            coordination.begin_turn(source, session_id='storage-stale-' + runtime,
+                                    turn_id='old', prompt='Old unfinished work',
+                                    policy=settings.resolve(source), runtime=runtime)
+        ledger = self.state / 'coordination'
+        snapshot = {p.relative_to(ledger): p.read_bytes()
+                    for p in ledger.rglob('*') if p.is_file()}
+        self.assert_failed_storage_lifecycle(source, 'symbolic link')
+        self.assertEqual(snapshot, {p.relative_to(ledger): p.read_bytes()
+                                    for p in ledger.rglob('*') if p.is_file()})
+        self.assertEqual((target / 'retained-data').read_text(), 'preserve existing copies')
 
     def test_disabled_bootstrap_does_not_initialize_storage(self):
         source = self.repository()

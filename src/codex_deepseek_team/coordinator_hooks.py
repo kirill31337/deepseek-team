@@ -283,16 +283,19 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
             return _context(_with_diagnostic(activation.DISABLED_GUIDANCE, diagnostic), event)
         if policy is None:
             raise resolve_error
-        try:
-            state_storage.prepare_storage()
-        except state_storage.StorageError as error:
-            return _context(_with_diagnostic(
-                'DeepSeek worker storage is unavailable: ' + str(error) + '\n'
-                'Resolve storage readiness before planning or launching a worker. '
-                'Continue locally while it is unavailable; no worker or provider request '
-                'was started by this bootstrap.', diagnostic), event)
     elif not activation.resolve(root).enabled:
         return {}
+    # Every enabled event must honor an unavailable root before ledger access.
+    # Otherwise tool/stop events could revive old tasks after bootstrap declined
+    # storage, imposing gates despite its local-continuation guidance.
+    try:
+        state_storage.prepare_storage()
+    except state_storage.StorageError as error:
+        return _context(_with_diagnostic(
+            'DeepSeek worker storage is unavailable: ' + str(error) + '\n'
+            'Resolve storage readiness before planning or launching a worker. '
+            'Continue locally while it is unavailable; no worker or provider request '
+            'was started by this hook.', diagnostic), event)
     session = str(payload.get("session_id") or "")
     if not session:
         return {}
