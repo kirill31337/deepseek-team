@@ -88,7 +88,7 @@ def acquire(state: Path, *, limit: int = DEFAULT_MAX_WORKERS, timeout: float = 0
             _call(validate)
             try:
                 if wait and ticket_fd is None:
-                    ticket_fd, ticket_name, sequence = _enqueue(directory)
+                    ticket_fd, ticket_name, sequence = _enqueue(directory, validate)
                 slot = _attempt(directory, limit, sequence, validate)
             except BlockingIOError:
                 # Contention on the allocator is queue wait too: it must obey
@@ -225,9 +225,10 @@ def _pending_before(directory: int, sequence: Optional[int]) -> int:
                if sequence is None or number < sequence)
 
 
-def _enqueue(directory: int) -> tuple[int, str, int]:
+def _enqueue(directory: int, validate=None) -> tuple[int, str, int]:
     allocator = _allocator(directory)
     try:
+        _call(validate)
         _reclaim_stale_tickets(directory)
         highest = max((number for number, _ in _tickets(directory)), default=0)
         sequence = max(highest + 1, time.monotonic_ns())
@@ -290,6 +291,7 @@ def _attempt(directory: int, limit: int, sequence: Optional[int],
     """Admit at most one caller while holding the private allocator lock."""
     allocator = _allocator(directory)
     try:
+        _call(validate)
         _reclaim_stale_tickets(directory)
         occupied, free = _probe_slots(directory)
         if occupied >= limit:

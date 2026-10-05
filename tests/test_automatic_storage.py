@@ -224,6 +224,35 @@ class AutomaticStorageTests(unittest.TestCase):
         self.assertFalse(any(self.state.glob('ticket-*')))
         self.assertFalse(any(self.state.glob('worker-*.lock')))
 
+    def assert_publication_before_admission_preserves_old_ticket(self, no_wait):
+        self.broken_workspaces()
+        stale = self.state / 'ticket-00000000000000000042'
+        stale.write_text('retained ticket'); stale.chmod(0o600)
+        arguments = ['deepseek-team', 'read source'] + (['--no-wait'] if no_wait else [])
+        with mock.patch.object(sys, 'argv', arguments):
+            args = worker.parse_args()
+        original = worker_slots._allocator
+        published = []
+        def publish_before_allocator(directory):
+            if not published:
+                published.append(None)
+                published[0] = state_storage.prepare_storage()
+            return original(directory)
+        with mock.patch.object(worker_slots, '_allocator', side_effect=publish_before_allocator):
+            with self.assertRaises(worker.WorkerError):
+                worker_admission.acquire(args, worker)
+        self.assertNotEqual(published[0], self.state)
+        self.assertTrue(stale.exists(), 'Rejected old-root admission removed a retained ticket')
+        self.assertEqual(stale.read_text(), 'retained ticket')
+        self.assertEqual(list(self.state.glob('ticket-*')), [stale])
+        self.assertFalse(any(self.state.glob('worker-*.lock')))
+
+    def test_no_wait_admission_revalidates_before_reclaiming_old_tickets(self):
+        self.assert_publication_before_admission_preserves_old_ticket(no_wait=True)
+
+    def test_fifo_admission_revalidates_before_reclaiming_old_tickets(self):
+        self.assert_publication_before_admission_preserves_old_ticket(no_wait=False)
+
 
 if __name__ == '__main__':
     unittest.main()
