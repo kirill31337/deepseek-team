@@ -133,18 +133,33 @@ links, including a `workspaces` link to an otherwise private directory, are
 rejected with a specific diagnostic. Existing entries are never chmodded,
 deleted, adopted or relocated to repair this error.
 
-Choose an ordinary directory outside the project to move future work:
+Starting with 0.8.11, no environment variable is required. When the default root
+is unusable (for example, its `workspaces` child is a symbolic link), setup,
+offline doctor and the next enabled project bootstrap can select a new private
+directory under your home and save the choice in
+`~/.config/deepseek-team/storage/selection.json` (`XDG_CONFIG_HOME` is respected).
+All commands and coordinator stores then use that saved root across sessions
+and package upgrades. A healthy default needs no replacement.
+
+Automatic recovery holds the old allocator lock while checking all live slots
+and FIFO tickets and saving the selection. Active workers or waiters prevent a
+switch; retry after they finish. A linked, foreign-owned or inaccessible old
+root cannot prove inactivity and remains an explicit diagnostic. Old copies,
+links, permissions, ledgers and ticket files are preserved. Old task IDs,
+routing history and lessons are not migrated; bootstrap opens new work in the
+selected root. A broken saved selection is reported, never silently replaced.
+
+For automatic preparation without variables:
 
 ```bash
-# Set this before starting Codex/Claude so hooks and commands use the same root.
-export DEEPSEEK_TEAM_STATE_DIR=/absolute/private/deepseek-team-state
 deepseek-team setup --runtime codex --no-key
 deepseek-team doctor --runtime codex --offline
 ```
 
 For `worker`, `workspace` commands and `doctor`, an explicit `--state-dir` has
-priority over that environment variable; otherwise the historical default is
-used. A command override changes only that command's worker storage, not the
+priority over the optional `DEEPSEEK_TEAM_STATE_DIR`, then the saved automatic
+selection, then the historical default. Explicit overrides are never changed by
+automatic recovery. A command override changes only that command's worker storage, not the
 coordination ledger. Use one storage root for concurrent workers. Changing
 `DEEPSEEK_TEAM_STATE_DIR` does **not** migrate old task IDs, copies, routing history
 or lessons: preserve the old root and register new coordination work in the new
