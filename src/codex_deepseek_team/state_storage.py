@@ -13,13 +13,13 @@ import uuid
 
 
 class StorageError(Exception):
-    def __init__(self, message: str, code: int = 78):
-        self.message, self.code = message, code
+    def __init__(self, message: str, code: int = 78, *, errno=None):
+        self.message, self.code, self.errno = message, code, errno
         super().__init__(message)
 
 
 def state_root(explicit=None) -> Path:
-    """Command override > live environment > historical user default.
+    """Command override > live environment > saved recovery > user default.
 
     Explicit command paths retain support for relative paths. Environment
     overrides must be absolute, without parent traversal, as required by the
@@ -33,7 +33,8 @@ def state_root(explicit=None) -> Path:
         if not path.is_absolute() or '..' in path.parts:
             raise StorageError('DEEPSEEK_TEAM_STATE_DIR must be an absolute canonical path.')
         return path
-    return Path.home() / '.local/state/codex-deepseek'
+    from . import storage_selection
+    return storage_selection.read_root() or Path.home() / '.local/state/codex-deepseek'
 
 
 def _problem(path, reason, label):
@@ -82,12 +83,14 @@ def _open_component(parent, name, path, *, create, private, label):
             os.close(fd)
             raise
         return fd
-    except OSError:
-        raise _problem(path, 'is missing or inaccessible', label) from None
+    except OSError as cause:
+        error = _problem(path, 'is missing or inaccessible', label)
+        error.errno = cause.errno
+        raise error from None
 
 
-def open_private_directory(path: Path, *, create=False, parent=None,
-                           label='Workspace control directory') -> int:
+def _open_directory(path: Path, *, create=False, parent=None, private=True,
+                    label='Workspace control directory') -> int:
     """Return an owned descriptor without traversing links in any component.
 
     Only the final directory requires ownership and mode 700; public system
@@ -104,10 +107,12 @@ def open_private_directory(path: Path, *, create=False, parent=None,
         for index, part in enumerate(path.parts[1:], start=1):
             current = current / part
             child = _open_component(fd, part, current, create=create,
-                                    private=index == len(path.parts) - 1, label=label)
+                                    private=private and index == len(path.parts) - 1, label=label)
             os.close(fd)
             fd = child
-        if path == Path('/'):
+        if not private and os.fstat(fd).st_uid != os.geteuid():
+            raise _problem(path, 'has a different owner', label)
+        if path == Path('/') and private:
             _validate(os.fstat(fd), path, label)
         result, fd = fd, None
         return result
@@ -116,19 +121,28 @@ def open_private_directory(path: Path, *, create=False, parent=None,
             os.close(fd)
 
 
+def open_private_directory(path: Path, *, create=False, parent=None,
+                           label='Workspace control directory') -> int:
+    return _open_directory(path, create=create, parent=parent, label=label)
+
+
+def open_owned_directory_for_inspection(path: Path) -> int:
+    """Inspect locks in a rejected owned root without adopting its permissions."""
+    return _open_directory(path, private=False, label='Previous worker state root')
+
+
 def check_private_directory(path: Path, *, create=False) -> None:
     fd = open_private_directory(path, create=create)
     os.close(fd)
 
 
-def prepare_storage(explicit=None) -> Path:
+def _prepare_exact(root: Path) -> Path:
     """Create missing private directories and prove local allocation can work.
 
     Probes only a uniquely named temporary directory and file, opened relative
     to validated descriptors. No workspace, lock slot, ledger, key or provider
     is opened; existing directory permissions are never repaired implicitly.
     """
-    root = state_root(explicit)
     state_fd = open_private_directory(root, create=True, label='Worker state root')
     copies_fd = probe_fd = None
     name = '.storage-check-' + uuid.uuid4().hex
@@ -165,3 +179,38 @@ def prepare_storage(explicit=None) -> Path:
             if copies_fd is not None:
                 os.close(copies_fd)
             os.close(state_fd)
+
+
+def prepare_storage(explicit=None) -> Path:
+    """Prepare explicit/saved storage, or recover an unusable idle default once."""
+    from . import storage_selection, worker_slots
+    root = state_root(explicit)
+    try:
+        return _prepare_exact(root)
+    except StorageError:
+        if explicit is not None or os.environ.get('DEEPSEEK_TEAM_STATE_DIR'):
+            raise
+        selected = storage_selection.read_root()
+        if selected is not None:
+            if selected == root:
+                raise  # Never silently discard an existing saved choice/history.
+            return _prepare_exact(selected)
+    with storage_selection.locked() as selection:
+        selected = storage_selection.read_root(selection)
+        if selected is not None:
+            return _prepare_exact(selected)
+        # Recheck after serializing concurrent bootstraps; another process may
+        # have repaired the default without selecting a replacement.
+        try:
+            return _prepare_exact(root)
+        except StorageError:
+            pass
+        try:
+            with worker_slots.idle_state(root):
+                replacement = Path.home() / ('.deepseek-team-state-' + uuid.uuid4().hex)
+                _prepare_exact(replacement)
+                storage_selection.publish(selection, replacement, root)
+                return replacement
+        except worker_slots.SlotError as error:
+            raise StorageError('Automatic storage recovery could not verify that the previous '
+                               'root has no active or queued workers: ' + str(error), error.code) from None

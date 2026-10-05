@@ -289,7 +289,7 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
     # Otherwise tool/stop events could revive old tasks after bootstrap declined
     # storage, imposing gates despite its local-continuation guidance.
     try:
-        state_storage.prepare_storage()
+        selected_state = state_storage.prepare_storage()
     except state_storage.StorageError as error:
         return _context(_with_diagnostic(
             'DeepSeek worker storage is unavailable: ' + str(error) + '\n'
@@ -313,6 +313,7 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
             f"Effort policy is forced to {policy.effort}: use that level for new DeepSeek assignments. "
         )
         text = (
+            'Worker storage root: ' + json.dumps(str(selected_state)) + '.\n' +
             coordination.summary(task) + "\n"
             "Before delegating any subtask (including small/read-only research), or before "
             "coordinator source edits for a substantial task, register a concrete "
@@ -355,6 +356,7 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
             or coordination.latest_task(root, session))
     if event == "SessionStart":
         base = (
+            'Worker storage root: ' + json.dumps(str(selected_state)) + '.\n' +
             f"DeepSeek Team effective profile: {str(policy.delegation_level) + '%' if policy.delegation_level != 'auto' else 'Auto'}/"
             f"{policy.effective_access}; effort={policy.effort}. "
             f"{'Claude Code' if runtime == 'claude' else 'Codex'} lifecycle enforcement "

@@ -19,8 +19,13 @@ with `deepseek-team doctor --runtime {runtime} --offline`, including read-only
 assignments. Storage must use ordinary current-user-owned directories with mode
 700; symbolic links in the state path or its `workspaces` child are rejected.
 Do not repair this by following a link, deleting retained copies, changing a
-foreign owner or weakening the sandbox. Choose an ordinary state root explicitly.
-`DEEPSEEK_TEAM_STATE_DIR` selects the shared root for the coordinator and commands;
+foreign owner or weakening the sandbox. Setup/doctor/enabled bootstrap can
+automatically select and persist a private replacement for an unusable idle
+default, without variables. All commands use the saved choice. Active slots,
+live queued tickets or an uninspectable old root forbid switching. Preserve all
+old files. Broken saved choices and explicit overrides are diagnosed, never
+silently replaced. The selected root is shown by bootstrap and doctor.
+Optional `DEEPSEEK_TEAM_STATE_DIR` overrides the saved shared root;
 `--state-dir` overrides worker/workspace/doctor storage for that command only.
 Changing the shared root does not migrate prior coordination tasks: preserve the
 old root and register new work in the newly selected root.

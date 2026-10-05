@@ -4,7 +4,7 @@ from pathlib import Path
 import subprocess
 import time
 
-from . import coordination, settings
+from . import coordination, settings, state_storage
 from .routing import RoutingService
 from .routing_models import RoutingError
 
@@ -55,6 +55,10 @@ def acquire(args, api, *, policy=None, root=None):
 
     def validate(*, started=False):
         try:
+            requested = getattr(args, 'state_dir_requested', args.state_dir)
+            if state_storage.state_root(requested) != args.state_dir:
+                raise api.WorkerError(78, 'Worker storage selection changed before admission; '
+                                     'start a new job using the saved storage root.')
             if args.job_deadline is not None and time.monotonic() >= args.job_deadline:
                 raise api.WorkerError(124, 'DeepSeek worker exceeded its total timeout before launch.')
             current = settings.resolve(root)
@@ -80,7 +84,8 @@ def acquire(args, api, *, policy=None, root=None):
                     RoutingService(root).validate_start(item['routing']['decision_id'],
                         already_running=(resuming or started) and row['status'] == 'running',
                         access=coordination._effective_task_access(task, current))
-        except (settings.SettingsError, coordination.CoordinationError, RoutingError) as error:
+        except (settings.SettingsError, coordination.CoordinationError, RoutingError,
+                state_storage.StorageError) as error:
             raise api.WorkerError(getattr(error, 'code', 78), str(error)) from None
 
     def waiting():

@@ -22,6 +22,7 @@ Error codes reported through :class:`SlotError`:
 from __future__ import annotations
 
 import fcntl
+from contextlib import contextmanager
 import math
 import os
 from pathlib import Path
@@ -299,3 +300,39 @@ def _attempt(directory: int, limit: int, sequence: Optional[int],
         return _allocate_slot(directory, free)
     finally:
         os.close(allocator)
+
+
+@contextmanager
+def idle_state(state: Path):
+    """Hold admission closed while proving no live slot or FIFO ticket exists.
+
+    Only inspect an owned root through no-follow descriptors. Preserve every
+    ticket and slot file, including stale tickets, and hold the allocator lock
+    through publication of the replacement selection.
+    """
+    from .state_storage import open_owned_directory_for_inspection, StorageError
+    directory = allocator = None
+    try:
+        try:
+            directory = open_owned_directory_for_inspection(state)
+        except StorageError as error:
+            raise SlotError(error.code, str(error)) from None
+        allocator = _allocator(directory)
+        if _probe_slots(directory)[0]:
+            raise SlotError(75, 'Workers are still running in the previous state root.')
+        for _, name in _tickets(directory):
+            fd = _open_file(directory, name, create=False)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                os.close(fd)
+        yield
+    except BlockingIOError:
+        raise SlotError(75, 'Worker admission or queued workers are active in the previous root.') from None
+    except OSError:
+        raise SlotError(78, 'Cannot safely inspect worker activity in the previous root.') from None
+    finally:
+        if allocator is not None:
+            os.close(allocator)
+        if directory is not None:
+            os.close(directory)

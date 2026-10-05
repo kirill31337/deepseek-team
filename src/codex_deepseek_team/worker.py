@@ -470,6 +470,7 @@ def parse_args():
                         help='Private shared state root; overrides DEEPSEEK_TEAM_STATE_DIR '
                              'and ~/.local/state/codex-deepseek. Use the same root for all workers.')
     args = parser.parse_args()
+    args.state_dir_requested = args.state_dir
     try:
         args.state_dir = state_storage.state_root(args.state_dir)
     except state_storage.StorageError as error:
