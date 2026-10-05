@@ -87,8 +87,11 @@ class CoordinationError(Exception):
 
 
 def _state_root() -> Path:
-    configured = os.environ.get("DEEPSEEK_TEAM_STATE_DIR")
-    return Path(configured).absolute() if configured else Path.home() / ".local/state/codex-deepseek"
+    from .state_storage import state_root, StorageError
+    try:
+        return state_root()
+    except StorageError as error:
+        raise CoordinationError(str(error), error.code) from None
 
 
 def _project_root(root: Path) -> Path:

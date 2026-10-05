@@ -96,13 +96,11 @@ def _normalize_effort(value):
 
 
 def _state_base() -> Path:
-    configured = os.environ.get("DEEPSEEK_TEAM_STATE_DIR")
-    if configured:
-        path = Path(configured)
-        if not path.is_absolute() or ".." in path.parts:
-            raise LessonError("DEEPSEEK_TEAM_STATE_DIR must be an absolute canonical path.")
-        return path
-    return Path.home() / ".local/state/codex-deepseek"
+    from .state_storage import state_root, StorageError
+    try:
+        return state_root()
+    except StorageError as error:
+        raise LessonError(str(error)) from None
 
 
 def _project(root) -> Path:

@@ -120,6 +120,36 @@ A few notes:
   it, and `detach` works in both modes. Projects without the marker keep the default full mode.
   The exact marker is shown in the [0.8.8 release notes](https://github.com/kirill31337/deepseek-team/blob/main/docs/releases/0.8.8.md).
 
+## Private worker storage
+
+Worker copies and lock files normally live under `~/.local/state/codex-deepseek`.
+In 0.8.10, `setup`, the session/prompt bootstrap and `doctor --offline` check this
+storage before model execution, including coordinated **read-only** work. Missing
+state and `workspaces` directories are created with mode `700`, and a temporary
+local allocation probe is removed afterwards. No provider key is read by this check.
+
+The directories must belong to the current user and have mode `700`. Symbolic
+links, including a `workspaces` link to an otherwise private directory, are
+rejected with a specific diagnostic. Existing entries are never chmodded,
+deleted, adopted or relocated to repair this error.
+
+Choose an ordinary directory outside the project to move future work:
+
+```bash
+# Set this before starting Codex/Claude so hooks and commands use the same root.
+export DEEPSEEK_TEAM_STATE_DIR=/absolute/private/deepseek-team-state
+deepseek-team setup --runtime codex --no-key
+deepseek-team doctor --runtime codex --offline
+```
+
+For `worker`, `workspace` commands and `doctor`, an explicit `--state-dir` has
+priority over that environment variable; otherwise the historical default is
+used. A command override changes only that command's worker storage, not the
+coordination ledger. Use one storage root for concurrent workers. Changing
+`DEEPSEEK_TEAM_STATE_DIR` does **not** migrate old task IDs, copies, routing history
+or lessons: preserve the old root and register new coordination work in the new
+root. Package installation alone does not run setup or relocate data.
+
 ## What gets delegated
 
 Auto delegation admits suitable work immediately; it does not wait for prior history to accumulate. A task is a good candidate when it is:

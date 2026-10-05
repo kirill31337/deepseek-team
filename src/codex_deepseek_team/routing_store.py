@@ -78,10 +78,11 @@ def _directory(path: Path) -> int:
 class RoutingStore:
     def __init__(self, root: Path):
         self.root = Path(root).resolve()
-        state = Path(os.environ.get('DEEPSEEK_TEAM_STATE_DIR') or
-                     Path.home() / '.local/state/codex-deepseek')
-        if not state.is_absolute() or '..' in state.parts:
-            raise RoutingError('DEEPSEEK_TEAM_STATE_DIR must be an absolute canonical path.', 78)
+        from .state_storage import state_root, StorageError
+        try:
+            state = state_root()
+        except StorageError as error:
+            raise RoutingError(str(error), error.code) from None
         if state.resolve().is_relative_to(self.root):
             raise RoutingError('Routing state must be outside the project working tree.', 78)
         self.state = state

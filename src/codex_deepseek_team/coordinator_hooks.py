@@ -9,7 +9,7 @@ import time
 import uuid
 
 from . import (activation, coordination, coordinator_activity, lessons, project,
-                 scope_matching, settings)
+                 scope_matching, settings, state_storage)
 from .shell_mutation import classify_shell_mutation
 
 
@@ -283,6 +283,14 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
             return _context(_with_diagnostic(activation.DISABLED_GUIDANCE, diagnostic), event)
         if policy is None:
             raise resolve_error
+        try:
+            state_storage.prepare_storage()
+        except state_storage.StorageError as error:
+            return _context(_with_diagnostic(
+                'DeepSeek worker storage is unavailable: ' + str(error) + '\n'
+                'Resolve storage readiness before planning or launching a worker. '
+                'Continue locally while it is unavailable; no worker or provider request '
+                'was started by this bootstrap.', diagnostic), event)
     elif not activation.resolve(root).enabled:
         return {}
     session = str(payload.get("session_id") or "")

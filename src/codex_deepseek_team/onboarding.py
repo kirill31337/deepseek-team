@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import sys
 
-from . import claude_config, config, doctor, project, sandbox, settings, worker
+from . import claude_config, config, doctor, project, sandbox, settings, state_storage, worker
 
 
 def _configure(runtimes):
@@ -148,6 +148,12 @@ def _credential(no_key):
 def run(runtimes, *, no_key=False, with_sandbox=False):
     """Configure selected runtimes without inferring hook trust or attaching a project."""
     _prerequisites(runtimes, with_sandbox)
+    try:
+        selected_state = state_storage.prepare_storage()
+    except state_storage.StorageError as error:
+        print('Setup incomplete: ' + str(error))
+        return error.code
+    print(f'Worker storage: ready ({selected_state}).')
     _configure(runtimes)
     if not _refresh_current_repository():
         print('Setup incomplete: resolve the managed instruction refresh error and rerun setup.')
