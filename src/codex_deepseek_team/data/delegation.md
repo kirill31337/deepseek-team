@@ -30,6 +30,16 @@ Optional `DEEPSEEK_TEAM_STATE_DIR` overrides the saved shared root;
 Changing the shared root does not migrate prior coordination tasks: preserve the
 old root and register new work in the newly selected root.
 
+An attached, enabled project uses its own DeepSeek hook context. When launching
+Codex or Claude Code from a common parent, select one explicitly attached root with
+`DEEPSEEK_TEAM_PROJECT_ROOT=/absolute/repo/root`. This selects the DeepSeek hook
+context only; it does not make the runtime discover child or native instructions
+automatically. Use the actual project workdir for tools and the worker CLI, and pass
+`--path` to coordination commands. An attached, enabled target without a bound
+selection keeps showing selection guidance, a workdir in another repository cannot
+reuse this plan, and an ambiguous working-directory change stays unscoped. The
+variable never attaches a project, widens access or changes the mandatory sandbox.
+
 Percentages are target work-distribution profiles, not measured contribution. Never
 derive an "actual percentage" from calls, tasks, files, lines, tokens, time, or a
 subjective list of bullets. Access remains independent of the target profile:
@@ -322,6 +332,12 @@ a distribution plan or claiming implementation completion. Status prompts retain
 existing unfinished tasks. Stop requests continuation for unfinished assignments,
 undisposed worker results and missing coordinator/native outcomes. A repeated Stop
 warns and keeps the ledger unfinished without vetoing another hook's continuation.
+
+Once every worker result has a disposition and every coordinator or native-agent
+outcome is a current accepted or cancelled, close the task explicitly with
+`deepseek-team coordination complete --path REPO --task TASK_ID`. It reuses the same
+validation on demand, independently of Stop, which still completes a delivered task
+automatically.
 
 Claude Code: after `setup --runtime claude` and project attachment, user-level hooks
 inject the current policy and enforce the same ledger distribution through PreToolUse.

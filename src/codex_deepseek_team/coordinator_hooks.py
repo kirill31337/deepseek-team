@@ -3,14 +3,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import time
 import uuid
 
-from . import (activation, coordination, coordinator_activity, lessons, project,
-                 scope_matching, settings, state_storage)
-from .shell_mutation import classify_shell_mutation
+from . import (activation, coordination, coordinator_activity, coordinator_context,
+                 lessons, project, scope_matching, settings, state_storage)
+from .shell_mutation import classify_shell_mutation_scoped
 
 
 def _context(text: str, event: str) -> dict:
@@ -79,7 +80,7 @@ def _with_diagnostic(text: str, diagnostic: str) -> str:
 
 
 def _paths_from_apply_patch(command: str) -> list[str]:
-    return re.findall(r"^\*\*\* (?:(?:Update|Add|Delete) File|Move to): (.+)$", command, re.M)
+    return coordinator_context.apply_patch_paths(command)
 
 
 def _declared_scopes(root: Path, deliverable: dict) -> list[str]:
@@ -92,7 +93,23 @@ def _declared_scopes(root: Path, deliverable: dict) -> list[str]:
     return found
 
 
-def _mutation(payload: dict) -> tuple[bool, list[str]]:
+_CWD_UNCERTAIN = (
+    'DeepSeek Team working directory gate: this command changes the working directory in a '
+    'way the hook cannot prove (relative, quoted, dynamic, option-bearing, repeated or '
+    'nested cd, a cd with a `..` component, or control flow after a leading cd that is not '
+    'an AND-only guarded chain). The write scope would be unknown, so it cannot be checked '
+    'against the registered distribution. Use one leading `cd <absolute-dir> &&` prefix '
+    'without `..`, pass the real target through the tool workdir/cwd, or use a file edit '
+    'whose scope can be checked.'
+)
+
+
+def _mutation(payload: dict) -> tuple[bool, list[str], bool]:
+    """Return recognized mutation, reliable literal paths and cwd uncertainty.
+
+    The third value marks a recognized mutation whose working directory cannot
+    be proved, so no partial scope may be authorized for it.
+    """
     tool = coordinator_activity.normalize_tool_name(payload.get("tool_name", ""))
     data = payload.get("tool_input") or {}
     command = data.get("command", "") if isinstance(data, dict) else ""
@@ -104,21 +121,21 @@ def _mutation(payload: dict) -> tuple[bool, list[str]]:
                               if isinstance(data.get(key), str))
         else:
             patch = ''
-        return True, _paths_from_apply_patch(patch)
+        return True, _paths_from_apply_patch(patch), False
     if tool in ("Edit", "Write", "NotebookEdit"):
         if not isinstance(data, dict):
-            return True, []
+            return True, [], False
         path = data.get("file_path") or data.get("notebook_path") or data.get("path")
-        return True, [str(path)] if isinstance(path, str) and path else []
+        return True, ([str(path)] if isinstance(path, str) and path else []), False
     if not coordinator_activity.is_shell_tool(tool):
-        return False, []
+        return False, [], False
     if isinstance(data, dict):
         # Codex sends exec_command as ``cmd`` while shell_command uses ``command``.
         for key in ("cmd", "shell", "script"):
             value = data.get(key)
             if not command and isinstance(value, str):
                 command = value
-    return classify_shell_mutation(command if isinstance(command, str) else "")
+    return classify_shell_mutation_scoped(command if isinstance(command, str) else "")
 
 
 _NATIVE_START = frozenset(('spawn_agent', 'Agent', 'Task'))
@@ -238,6 +255,19 @@ def _source_inspection_gate(root, task, payload, cwd):
     return nudge
 
 
+def _unbound_event(payload: dict, event: str, resolution, runtime: str) -> dict:
+    """Inert behavior for unbound sessions; explain an attached explicit target.
+
+    A parent or inert session never creates ledger or storage state.  When a
+    PreToolUse explicitly targets an attached enabled repository, the gate
+    explains how to select it instead of silently allowing the call.
+    """
+    if event != 'PreToolUse':
+        return {}
+    problem = coordinator_context.selection_denial(resolution, runtime)
+    return _deny(problem) if problem else {}
+
+
 def handle(payload: dict, runtime: str = 'codex') -> dict:
     if runtime not in ('codex', 'claude'):
         raise ValueError('Unsupported coordinator runtime.')
@@ -246,10 +276,30 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
     if runtime == 'claude' and payload.get('agent_id'):
         return {}
     event = payload.get("hook_event_name")
-    cwd = Path(payload.get("cwd") or ".")
-    root = settings.project_root(cwd)
-    if root is None:
+    resolution = coordinator_context.resolve(payload, runtime)
+    if resolution.error:
+        if os.environ.get(activation.DISABLE_VARIABLE) == '1':
+            # The environment disable switch is authoritative: an invalid explicit
+            # selection must not turn an otherwise inert session into a mutation
+            # gate. This mirrors the disabled attached-project guidance without
+            # touching the ledger or any project state.
+            if event in ('SessionStart', 'UserPromptSubmit'):
+                return _context(_with_diagnostic(activation.DISABLED_GUIDANCE,
+                                                 resolution.error), event)
+            return {}
+        # An explicit selection that does not validate never falls back to the
+        # session directory; diagnose it and stay unbound.
+        if event in ('SessionStart', 'UserPromptSubmit'):
+            return _context(resolution.error, event)
+        if event == 'PreToolUse':
+            if _mutation(payload)[0]:
+                return _deny(resolution.error)
+            return _context(resolution.error, event)
         return {}
+    root = resolution.root
+    if root is None:
+        return _unbound_event(payload, event, resolution, runtime)
+    cwd = resolution.tool_cwd
     try:
         attached = project.is_attached(root, runtime)
     except project.ProjectError as error:
@@ -259,7 +309,7 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
             return _context(_binding_diagnostic(error, runtime), event)
         return {}
     if not attached:
-        return {}
+        return _unbound_event(payload, event, resolution, runtime)
     lifecycle = event in ('SessionStart', 'UserPromptSubmit')
     policy = None
     resolve_error = None
@@ -408,12 +458,14 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
                 if candidate.parent == directory and candidate.suffix == '.md':
                     return {}
     if event == "PreToolUse":
-        is_mutation, paths = _mutation(payload)
+        is_mutation, paths, cwd_uncertain = _mutation(payload)
         if not is_mutation:
             return _source_inspection_gate(root, task, payload, cwd)
         issues = coordination.validate_task(root, task["id"])
         if issues:
             return _deny("DeepSeek Team distribution gate: " + "; ".join(issues))
+        if cwd_uncertain:
+            return _deny(_CWD_UNCERTAIN)
         if coordinator_activity.normalize_tool_name(payload.get('tool_name')) == 'apply_patch' and not paths:
             return _deny('Patch targets could not be mapped to the registered distribution.')
         protected_kinds = coordination.PROTECTED_COORDINATOR_KINDS

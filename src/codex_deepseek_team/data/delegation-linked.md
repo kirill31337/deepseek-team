@@ -27,6 +27,15 @@ commands; a worker/workspace/doctor `--state-dir` overrides only that command's
 storage. A new shared root requires new coordination work; existing tasks are
 never migrated automatically. Keep the mandatory worker sandbox.
 
+An attached, enabled project uses its own DeepSeek hook context. From a common
+parent, select one explicitly attached root with
+`DEEPSEEK_TEAM_PROJECT_ROOT=/absolute/repo/root`; it selects the hook context only
+and never makes the runtime discover child/native instructions automatically. Use the
+real project workdir for tools/worker CLI and `--path` on coordination commands. An
+unbound attached enabled target keeps showing selection guidance, a cross-repo workdir
+cannot reuse this plan, and an ambiguous cwd change stays unscoped. No auto attachment,
+access widening or sandbox change.
+
 - `deepseek-team off` stays authoritative: while disabled, continue locally and do
   not delegate. Fresh or current access is never widened automatically, and
   read-only never becomes write access.
@@ -35,3 +44,7 @@ never migrated automatically. Keep the mandatory worker sandbox.
 - The coordinator still owns architecture, integration, security, final
   verification, secrets/signing and commit/push. The mandatory Linux worker OS
   sandbox is retained, not weakened.
+- After every worker result has a disposition and every coordinator/native outcome is
+  a current accepted or cancelled, close the task with
+  `deepseek-team coordination complete --path REPO --task TASK_ID`; this reuses the
+  same validation on demand, while Stop still completes a delivered task automatically.

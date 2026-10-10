@@ -38,15 +38,36 @@ def _current_repository():
     return None
 
 
+def _current_repository_owns_blocks(repository):
+    """Bounded ownership probe: is there an existing owned block to refresh?
+
+    Only the two instruction files at ``repository`` are inspected, never children
+    or other projects. Uses the same marker and metadata parsing as the refresh, so
+    an unmarked or foreign file is never adopted and a malformed owned binding is
+    surfaced rather than silently skipped.
+    """
+    return any(project.owns_block(repository, runtime) for runtime in project.TARGETS)
+
+
 def _refresh_current_repository():
     """Refresh both owned blocks in the current repository only.
 
-    This never attaches a fresh or unrelated repository: only blocks that already
-    exist are re-rendered. A failed refresh makes setup incomplete.
+    Detection runs before any Git or policy work: when the nearest repository
+    carries no owned block at all (for example an unrelated ancestor with a stray
+    ``.git`` marker), setup neither resolves policy nor invokes Git. This never
+    attaches a fresh or unrelated repository: only blocks that already exist are
+    re-rendered. A failed refresh makes setup incomplete.
     Other attached projects refresh on their next session or prompt.
     """
     repository = _current_repository()
     if repository is None:
+        return True
+    try:
+        owned = _current_repository_owns_blocks(repository)
+    except project.ProjectError as error:
+        print('Managed instruction refresh failed: ' + str(error))
+        return False
+    if not owned:
         return True
     try:
         policy = settings.resolve(repository)

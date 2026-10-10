@@ -4,10 +4,27 @@ Keep shell operators distinct from quoted words and skip heredoc program text.
 Only the commands listed below and shell redirections are recognized; arbitrary
 programs, aliases, eval and shell functions can still write files. A nonempty
 path list is returned only when every recognized write has a literal scope.
+
+Two entry points share that bounded lexer:
+
+* :func:`classify_shell_mutation` keeps the conservative contract for callers
+  that cannot resolve a base working directory: any ``cd`` leaves the mutation
+  unscoped.
+* :func:`classify_shell_mutation_scoped` implements the one-project coordinator
+  context: at most one leading ``cd <absolute-dir> &&`` prefix is applied to the
+  literal write paths.  Only a plain literal absolute directory without a ``..``
+  component is provable, only ``&&`` may follow it, and every following command
+  must stay in an AND-only guarded chain that allows no ``;``, newline, ``||``,
+  ``&``, pipe or subshell escape.  A relative, quoted, dynamic, option-bearing,
+  repeated or nested ``cd``, a ``..`` component, or any other control-flow
+  separator, or a shell-evoked directory change through ``time``, ``eval``,
+  ``source``/``.`` and their ``command``/``builtin``/assignment forms marks the
+  whole mutation cwd-uncertain so a partial or wrong scope is never authorized.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import posixpath
 import re
 
 
@@ -18,6 +35,9 @@ _REDIRECT = _OUTPUT | {'<', '<<', '<<-', '<<<', '<&'}
 _ASSIGNMENT = re.compile(r'[A-Za-z_][A-Za-z_0-9]*=')
 _COMMAND_PREFIXES = {'if', 'then', 'else', 'elif', 'while', 'until', 'for',
                      'do', 'done', 'fi', '{', '}', '!'}
+_CWD_BUILTINS = frozenset(('cd', 'pushd', 'popd'))
+_CWD_EVALUATORS = frozenset(('eval', 'source', '.'))
+_CWD_WRAPPERS = frozenset(('command', 'builtin', 'exec', 'time'))
 
 
 @dataclass
@@ -35,6 +55,7 @@ class _Result:
     mutation: bool = False
     paths: list[str] = field(default_factory=list)
     unknown: bool = False
+    cwd: bool = False
 
     def write(self, paths: list[_Token]) -> None:
         self.mutation = True
@@ -46,15 +67,17 @@ class _Result:
     def merge(self, other: _Result) -> None:
         self.mutation |= other.mutation
         self.unknown |= other.unknown
+        self.cwd |= other.cwd
         self.paths.extend(other.paths)
 
 
 class _Lexer:
     """Read shell boundaries without executing expansions or removing their context."""
 
-    def __init__(self, source: str):
+    def __init__(self, source: str, *, scoped: bool = False):
         self.source = source
         self.index = 0
+        self.scoped = scoped
         self.nested = _Result()
         self.incomplete = False
 
@@ -255,9 +278,18 @@ class _Lexer:
         self.incomplete = True
 
     def result(self) -> _Result:
-        result = _classify(self.scan())
+        tokens = self.scan()
+        prefix, remaining, ambiguous = (None, tokens, False)
+        if self.scoped:
+            prefix, remaining, ambiguous = _split_leading_cd(tokens)
+        result = _classify(remaining)
         result.merge(self.nested)
         result.unknown |= self.incomplete
+        if prefix is not None:
+            if not result.unknown:
+                result.paths = [posixpath.join(prefix, path) for path in result.paths]
+        elif ambiguous:
+            result.cwd = True
         return result
 
 
@@ -310,8 +342,57 @@ def _command_position(tokens: list[_Token]) -> bool:
         word.value in _COMMAND_PREFIXES or _ASSIGNMENT.match(word.value)) for word in words)
 
 
+def _cwd_change(words: list[_Token]) -> bool:
+    """Whether the command reached after shell wrappers can change the cwd.
+
+    Skips assignment prefixes, ``command``/``builtin``/``exec`` with their own
+    option terminators, a repeated ``time`` keyword and its options; the first
+    remaining word decides by its literal name.  ``command -v``/``-V`` only
+    prints how a name resolves and runs nothing.  This stays a bounded lexical
+    scan, not a shell parser: dynamic command words and arbitrary programs keep
+    the existing documented detector limitation.
+    """
+    index = 0
+    while index < len(words):
+        token = words[index]
+        if token.operator:
+            return False
+        value = token.value
+        if value == 'command':
+            index += 1
+            while index < len(words) and not words[index].operator:
+                option = words[index].value
+                if not option.startswith('-') or option == '-':
+                    break
+                index += 1
+                if option == '--':
+                    break
+                if any(flag in 'vV' for flag in option[1:]):
+                    return False
+            continue
+        if value in ('builtin', 'exec'):
+            index += 1
+            if (index < len(words) and not words[index].operator
+                    and words[index].value == '--'):
+                index += 1
+            continue
+        if value in _CWD_WRAPPERS or value in _COMMAND_PREFIXES:
+            index += 1
+            continue
+        if value.startswith('-') and value != '-':
+            index += 1
+            continue
+        if _ASSIGNMENT.match(value):
+            index += 1
+            continue
+        return value.rsplit('/', 1)[-1] in _CWD_BUILTINS | _CWD_EVALUATORS
+    return False
+
+
 def _command(words: list[_Token]) -> _Result:
     result = _Result()
+    if _cwd_change(words):
+        result.cwd = True
     while words:
         if words[0].value in _COMMAND_PREFIXES and not words[0].quoted:
             result.unknown = True
@@ -337,8 +418,9 @@ def _command(words: list[_Token]) -> _Result:
         return result
     name = words[0].value.rsplit('/', 1)[-1]
     args = words[1:]
-    if name in ('cd', 'pushd', 'popd'):
+    if name in _CWD_BUILTINS:
         result.unknown = True
+        result.cwd = True
     elif name == 'patch' or (name == 'git' and args and args[0].value == 'apply'):
         result.write([])
     elif name == 'sed':
@@ -395,3 +477,66 @@ def classify_shell_mutation(command: str) -> tuple[bool, list[str]]:
     """
     result = _Lexer(command).result()
     return result.mutation, [] if result.unknown else list(dict.fromkeys(result.paths))
+
+
+def _cd_target_provable(value: str) -> bool:
+    """True only for a plain literal absolute directory with no ``..`` component.
+
+    Relative targets depend on the inherited ``PWD``/``CDPATH`` and can silently
+    resolve into another directory; a ``..`` component is applied lexically by
+    Bash but physically by ``Path.resolve``, so a symlink in the prefix can make
+    the two disagree.  Quoted and dynamic targets are rejected by the caller.
+    """
+    if not value.startswith('/'):
+        return False
+    return '..' not in value.split('/')
+
+
+def _and_only_guarded(tokens: list[_Token]) -> bool:
+    """True when control flow after the ``cd`` prefix stays AND/redirect-only."""
+    return all(token.value == '&&' or token.value in _REDIRECT
+               for token in tokens if token.operator)
+
+
+def _split_leading_cd(tokens: list[_Token]) -> tuple[str | None, list[_Token], bool]:
+    """Split one provable leading literal ``cd <absolute-dir> &&`` prefix.
+
+    Returns ``(prefix, remaining, ambiguous)``.  ``prefix`` is the absolute
+    literal target when a single option-free, unquoted, non-dynamic ``cd`` leads
+    the command, names a path without ``..``, is followed by ``&&``, and every
+    following command is joined by ``&&`` or redirection only.  Then a failed
+    ``cd`` skips the whole guarded body instead of running it in the original
+    working directory.  ``ambiguous`` marks any other *leading* ``cd`` shape so
+    the caller keeps the whole mutation unscoped.  Repeated and nested cwd
+    changes stay visible to normal classification and set :attr:`_Result.cwd`.
+    """
+    if len(tokens) < 2 or tokens[0].operator or tokens[0].quoted or tokens[0].value != 'cd':
+        return None, tokens, False
+    target = tokens[1]
+    if (target.operator or target.dynamic or target.quoted or not target.value
+            or not _cd_target_provable(target.value)):
+        return None, tokens, True
+    if len(tokens) < 3:
+        return None, tokens, False
+    separator = tokens[2]
+    if (not separator.operator or separator.value != '&&'
+            or not _and_only_guarded(tokens[3:])):
+        return None, tokens, True
+    return target.value, tokens[3:], False
+
+
+def classify_shell_mutation_scoped(command: str) -> tuple[bool, list[str], bool]:
+    """Return mutation status, reliable literal paths and cwd-uncertainty.
+
+    At most one leading literal ``cd <absolute-dir> &&`` prefix is applied to the
+    literal write paths.  The third value is true when the command was recognized
+    as a mutation but changes the working directory in a way this bounded lexer
+    cannot prove; callers must then treat the scope as unknown instead of
+    authorizing a partial or wrong path list, so the path list is empty.
+    """
+    result = _Lexer(command, scoped=True).result()
+    if result.mutation and result.cwd:
+        return True, [], True
+    return (result.mutation,
+            [] if result.unknown else list(dict.fromkeys(result.paths)),
+            False)

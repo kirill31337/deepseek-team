@@ -256,6 +256,30 @@ def _prepare_detach(repository, runtime):
     return target, original, mode, updated, remove
 
 
+def owns_block(root, runtime='codex'):
+    """Bounded, Git-free ownership probe used before any policy or refresh work.
+
+    Returns ``True`` only when this runtime's root instruction file already holds
+    a managed block this package owns. Exactly that one file is inspected: children
+    and other projects are never scanned and nothing is created. The same marker and
+    metadata parsing as refresh is reused, so an unmarked or foreign file is not
+    adopted, while a genuinely corrupt owned control (duplicate or unbalanced
+    markers, modified ownership metadata, a symbolic link or a non-regular file)
+    raises :class:`ProjectError` instead of being silently skipped.
+    """
+    if runtime not in TARGETS:
+        raise ProjectError("coordinator must be codex or claude")
+    content, _mode = _read_agents(Path(root) / TARGETS[runtime])
+    if not content:
+        return False
+    marks = _locate(content)
+    if marks is None:
+        return False
+    begin, finish = marks
+    _original_state(content, begin)
+    return finish > begin
+
+
 def is_attached(root, runtime='codex'):
     """Return whether this package owns a managed block for the coordinator."""
     if runtime not in TARGETS:

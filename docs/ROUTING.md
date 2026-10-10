@@ -206,6 +206,14 @@ deepseek-team coordination abandon \
 
 `--confirmed-stopped` is an operator attestation, not a request for DeepSeek Team to kill processes. The command requires a running assignment and also verifies through an exclusive workspace lock that no active owner remains. It refuses a currently owned live workspace. Successful abandonment records `cancelled`, contributes no quality failure, and resolves the assignment cancellation. There is no automatic abandonment timeout, retry, or process killing.
 
+Completed work is closed explicitly once every worker result has a disposition and every coordinator or native-agent outcome is a current `accepted` or `cancelled`:
+
+```bash
+deepseek-team coordination complete --path /path/to/repository --task TASK_ID
+```
+
+Completion reuses the same validation on demand, independently of the `Stop` hook, which still completes a delivered task automatically. It does not replace the required disposition and outcome records.
+
 Recorded plan decisions are canonical for their task, deliverable and plan binding: repeated evaluation reuses the saved decision without selecting the executor again. Access or policy revocation may narrow an existing authorization; it never promotes a denied assignment into a new one.
 
 ## Runnable synthetic example
@@ -334,6 +342,8 @@ deepseek-team coordination result --path "$PROJECT" \
 ```
 
 Coordinator outcomes accept `accepted`, `rework`, `rejected`, `infrastructure`, `cancelled`, or `unknown`. For a coordinator observation, the feature card still describes the candidate worker identity so comparable worker and coordinator observations can be evaluated.
+
+Auto does not measure end-to-end cost automatically. `--cost-usd` is optional and absent by default; when the operator supplies it, it must be the measured FULL total of worker execution, coordinator review and any rework. Unknown cost stays unknown and never blocks an eligible task. Neither Auto nor the estimator guarantees quality, speed, cost or savings, and recorded elapsed/duration metadata is informational, not a latency routing objective. Do not invent percentages or prices.
 
 The lower-level `routing observe` command is for trusted operator-reported historical data. Without a valid recorded decision ID it cannot guarantee that the feature card was captured before execution, so do not use it as a substitute for the coordination lifecycle when that lifecycle is available. Corrections for a local case are chronological and immutable: every phase remains in the audit history, and any observed `rework` or `rejected` quality failure dominates an earlier or later `accepted` phase. Repeated attempts at one case do not become independent evidence.
 

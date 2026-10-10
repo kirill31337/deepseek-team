@@ -10,6 +10,10 @@ Both Codex and Claude Code use the persistent coordination ledger in explicitly 
 
 Every coordinator or native-agent deliverable needs an explicit current accepted or cancelled result. A later recognized mutation in its scope requires renewed acceptance. Feedback observations alone do not complete a deliverable.
 
+An attached, enabled project is bound to its DeepSeek hook context. Launching Codex or Claude Code from a common parent can select one explicitly attached root with `DEEPSEEK_TEAM_PROJECT_ROOT=/absolute/repo/root`; this selects the DeepSeek hook context only and does not make the runtime discover child or native instructions automatically. An attached, enabled target without a bound selection keeps showing selection guidance, a workdir in a different repository cannot reuse another plan, and an ambiguous working-directory change stays unscoped. No variable attaches a project, widens access or changes the mandatory worker sandbox.
+
+Once every worker result has a disposition and every coordinator or native-agent outcome is a current `accepted` or `cancelled`, the coordinator can close the task explicitly with `deepseek-team coordination complete --path REPO --task TASK_ID`. It reuses the same validation on demand, independently of `Stop`, which still completes a delivered task automatically.
+
 These are process guardrails, not universal interception of arbitrary programs or future runtime tools. Claude plan-mode files use the native configured plans directory; native-subagent events are outside its coordinator gate. Codex owns native hook trust, reviewed through `/hooks`; the package does not bypass or infer it. Runtime settings can disable hooks and `hooks status` cannot establish what a running session loaded.
 
 Native coordinator agents run under the coordinator's own model, permissions and sandbox. They require a concrete delegation reason for planned work and do not substitute for required DeepSeek implementation assignments at manual 50/75 profiles.

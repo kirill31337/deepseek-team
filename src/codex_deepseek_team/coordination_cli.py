@@ -106,6 +106,11 @@ def main(argv):
         '--confirmed-stopped', action='store_true', required=True,
         help='Attest that remaining worker processes were stopped and verified stopped.')
 
+    complete = subs.add_parser(
+        'complete', help='Close a task whose distribution and recorded outcomes are terminal.')
+    complete.add_argument('--path', type=Path, default=Path.cwd())
+    complete.add_argument('--task', required=True)
+
     args = parser.parse_args(argv[1:])
     try:
         if args.command == 'plan':
@@ -145,6 +150,10 @@ def main(argv):
             task = coordination.abandon_assignment(
                 args.path, args.task, args.assignment, args.evidence,
                 confirmed_stopped=args.confirmed_stopped)
+            print(coordination.summary(task))
+            return 0
+        if args.command == 'complete':
+            task = coordination.complete_task(args.path, args.task)
             print(coordination.summary(task))
             return 0
         if args.task:
