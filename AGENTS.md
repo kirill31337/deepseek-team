@@ -29,6 +29,40 @@ inspect their results before integration. Check again before every new assignmen
 deepseek-team config show --effective --instructions --runtime codex
 ```
 
+The session/prompt bootstrap checks private worker storage before opening a
+coordination task. Before the first worker in a session, confirm local readiness
+with `deepseek-team doctor --runtime codex --offline`, including read-only
+assignments. Storage must use ordinary current-user-owned directories with mode
+700; symbolic links in the state path or its `workspaces` child are rejected.
+Do not repair this by following a link, deleting retained copies, changing a
+foreign owner or weakening the sandbox. Setup/doctor/enabled bootstrap can
+automatically select and persist a private replacement for an unusable idle
+default, without variables. All commands use the saved choice. Active slots,
+live queued tickets or an uninspectable old root forbid switching. Preserve all
+old files. Broken saved choices and explicit overrides are diagnosed, never
+silently replaced. The selected root is shown by bootstrap and doctor.
+Optional `DEEPSEEK_TEAM_STATE_DIR` overrides the saved shared root;
+`--state-dir` overrides worker/workspace/doctor storage for that command only.
+Changing the shared root does not migrate prior coordination tasks: preserve the
+old root and register new work in the newly selected root.
+After an upgrade, setup/init use the same provider-free safe collector for known
+owned roots. `deepseek-team gc --dry-run` is the default and reports keeps,
+deletions, allocated bytes and inodes; `gc --apply` performs only safe deletions.
+GC protects creation, preparation, start, import, review and verification, plus
+live leases and locks. Historical task status is not a lease. Unsafe or uncertain
+cleanup is reported and kept, never guessed from mtime alone. User guides and
+delegation configuration are preserved.
+
+An attached, enabled project uses its own DeepSeek hook context. When launching
+Codex or Claude Code from a common parent, select one explicitly attached root with
+`DEEPSEEK_TEAM_PROJECT_ROOT=/absolute/repo/root`. This selects the DeepSeek hook
+context only; it does not make the runtime discover child or native instructions
+automatically. Use the actual project workdir for tools and the worker CLI, and pass
+`--path` to coordination commands. An attached, enabled target without a bound
+selection keeps showing selection guidance, a workdir in another repository cannot
+reuse this plan, and an ambiguous working-directory change stays unscoped. The
+variable never attaches a project, widens access or changes the mandatory sandbox.
+
 Percentages are target work-distribution profiles, not measured contribution. Never
 derive an "actual percentage" from calls, tasks, files, lines, tokens, time, or a
 subjective list of bullets. Access remains independent of the target profile:
@@ -238,6 +272,10 @@ and rework; omit unknown costs rather than inventing a subscription dollar value
 Use `needs-rework` when the worker result needed fixes. Repeated attempts remain one
 case, and a recorded quality failure cannot be converted into a clean first-pass
 success by a later incorporation. Provider/environment failures stay unlabelled.
+Process success is only awaiting review: integrate and verify accepted changes
+before finalization. Repeated `coordination use` feedback remains allowed;
+`--disposition needs-rework` keeps the copy, while `--final` combines the final
+accepted or rejected disposition with finalization.
 
 If selected uncommitted source is required, never copy the whole checkout:
 
@@ -254,8 +292,14 @@ caches, writable in the copy), `--env NAME=VALUE` (only `JAVA_HOME`, `ANDROID_HO
 in the copy through the literal `{workspace}` placeholder) and `--probe COMMAND`
 (smoke commands that run only inside the worker namespace before the provider key).
 `--save-project` stores a private recipe that replays only those declarations into a
-later copy and never executes host commands; the legacy `workspace prepare ID --
-COMMAND` form still runs on the coordinator host with the prepared variables and PATH.
+later copy and never executes host commands. The finite immutable content cache keeps
+saved recipes independent of execution trees; each active workspace still
+materializes its tools independently inside the sandbox, mutable files are never
+hardlinked, and a missing or stale entry invalidates the recipe with re-preparation
+guidance. Aggregate byte/inode reservations with free margins honor the configured
+storage root and TMPDIR rather than assuming `/mnt/data`. The legacy `workspace
+prepare ID -- COMMAND` form still runs on the coordinator host with the prepared
+variables and PATH.
 Full-access never implies access to host-only JDK/SDK/tools, secrets, databases,
 services, or the network. Default runtimes are namespace-verified candidates, an explicit
 `--codex`/`--claude` pin is preserved rather than replaced, and runtime selection shares
@@ -276,10 +320,28 @@ relay or starts a model, and it preserves the original worker status, error, che
 quality. Bounded per-stream output is redacted and published owner-only under the
 workspace's private `diagnostics/` directory.
 
-A failed or interrupted workspace is retained. Inspect it before explicit
-`--resume-after-failure`; a verification rerun may inspect it without automatically
-resuming implementation. Do not automatically repeat implementation over unknown
-state. The default concurrency limit is eight workers (`max_workers`, configurable 1–64).
+One logical job (`job_id`) owns one stable workspace through preparation, a failed
+process, check or API error, a review gap without a PID, `needs-rework`, explicit
+resume and linked corrections. Each run records a distinct `attempt_id`; there is
+no automatic implementation retry. Final acceptance explicitly closes the lease and
+removes the checkout, its `.git`, `.deepseek-tools` and owned temporary
+environments. Rejecting, cancelling or abandoning the job finalizes it the same
+way. Compact job, attempt, check, exit and `work_inode` history, the final binary and
+untracked `changes.patch`, diagnostics, provenance and lessons are preserved; no
+checkout or runtime tree is archived and there is no TTL backlog. A parent feature
+may continue.
+
+Finalize explicitly with `coordination use ... --final` or
+`coordination finalize --task ID --assignment ID --evidence TEXT [--cancel]`.
+`workspace finalize ID`, `workspace cancel ID`, `workspace recover ID`,
+`workspace resume ID`, `workspace list` and `workspace history` expose the same
+lifecycle. `workspace recover` and `workspace resume` repair ownership/state only
+and never run a model. A failed attempt continues explicitly with
+`worker --workspace ID --resume-after-failure` in the same inode. A succeeded result
+that needs substantive correction gets `needs-rework`, then a newly planned linked
+assignment using the same still-unfinalized `--workspace ID`. A verification rerun
+may inspect an unfinalized copy without resuming implementation. The default
+concurrency limit is eight workers (`max_workers`, configurable 1–64).
 Eligible assignments remain worker-owned when slots are busy; launches wait FIFO.
 Use `config set --project --max-workers N` or `--global` to save a limit, or
 `worker --max-workers N` for one launch. `--no-wait` returns capacity code 75.
@@ -300,9 +362,12 @@ When new coordinator isolation is genuinely required, prefer a detached worktree
 worktree the coordinator created and why. After accepted integration, verify a clean status
 and commit reachability before removing only the coordinator's own temporary worktree and its
 fully merged branch. Preserve active, failed, unaccepted and foreign work: never bulk-prune,
-force-delete or rewrite work you do not own. There is no automatic cleanup engine and no broad
-cleanup command; worker copies remain retained outside the project for review and recovery and
-are never deleted automatically.
+force-delete or rewrite work you do not own. Finalization is explicit and limited to the
+accepted or cancelled job: `workspace finalize`/`workspace cancel` removes its checkout,
+`.git`, `.deepseek-tools` and owned temporary environments while preserving compact history,
+the final `changes.patch`, diagnostics, provenance and lessons. Use `gc --dry-run` before
+cleanup of known owned roots; mtime and a broad prune never authorize deletion. Worker copies
+and coordinator worktrees remain outside the project until that lifecycle completes.
 
 ### Integration boundary
 
@@ -321,6 +386,12 @@ a distribution plan or claiming implementation completion. Status prompts retain
 existing unfinished tasks. Stop requests continuation for unfinished assignments,
 undisposed worker results and missing coordinator/native outcomes. A repeated Stop
 warns and keeps the ledger unfinished without vetoing another hook's continuation.
+
+Once every worker result has a disposition and every coordinator or native-agent
+outcome is a current accepted or cancelled, close the task explicitly with
+`deepseek-team coordination complete --path REPO --task TASK_ID`. It reuses the same
+validation on demand, independently of Stop, which still completes a delivered task
+automatically.
 
 Claude Code: after `setup --runtime claude` and project attachment, user-level hooks
 inject the current policy and enforce the same ledger distribution through PreToolUse.
@@ -352,8 +423,8 @@ Auto delegates suitable work immediately by default. Actively split substantial 
 Delegation level is auto: the profile is adaptive per task, chosen from local outcomes and bounded external evidence instead of a fixed percentage. New auto plans must record executor: "auto" together with a "features" card capturing the task before execution: kind, domain, operation, localization, coupling, verification, clarity, risk, scope_size, runtime, model, effort and context_version. The coordinator classifies the task; the router resolves its saved feature card. Workers must not self-select a profile or stage. Admission is immediate: suitable small/medium low/medium-risk local/component tasks with clear requirements, known/partial localization and declared tests or a reproducer can start without prior evidence. Read-only deliverables and documentation may use explicit manual acceptance criteria. High/protected/unknown-risk, unbounded or unverifiable work stays with the coordinator. There is no initial trial quota or periodic coordinator holdout. Missing data and unknown prices do not block suitable work and never imply measured savings; supported poor economics still veto delegation. A rejected result or three distinct recent rework cases pause only that family for the configured cooldown (300 seconds by default). Explicit assessments restrict these failures to worker/shared major_gaps or unusable; cosmetic, minor-gap and neutral assessments never trigger the pause. One rework is recorded without pausing the family; after a pause immediate admission resumes. There is no automatic paid exploration outside the normal task stream and no automatic permission widening; keep the resolved access and explicit executor choices. Inspect adaptive routing state with deepseek-team routing status and adjust it with deepseek-team routing configure.
 Full-access is development inside an owned isolated copy, not host access. Allow the worker to create/edit/delete project files in its assigned copy and run declared local checks. Prepare missing dependencies with workspace prepare. If selected uncommitted source is required, import only those files with workspace import; it is recorded as coordinator-prepared source, not worker output. Host SDK/JDK/tools are not assumed to exist inside the sandbox.
 ### Workspace and branch hygiene
-Coordinator process guidance, separate from the worker OS sandbox. Each write-capable worker already runs in a fully independent Git repository created under the private state directory by workspace.create; its internal deepseek/<id> ref lives only in that private copy and is never a branch or worktree of the source project. Reuse that existing isolation instead of building isolation in the project. Create no synthetic branch, worktree or commit merely to invoke DeepSeek: a worker launch needs no project branch. When new coordinator isolation is genuinely required, prefer a detached worktree (git worktree add --detach) over a named task branch, and record which temporary branch or worktree the coordinator created and why. After accepted integration, verify a clean status and commit reachability before removing only the coordinator's own temporary worktree and its fully merged branch. Preserve active, failed, unaccepted and foreign work: never bulk-prune, force-delete or rewrite work you do not own. This is not worker OS enforcement, there is no automatic cleanup engine and no broad cleanup command; worker copies remain retained outside the project for review and recovery and are never deleted automatically.
-Codex process integration: after project init and enabling hooks in the runtime, SessionStart/UserPromptSubmit provide the current coordination task id. Plan and route every delegated subtask, even a small read-only history, search or review task, before assigning another agent; Auto registers executor:auto and a worker decision means DeepSeek. Before coordinator source edits, submit a concrete JSON distribution with deepseek-team coordination plan --task TASK_ID; include deliverable id/kind/scope, executor, acceptance criteria, dependencies and checks. Run each worker assignment with deepseek-team worker --runtime codex --effort high --coord-task TASK_ID --coord-assignment ASSIGNMENT_ID. Because effort policy is auto, replace high with low or max when the assigned task warrants it (medium is the accepted legacy alias for high). The runner records start/result/workspace/checks automatically. After reviewing a result, record its use with deepseek-team coordination use. Record verified coordinator and native-agent outcomes with deepseek-team coordination result; accepted or explicitly cancelled outcomes are required for completion. Later recognized scope mutations require fresh acceptance. New substantial scope requires a revised plan. Codex PreToolUse blocks recognized source edits while the distribution is missing/noncompliant, blocks unplanned scope, and blocks duplicate work owned by a pending worker assignment. This parent launch/message gate covers only the events the runtime actually delivers, not every possible write; Codex and Claude coverage is verified separately and universal hook coverage must never be claimed. Where the runtime cannot intercept an action, these instructions remain authoritative. Hooks do not replace the mandatory, unchanged worker OS sandbox. An unplanned turn without recorded work closes without a distribution plan; status prompts retain existing unfinished tasks. Stop requests continuation for unfinished assignments/results, including coordinator and native-agent outcomes. On repeated Stop it warns and keeps the ledger unfinished without vetoing another hook continuation. The lifecycle hook lets the first recognized source inspection through with an early-planning reminder and records it as work; a registered distribution is required before any further supported source read. Real status/bootstrap checks and purely conversational turns stay exempt, and tool recognition is bounded, never universal. Native hook trust is controlled by Codex and is not inferred by this package.
+Coordinator process guidance, separate from the worker OS sandbox. Each write-capable worker already runs in a fully independent Git repository created under the private state directory by workspace.create; its internal deepseek/<id> ref lives only in that private copy and is never a branch or worktree of the source project. Reuse that existing isolation instead of building isolation in the project. Create no synthetic branch, worktree or commit merely to invoke DeepSeek: a worker launch needs no project branch. When new coordinator isolation is genuinely required, prefer a detached worktree (git worktree add --detach) over a named task branch, and record which temporary branch or worktree the coordinator created and why. After accepted integration, verify a clean status and commit reachability before removing only the coordinator's own temporary worktree and its fully merged branch. Preserve active, failed, unaccepted and foreign work: never bulk-prune, force-delete or rewrite work you do not own. Finalization is explicit and limited to the accepted or cancelled job: workspace finalize/cancel removes its checkout, .git, .deepseek-tools and owned temporary environments while preserving compact history, the final changes.patch, diagnostics, provenance and lessons. Use gc --dry-run before any cleanup of known owned roots; mtime and a broad prune never authorize deletion. Worker copies and coordinator worktrees remain outside the project until that lifecycle completes. This is not worker OS enforcement.
+Codex process integration: after project init and enabling hooks in the runtime, SessionStart/UserPromptSubmit provide the current coordination task id. Plan and route every delegated subtask, even a small read-only history, search or review task, before assigning another agent; Auto registers executor:auto and a worker decision means DeepSeek. Before coordinator source edits, submit a concrete JSON distribution with deepseek-team coordination plan --task TASK_ID; include deliverable id/kind/scope, executor, acceptance criteria, dependencies and checks. Run each worker assignment with deepseek-team worker --runtime codex --effort high --coord-task TASK_ID --coord-assignment ASSIGNMENT_ID. Because effort policy is auto, replace high with low or max when the assigned task warrants it (medium is the accepted legacy alias for high). The runner records start/result/workspace/checks automatically. One job_id owns one stable workspace across preparation, failed process/check/API, review gaps, needs-rework, explicit resume and linked corrections; each run has a distinct attempt_id and there is no automatic retry. Process success is awaiting review: integrate and verify accepted changes before finalization. After reviewing a result, record its use with deepseek-team coordination use; repeated feedback is allowed, --disposition needs-rework keeps the copy, and --final makes the final accepted or rejected disposition finalize the job. Explicit alternatives are coordination finalize and workspace finalize/cancel. workspace recover and workspace resume repair ownership only and never run a model; worker --workspace ID --resume-after-failure continues a failed attempt in the same inode. After needs-rework, a succeeded result that needs a substantive correction uses the same unfinalized workspace in a newly planned linked assignment. Record verified coordinator and native-agent outcomes with deepseek-team coordination result; accepted or explicitly cancelled outcomes are required for completion. Later recognized scope mutations require fresh acceptance. New substantial scope requires a revised plan. Codex PreToolUse blocks recognized source edits while the distribution is missing/noncompliant, blocks unplanned scope, and blocks duplicate work owned by a pending worker assignment. This parent launch/message gate covers only the events the runtime actually delivers, not every possible write; Codex and Claude coverage is verified separately and universal hook coverage must never be claimed. Where the runtime cannot intercept an action, these instructions remain authoritative. Hooks do not replace the mandatory, unchanged worker OS sandbox. An unplanned turn without recorded work closes without a distribution plan; status prompts retain existing unfinished tasks. Stop requests continuation for unfinished assignments/results, including coordinator and native-agent outcomes. On repeated Stop it warns and keeps the ledger unfinished without vetoing another hook continuation. The lifecycle hook lets the first recognized source inspection through with an early-planning reminder and records it as work; a registered distribution is required before any further supported source read. Real status/bootstrap checks and purely conversational turns stay exempt, and tool recognition is bounded, never universal. Native hook trust is controlled by Codex and is not inferred by this package.
 Execution capacity is 8; configure max_workers independently of access. Plan all eligible deliverables; launch independent jobs concurrently and let excess jobs wait in FIFO order. Capacity is not a reason to retain their implementation with the coordinator. Report accepted work, verification results and any rework; only report money savings when measured.
 While a worker runs, work only on independent scope. Review the actual diff and recorded checks without repeating the whole investigation or rewriting correct code. DeepSeek workers never stage, commit, push, publish, deploy, access production services or delegate.
 ### Graded review and corrective work

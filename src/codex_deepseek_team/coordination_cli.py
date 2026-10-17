@@ -75,6 +75,8 @@ def main(argv):
     use.add_argument('--disposition', required=True,
                      choices=['incorporated', 'reproduced', 'rejected', 'needs-rework'])
     use.add_argument('--evidence', required=True)
+    use.add_argument('--final', action='store_true',
+                     help='Attest final integration/rejection; close this job and delete its execution copy.')
     use.add_argument('--cost-usd', type=float,
                      help='Measured total cost including worker, review and rework; omit if unknown.')
     use.add_argument('--rework-json', metavar='FILE',
@@ -106,6 +108,13 @@ def main(argv):
         '--confirmed-stopped', action='store_true', required=True,
         help='Attest that remaining worker processes were stopped and verified stopped.')
 
+    finalize = subs.add_parser('finalize', help='Finalize one reviewed job and immediately remove its execution copy.')
+    finalize.add_argument('--path', type=Path, default=Path.cwd())
+    finalize.add_argument('--task', required=True)
+    finalize.add_argument('--assignment', required=True)
+    finalize.add_argument('--evidence', required=True)
+    finalize.add_argument('--cancel', action='store_true', help='Explicitly cancel/reject this stopped job.')
+
     complete = subs.add_parser(
         'complete', help='Close a task whose distribution and recorded outcomes are terminal.')
     complete.add_argument('--path', type=Path, default=Path.cwd())
@@ -128,6 +137,9 @@ def main(argv):
             }, indent=2))
             return 78 if issues else 0
         if args.command == 'use':
+            if args.final and args.disposition == 'needs-rework':
+                raise coordination.CoordinationError(
+                    'needs-rework preserves the same workspace; omit --final until corrections are accepted.', 64)
             if args.rework_json == '-' and args.quality_json == '-':
                 raise coordination.CoordinationError(
                     'Only one feedback JSON source may read stdin (-); pass a file for the '
@@ -139,6 +151,14 @@ def main(argv):
             task = coordination.use_result(args.path, args.task, args.assignment,
                                            args.disposition, args.evidence,
                                            cost_usd=args.cost_usd, rework=rework, quality=quality)
+            if args.final:
+                task = coordination.finalize_assignment(args.path, args.task, args.assignment,
+                    args.evidence, cancelled=args.disposition == 'rejected')
+            print(coordination.summary(task))
+            return 0
+        if args.command == 'finalize':
+            task = coordination.finalize_assignment(args.path, args.task, args.assignment,
+                                                    args.evidence, cancelled=args.cancel)
             print(coordination.summary(task))
             return 0
         if args.command == 'result':

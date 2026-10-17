@@ -353,6 +353,10 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
         task = coordination.begin_turn(
             root, session_id=session, turn_id=str(payload.get("turn_id") or uuid.uuid4().hex),
             prompt=str(payload.get("prompt") or ""), policy=policy, runtime=runtime)
+        from . import workspace_lifecycle
+        problems = workspace_lifecycle.heartbeat_task(root, task)
+        if problems:
+            diagnostic = _with_diagnostic('Job lease recovery needs inspection: ' + '; '.join(problems), diagnostic)
         coordination.sync_routing_feedback(root, task['id'])
         _sync_lessons_feedback(root, task['id'])
         effort_context = (
@@ -404,6 +408,12 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
         return _context(text, event)
     task = (coordination.active_task(root, session)
             or coordination.latest_task(root, session))
+    if task:
+        from . import workspace_lifecycle
+        problems = workspace_lifecycle.heartbeat_task(root, task,
+            recover=event == 'SessionStart' and payload.get('source') == 'resume')
+        if problems:
+            diagnostic = _with_diagnostic('Job lease recovery needs inspection: ' + '; '.join(problems), diagnostic)
     if event == "SessionStart":
         base = (
             'Worker storage root: ' + json.dumps(str(selected_state)) + '.\n' +

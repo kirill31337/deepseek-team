@@ -1,12 +1,16 @@
 """Settings and owned-copy CLI, kept separate from provider authentication."""
 import argparse
+import errno
+import hashlib
 import json
+import os
 from pathlib import Path
+import re
 import sys
 import subprocess
 
 from . import (check_evidence, lessons, project, runtime_preflight, settings,
-               toolchains, worker, workspace)
+               state_storage, toolchains, worker, workspace)
 
 
 def _lessons_guidance(root):
@@ -34,6 +38,95 @@ def policy_options(parser):
 
 def _record(copy):
     return dict(copy.metadata, id=copy.id, path=str(copy.path))
+
+
+def _state_root(value):
+    try:
+        return state_storage.state_root(value)
+    except state_storage.StorageError as error:
+        raise workspace.WorkspaceError(str(error), error.code) from None
+
+
+def _inspect_all(value):
+    from . import workspace_gc
+    state = _state_root(value)
+    if not state.exists() and not state.is_symlink():
+        return []
+    root_fd = copies_fd = None
+    try:
+        try:
+            root_fd = state_storage.open_private_directory(state)
+            copies_fd = state_storage.open_private_directory(state / 'workspaces', parent=root_fd)
+        except state_storage.StorageError as error:
+            if error.errno == errno.ENOENT and not (state / 'workspaces').exists():
+                return []
+            raise workspace.WorkspaceError(str(error), error.code) from None
+        identifiers = [name for name in os.listdir(copies_fd)
+                       if re.fullmatch('[0-9a-f]{32}', name)]
+        return [workspace_gc.inspect_workspace(state, identifier)
+                for identifier in sorted(identifiers)]
+    finally:
+        if copies_fd is not None:
+            os.close(copies_fd)
+        if root_fd is not None:
+            os.close(root_fd)
+
+
+def _retained_patch(value, identifier, inspection):
+    from . import workspace_gc, workspace_lifecycle
+    state = _state_root(value)
+    copy = workspace_gc._load_record(state, identifier)
+    with workspace_lifecycle.directory(copy) as fd:
+        raw = workspace_lifecycle.read_file(
+            fd, 'changes.patch', maximum=workspace_gc.MAX_PATCH_BYTES)
+    if raw is None:
+        raise workspace.WorkspaceError('This cleaned workspace has no retained result patch.', 73)
+    result = inspection.get('result') or {}
+    patch = result.get('patch') if isinstance(result, dict) else None
+    if (not isinstance(patch, dict) or patch.get('file') != 'changes.patch'
+            or patch.get('bytes') != len(raw)
+            or patch.get('sha256') != hashlib.sha256(raw).hexdigest()):
+        raise workspace.WorkspaceError('Retained result patch failed its integrity check.', 73)
+    return raw.decode('utf-8', errors='replace')
+
+
+def _show_inspection(inspection):
+    print('Workspace: ' + inspection['id'])
+    state = ('execution data cleaned' if not inspection['execution_present']
+             else 'execution data present')
+    print('Working copy: ' + inspection['path'] + ' (' + state + ')')
+    print(json.dumps(inspection['metadata'], indent=2))
+    result = inspection.get('result')
+    if result:
+        print('Result patch: ' + json.dumps(result.get('patch', {}), sort_keys=True))
+
+
+def _show_history(inspection):
+    print('Workspace: ' + inspection['id'])
+    print('Execution: ' + ('present' if inspection['execution_present'] else 'cleaned'))
+    lease = inspection.get('lease')
+    if lease is None:
+        print('Lease: absent (legacy record)')
+    else:
+        print('Lease phase: ' + lease['phase'])
+        print('Final reason: ' + str(lease.get('final_reason') or '-'))
+        for attempt in lease.get('attempts', []):
+            print('Attempt: {} {} {}'.format(
+                attempt.get('operation', '-'), attempt.get('status', '-'),
+                attempt.get('id', '-')))
+        for event in lease.get('events', []):
+            print('Event: {} {}'.format(event.get('event', '-'), event.get('at', '-')))
+    result = inspection.get('result')
+    if result:
+        print('Result patch: ' + json.dumps(result.get('patch', {}), sort_keys=True))
+
+
+def _show_action(report):
+    print('Workspace: ' + report['id'])
+    print('Action: ' + report['action'])
+    print('Reason: ' + str(report.get('reason') or '-'))
+    print('Allocated bytes: ' + str(report.get('allocated_bytes', 0)))
+    print('Inodes: ' + str(report.get('inodes', 0)))
 
 
 def _set_project(root, target, **options):
@@ -91,17 +184,21 @@ def main(argv):
                                              'blockers; allocates no state or copy.')
         check.add_argument('path', type=Path, nargs='?', default=Path.cwd())
         check.add_argument('--json', action='store_true')
-        for name in ('create', 'show', 'diff', 'prepare', 'import', 'verify'):
+        for name in ('create', 'show', 'diff', 'prepare', 'import', 'verify',
+                     'finalize', 'cancel', 'recover', 'resume', 'list', 'history'):
             sub = subs.add_parser(name)
             sub.add_argument('--state-dir', type=Path,
                              help='Private state root; defaults to DEEPSEEK_TEAM_STATE_DIR '
                                   'or ~/.local/state/codex-deepseek.')
             if name == 'create':
                 sub.add_argument('path', type=Path, nargs='?', default=Path.cwd())
-            else:
+            elif name != 'list':
                 sub.add_argument('id')
-            if name in ('create', 'show', 'verify'):
+            if name in ('create', 'show', 'verify', 'list', 'history', 'finalize',
+                        'cancel', 'recover', 'resume'):
                 sub.add_argument('--json', action='store_true')
+            if name in ('finalize', 'cancel'):
+                sub.add_argument('--reason', default='accepted' if name == 'finalize' else 'cancelled')
             if name == 'prepare':
                 sub.add_argument('--resume-after-failure', action='store_true')
                 for option in ('tool', 'copy', 'env'):
@@ -169,6 +266,69 @@ def main(argv):
                 else:
                     print(workspace.describe_check(report))
                 return 0 if report['eligible'] else 78
+            if args.command == 'list':
+                reports = _inspect_all(args.state_dir)
+                if args.json:
+                    print(json.dumps(reports, indent=2, ensure_ascii=True))
+                elif not reports:
+                    print('No retained workspaces.')
+                else:
+                    for inspection in reports:
+                        execution = 'present' if inspection['execution_present'] else 'cleaned'
+                        lease = inspection.get('lease') or {}
+                        print('{}: status={}; execution={}; lease={}'.format(
+                            inspection['id'], inspection['metadata'].get('status', 'unknown'),
+                            execution, lease.get('phase', 'absent')))
+                return 0
+            if args.command == 'show':
+                from . import workspace_gc
+                inspection = workspace_gc.inspect_workspace(args.state_dir, args.id)
+                if args.json:
+                    print(json.dumps(inspection, indent=2, ensure_ascii=True))
+                else:
+                    _show_inspection(inspection)
+                return 0
+            if args.command == 'history':
+                from . import workspace_gc
+                inspection = workspace_gc.inspect_workspace(args.state_dir, args.id)
+                if args.json:
+                    print(json.dumps(inspection, indent=2, ensure_ascii=True))
+                else:
+                    _show_history(inspection)
+                return 0
+            if args.command == 'diff':
+                from . import workspace_gc
+                inspection = workspace_gc.inspect_workspace(args.state_dir, args.id)
+                if inspection['execution_present']:
+                    copy = workspace.load(_state_root(args.state_dir), args.id)
+                    print(copy.diff(), end='')
+                else:
+                    print(_retained_patch(args.state_dir, args.id, inspection), end='')
+                return 0
+            if args.command in ('finalize', 'cancel', 'recover', 'resume'):
+                from . import workspace_gc
+                copy = workspace_gc._load_record(_state_root(args.state_dir), args.id)
+                if args.command == 'finalize':
+                    report = workspace_gc.finalize(copy, reason=args.reason)
+                elif args.command == 'cancel':
+                    report = workspace_gc.cancel(copy, reason=args.reason)
+                elif args.command == 'recover':
+                    report = workspace_gc.recover(copy)
+                else:
+                    inspection = workspace_gc.inspect_workspace(args.state_dir, args.id)
+                    lease = inspection.get('lease')
+                    if lease and lease['phase'] in ('finalized', 'cancelled'):
+                        raise workspace.WorkspaceError(
+                            'A finalized workspace cannot be resumed; create a new copy.', 73)
+                    if not inspection['execution_present']:
+                        raise workspace.WorkspaceError(
+                            'This workspace has no execution tree to resume.', 73)
+                    report = workspace_gc.recover(copy)
+                if getattr(args, 'json', False):
+                    print(json.dumps(report, indent=2, ensure_ascii=True))
+                else:
+                    _show_action(report)
+                return 0
             copy = (workspace.create(args.path, args.state_dir) if args.command == 'create'
                     else workspace.load(args.state_dir, args.id))
             if args.command == 'prepare':
@@ -210,9 +370,7 @@ def main(argv):
                 imported = workspace.import_paths(copy, args.include)
                 print('Imported coordinator-prepared source: ' + ', '.join(imported))
                 return 0
-            if args.command == 'diff':
-                print(copy.diff(), end='')
-            elif getattr(args, 'json', False):
+            if getattr(args, 'json', False):
                 print(json.dumps(_record(copy), indent=2))
             else:
                 print('Workspace: ' + copy.id + '\nWorking copy: ' + str(copy.path))

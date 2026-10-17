@@ -16,7 +16,7 @@ import time
 import uuid
 
 from .settings import git_environment, project_root, SettingsError
-from . import state_storage
+from . import state_storage, workspace_lifecycle
 
 SCHEMA = 'deepseek-team-workspace-v1'
 DEFAULT_STATE = Path.home() / '.local/state/codex-deepseek'
@@ -46,22 +46,15 @@ def _read(path: Path) -> bytes:
 
 
 def _atomic(path: Path, content: bytes) -> None:
-    temporary = None
+    fd = None
     try:
-        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as stream:
-            temporary = Path(stream.name)
-            stream.write(content)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-        fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+        fd = state_storage.open_private_directory(path.parent)
+        workspace_lifecycle.atomic_file(fd, path.name, content)
+    except state_storage.StorageError as cause:
+        raise WorkspaceError(str(cause), cause.code) from None
     finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+        if fd is not None:
+            os.close(fd)
 
 
 def git(root: Path, *args: str, ok=(0,)) -> bytes:
@@ -233,38 +226,47 @@ class Workspace:
 
     @contextmanager
     def lock(self, *, recover: bool = False):
-        fd = os.open(self.directory / 'owner.lock',
-                     os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+        fd = None
         try:
-            info = os.fstat(fd)
-            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or
-                    info.st_uid != os.geteuid() or info.st_mode & 0o077):
-                raise WorkspaceError('Unsafe workspace ownership lock.')
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                raise WorkspaceError('This copy already has an active owner; choose another copy.', 75) from None
-            fresh = load(self.directory.parent.parent, self.id)
-            self.metadata = fresh.metadata
-            self.verify()
-            if self.metadata['status'] not in ('ready', 'succeeded') and not recover:
-                raise WorkspaceError('Copy has failed/interrupted or partial work. Inspect workspace show/diff, '
-                                     'then explicitly use --resume-after-failure; no automatic retry.')
+            with workspace_lifecycle.fence(self.directory.parent.parent), \
+                    workspace_lifecycle.directory(self) as directory_fd:
+                fd = workspace_lifecycle.open_lock(directory_fd, 'owner.lock')
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    raise WorkspaceError('This copy already has an active owner; choose another copy.', 75) from None
+                fresh = load(self.directory.parent.parent, self.id)
+                self.metadata = fresh.metadata
+                lease = workspace_lifecycle.read(self)
+                if lease and lease['phase'] in workspace_lifecycle.FINAL_PHASES:
+                    raise WorkspaceError('Job was finalized; create a new workspace for new execution.', 73)
+                self.verify()
+                if self.metadata['status'] not in ('ready', 'succeeded') and not recover:
+                    raise WorkspaceError('Copy has failed/interrupted or partial work. Inspect workspace show/diff, '
+                                         'then explicitly use --resume-after-failure; no automatic retry.')
+                workspace_lifecycle.renew(self, recover=recover)
             self._locked = True
             yield self
         finally:
             self._locked = False
-            os.close(fd)
+            if fd is not None:
+                os.close(fd)
 
     def begin(self, kind: str) -> None:
         if not self._locked:
             raise WorkspaceError('An exclusive workspace lock is required.')
-        self.metadata.update(status='running', operation=kind,
+        attempt_id = workspace_lifecycle.begin(self, kind)
+        lease = workspace_lifecycle.read(self)
+        self.metadata.update(status='running', operation=kind, job_id=lease['job_id'],
+                             attempt_id=attempt_id,
                              attempt=self.metadata.get('attempt', 0) + 1,
                              started_at=time.time(), error_kind=None, exit_code=None)
         self.save()
 
     def changes(self) -> tuple[list[str], int]:
+        if not self._locked:
+            with self.lock(recover=True):
+                return self.changes()
         self.verify()
         # --name-only can report stat-only differences when index refresh is
         # disabled. --numstat compares content while keeping the index intact.
@@ -276,7 +278,10 @@ class Workspace:
         ignored = git(self.path, 'ls-files', '--others', '--ignored', '--exclude-standard', '-z')
         return sorted({os.fsdecode(n) for n in names.split(b'\0') if n}), sum(bool(n) for n in ignored.split(b'\0'))
 
-    def diff(self) -> str:
+    def diff_bytes(self) -> bytes:
+        if not self._locked:
+            with self.lock(recover=True):
+                return self.diff_bytes()
         self.verify()
         patch = git(self.path, 'diff', '--binary', '--full-index', '--no-ext-diff',
                     '--no-textconv', '--no-renames', 'HEAD', '--')
@@ -284,7 +289,10 @@ class Workspace:
             if raw_name:
                 patch += git(self.path, 'diff', '--no-index', '--binary', '--no-ext-diff',
                              '--no-textconv', '--', '/dev/null', os.fsdecode(raw_name), ok=(0, 1))
-        return patch.decode('utf-8', errors='replace')
+        return patch
+
+    def diff(self) -> str:
+        return self.diff_bytes().decode('utf-8', errors='replace')
 
     def finish(self, status: str, *, error_kind: str | None = None, exit_code: int = 0) -> dict:
         if not self._locked:
@@ -294,7 +302,8 @@ class Workspace:
                              changed_files=names, ignored_artifacts=ignored,
                              finished_at=time.time())
         self.save()
-        _atomic(self.directory / 'changes.patch', self.diff().encode())
+        _atomic(self.directory / 'changes.patch', self.diff_bytes())
+        workspace_lifecycle.finish(self)
         return dict(self.metadata)
 
     def failed(self, kind: str, exit_code: int) -> None:
@@ -302,6 +311,7 @@ class Workspace:
         self.metadata.update(status='failed', error_kind=kind, exit_code=exit_code,
                              finished_at=time.time())
         self.save()
+        workspace_lifecycle.finish(self)
 
 
 def content_snapshot(copy: Workspace) -> dict[str, str]:
@@ -353,6 +363,16 @@ def create(source: Path, state: Path | None = None) -> Workspace:
     except state_storage.StorageError as error:
         raise WorkspaceError(str(error), error.code) from None
     _private(state, create=True)
+    from . import execution_allocation, storage_budget
+    try:
+        with execution_allocation.checkout(source, head, state), workspace_lifecycle.fence(state):
+            return _create_owned(source, head, state)
+    except storage_budget.BudgetError as cause:
+        raise WorkspaceError(str(cause), cause.code) from None
+
+
+def _create_owned(source, head, state):
+    """The caller holds the creation/collection fence before work/ exists."""
     root = state / 'workspaces'
     _private(root, create=True)
     directory = root / uuid.uuid4().hex
@@ -362,8 +382,11 @@ def create(source: Path, state: Path | None = None) -> Workspace:
     try:
         work.mkdir(mode=0o700)
         metadata = {'schema': SCHEMA, 'source': str(source), 'status': 'preparing',
-                    'attempt': 0, 'created_at': time.time(), 'work_inode': work.stat().st_ino}
+                    'source_head': head, 'attempt': 0, 'created_at': time.time(),
+                    'work_inode': work.stat().st_ino}
         copy = Workspace(directory, metadata)
+        lease = workspace_lifecycle.initialize(copy)
+        metadata['job_id'] = lease['job_id']
         copy.save()
         git(work, 'init', '-q', '--template=', '-b', 'deepseek/' + copy.id)
         # Fetch exactly the preflighted commit: a concurrent HEAD move cannot swap the tree.
@@ -379,6 +402,9 @@ def create(source: Path, state: Path | None = None) -> Workspace:
         metadata.update(base_head=head, git_digest=_git_digest(work), status='ready',
                         changed_files=[], ignored_artifacts=0)
         copy.save()
+        lease = workspace_lifecycle.read(copy)
+        lease['phase'] = 'ready'
+        workspace_lifecycle.write(copy, lease)
         return copy
     except (WorkspaceError, OSError, UnicodeError, KeyboardInterrupt) as error:
         code = 130 if isinstance(error, KeyboardInterrupt) else 78
@@ -412,6 +438,10 @@ def load(state: Path, identifier: str) -> Workspace:
                 or not Path(metadata['source']).is_absolute()):
             raise ValueError('invalid marker')
         copy = Workspace(directory, metadata)
+        if not copy.path.exists() and not copy.path.is_symlink():
+            lease = workspace_lifecycle.read(copy)
+            if lease and lease['phase'] in workspace_lifecycle.FINAL_PHASES and lease.get('cleanup'):
+                return copy
         if copy.path.is_symlink() or not copy.path.is_dir() or copy.path.stat().st_ino != metadata['work_inode']:
             raise ValueError('replaced copy')
         return copy
@@ -537,13 +567,13 @@ def prepare(copy: Workspace, command: list[str], *, recover: bool = False) -> in
         raise WorkspaceError('workspace prepare requires -- COMMAND [ARG ...].', 64)
     with copy.lock(recover=recover):
         copy.begin('preparation')
-        home = copy.directory / 'preparation-home'
-        _private(home, create=True)
-        env = git_environment()
-        env.update(HOME=str(home), PIP_NO_INPUT='1')
-        from . import toolchains
-        env = toolchains.environment_for(copy, env)
         try:
+            home = copy.directory / 'preparation-home'
+            _private(home, create=True)
+            env = git_environment()
+            env.update(HOME=str(home), PIP_NO_INPUT='1')
+            from . import toolchains
+            env = toolchains.environment_for(copy, env)
             result = subprocess.run(command, cwd=copy.path, env=env, check=False)
             copy.finish('succeeded' if result.returncode == 0 else 'failed',
                         error_kind=None if result.returncode == 0 else 'preparation',

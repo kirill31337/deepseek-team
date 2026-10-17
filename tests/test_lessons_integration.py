@@ -413,8 +413,8 @@ class ChangesPatchReferenceTests(LessonsIntegrationCase):
         os.chmod(patch, 0o600)
         self.start(planned['id'], assignment_id, workspace_id=copy.id)
         self.finish(planned['id'], assignment_id)
-        coordination.use_result(self.repo, planned['id'], assignment_id, 'rejected',
-                                'output rejected after inspecting the diff')
+        coordination.use_result(self.repo, planned['id'], assignment_id, 'incorporated',
+                                'draft reviewed; final acceptance is separate')
         reference = lessons.journal(self.repo)[-1]['context']['execution']['changes_patch']
         self.assertEqual(reference['file'], 'changes.patch')
         self.assertEqual(reference['workspace_id'], copy.id)

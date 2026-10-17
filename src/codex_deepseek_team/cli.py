@@ -37,11 +37,25 @@ def _sandbox_status(sandbox):
     return 0
 
 
+def _upgrade_cleanup():
+    from . import gc_cli
+    try:
+        report = gc_cli.upgrade_cleanup()
+    except (OSError, ValueError) as error:
+        print('Workspace upgrade cleanup deferred: ' + str(error), file=sys.stderr)
+        return
+    for line in gc_cli.upgrade_lines(report):
+        print(line)
+
+
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if sys.platform != 'linux':
         print('This release supports Linux with Python 3.11+ and Codex and/or Claude Code.', file=sys.stderr)
         return 78
+    if argv and argv[0] == 'gc':
+        from . import gc_cli
+        return gc_cli.main(argv[1:])
     from . import activation, claude_config, config, doctor, sandbox, settings, worker
     if argv and argv[0] == 'coordinator-hook':
         from . import coordinator_hooks
@@ -108,6 +122,7 @@ def main(argv=None):
     sandbox_commands.add_parser('remove-apparmor', help='Remove only an unchanged package-owned AppArmor profile.')
     commands.add_parser('config', help='Manage delegation profiles; use config --help.')
     commands.add_parser('lessons', help='Inspect the private rework journal and apply reviewed delegation lessons.')
+    commands.add_parser('gc', help='Explain or apply safe cleanup of owned workspace copies; use gc --help.')
     commands.add_parser('workspace', help='Prepare and inspect owned development copies; use workspace --help.')
     commands.add_parser('doctor', help='Check local setup; use doctor --help for runtime/live options.')
     commands.add_parser('worker', help='Run a worker; use worker --help for runtime/read/write options.')
@@ -129,6 +144,7 @@ def main(argv=None):
                     print('Remove the environment disable switch to use the saved project state.')
         elif args.command == 'setup':
             from . import onboarding
+            _upgrade_cleanup()
             return onboarding.run(_runtimes(args.runtime), no_key=args.no_key,
                                   with_sandbox=args.with_sandbox)
         elif args.command == 'reset':
@@ -143,6 +159,8 @@ def main(argv=None):
                       else 'No package-owned Claude hooks to remove.')
         elif args.command in ['init', 'detach']:
             from . import project
+            if args.command == 'init':
+                _upgrade_cleanup()
             try:
                 changed = (project.attach if args.command == 'init' else project.detach)(
                     args.path, coordinator=args.coordinator)
