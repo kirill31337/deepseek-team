@@ -167,6 +167,60 @@ coordination ledger. Use one storage root for concurrent workers. Changing
 or lessons: preserve the old root and register new coordination work in the new
 root. Package installation alone does not run setup or relocate data.
 
+## Workspace lifecycle and cleanup
+
+One logical job (`job_id`) owns one stable workspace through preparation, failed
+processes, checks and API errors, review gaps without a PID, `needs-rework`, explicit
+resume and linked corrections. Every execution run has a distinct `attempt_id`.
+Implementation never retries automatically. A successful process only means the
+result is **awaiting review**: the coordinator integrates the accepted changes and
+verifies them before final acceptance.
+
+Final acceptance explicitly closes the job lease and immediately removes the
+workspace checkout, its `.git`, `.deepseek-tools` and owned temporary environments.
+Rejecting, cancelling or abandoning a job finalizes it the same way. Compact job,
+attempt, check, exit and `work_inode` history, the final binary and untracked
+`changes.patch`, diagnostics, provenance and lessons are preserved; no checkout or
+runtime tree is archived, and there is no TTL backlog. The parent feature may
+continue after a job is finalized.
+
+Repeated `coordination use` feedback remains available. `--disposition needs-rework`
+keeps the copy, while adding `--final` makes that accepted or rejected disposition
+finalize the job. Finalization can also be requested explicitly:
+
+```bash
+deepseek-team coordination finalize --task TASK_ID --assignment ASSIGNMENT_ID \
+  --evidence "reviewed and integrated" [--cancel]
+deepseek-team workspace finalize WORKSPACE_ID
+deepseek-team workspace cancel WORKSPACE_ID
+deepseek-team workspace recover WORKSPACE_ID
+deepseek-team workspace resume WORKSPACE_ID
+deepseek-team workspace list
+deepseek-team workspace history WORKSPACE_ID
+```
+
+`workspace recover` and `workspace resume` repair ownership/state only and never
+start a model run. A failed attempt continues explicitly with
+`worker --workspace WORKSPACE_ID --resume-after-failure` in the same workspace
+inode. A succeeded result that needs a substantive correction gets
+`needs-rework` first, then a newly planned linked assignment using the same
+still-unfinalized `--workspace WORKSPACE_ID`.
+
+`gc --dry-run` is the default and explains every keep or delete decision with
+measured allocated bytes and inodes. `gc --apply` performs only the reported safe
+deletions:
+
+```bash
+deepseek-team gc [--dry-run | --apply] [--state-dir PATH] [--all-roots] [--json]
+```
+
+GC protects workspaces during creation, preparation, start, import, review and
+verification, together with live leases and locks. Historical task status is not a
+lease. After an upgrade, `setup` and `init` use the same provider-free collector on
+known owned roots while preserving user guides and delegation configuration.
+Unsafe or uncertain cleanup is reported and kept; deletion is never guessed from
+mtime alone.
+
 ## What gets delegated
 
 Auto delegation admits suitable work immediately; it does not wait for prior history to accumulate. A task is a good candidate when it is:
@@ -249,11 +303,11 @@ The package ships the delegation rules and the managed blocks. Each project keep
 
 <a id="workspace-and-branch-hygiene"></a>
 
-Workers require the Linux OS sandbox with Bubblewrap. Full-access work runs in an owned development copy with restricted filesystem and network access. Read-only and full-access workers have different filesystem, credential and network limits, and worker copies are never deleted automatically. The coordinator retains architecture, security decisions, final verification and integration. See [Hardening](https://github.com/kirill31337/deepseek-team/blob/main/docs/HARDENING.md) for the exact rules.
+Workers require the Linux OS sandbox with Bubblewrap. Full-access work runs in an owned development copy with restricted filesystem and network access. Read-only and full-access workers have different filesystem, credential and network limits. A worker copy remains outside the project until its job is explicitly finalized; finalization removes that checkout and its owned temporary environments while preserving the compact evidence described above. The coordinator retains architecture, security decisions, final verification and integration. See [Hardening](https://github.com/kirill31337/deepseek-team/blob/main/docs/HARDENING.md) for the exact rules.
 
 <a id="preflight-and-recovery"></a>
 
-Before allocating a copy, the coordinator can run an optional read-only preflight over the committed source: `deepseek-team workspace check --json` reads only committed `HEAD` names and modes, calls no model, creates no copy, and exits `0` when eligible or `78` when blocked. A failed job retains its copy for inspection with `deepseek-team workspace show WORKSPACE_ID`; continuation stays explicit, and there is no automatic cleanup engine. See [Hardening](https://github.com/kirill31337/deepseek-team/blob/main/docs/HARDENING.md) for the full preflight and recovery rules.
+Before allocating a copy, the coordinator can run an optional read-only preflight over the committed source: `deepseek-team workspace check --json` reads only committed `HEAD` names and modes, calls no model, creates no copy, and exits `0` when eligible or `78` when blocked. A failed or interrupted job keeps its copy for inspection with `deepseek-team workspace show WORKSPACE_ID`; continuation stays explicit, and cleanup follows the lifecycle and guarded GC rules above. See [Hardening](https://github.com/kirill31337/deepseek-team/blob/main/docs/HARDENING.md) for the full preflight and recovery rules.
 
 ## Preparing a toolchain and re-verifying
 
@@ -276,6 +330,13 @@ deepseek-team workspace verify WORKSPACE_ID --check 'java -version' --timeout 12
 - `--probe COMMAND` runs only inside the worker namespace, before any model key; a failed probe stops the job. `--save-project` records a private recipe that replays these declarations into a later copy and never executes or replays host commands. The legacy `workspace prepare ID -- COMMAND ARG ...` form is unchanged and still runs on the coordinator host.
 - `workspace verify ID [--check COMMAND] [--timeout SECONDS] [--json]` rebuilds the prepared environment, reruns the declared or supplied checks and appends evidence. It never loads the provider key, starts a relay or starts a model, and it preserves the original worker result. Output is capped at 65,536 bytes per stream, redacted, and kept owner-only under the workspace's private `diagnostics/` directory.
 - Checks are captured as a baseline before the model runs, so an already-red suite does not block a bugfix assignment. A failed project check stays neutral `unknown` until the coordinator reviews the actual diff and evidence.
+
+Saved recipes refer to a finite immutable content cache rather than one execution
+tree. Each active workspace still materializes its declared tools independently
+inside the existing sandbox mapping, and mutable files are never hardlinked. A
+missing or stale cache entry invalidates the recipe with actionable re-preparation
+guidance. Allocation reserves aggregate bytes and inodes with free margins under
+the configured storage root and `TMPDIR`; `/mnt/data` is not a portable default.
 
 Realistic Java, Android and Gradle recipes, the Java/security materialization rules and the evidence causes are in the [toolchain guide](https://github.com/kirill31337/deepseek-team/blob/main/docs/TOOLCHAINS.md).
 

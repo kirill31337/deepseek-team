@@ -331,14 +331,21 @@ class PrepareToolsTests(ToolchainFixture):
         self.assertTrue((self.copy.path / '.deepseek-tools/sdk/bin/tool').is_file())
 
     def test_prepare_does_not_modify_source_or_isolated_homes(self):
+        homes = ('home', 'codex', 'claude', 'xdg-config', 'xdg-state')
+        def home_snapshot():
+            return {str(path.relative_to(self.root)):
+                    (path.stat().st_mode, path.read_bytes() if path.is_file() else None)
+                    for name in homes for path in (self.root / name).rglob('*')}
+        # Checkout admission has already created the private allocator pool.
+        # Preparation must preserve that baseline and every coordinator home.
+        homes_before = home_snapshot()
         before = _git(self.source, 'status', '--porcelain=v1', '--untracked-files=all')
         head = _git(self.source, 'rev-parse', 'HEAD')
         root = self.software(inside_link=True)
         toolchains.prepare(self.copy, tools={'sdk': root})
         self.assertEqual(_git(self.source, 'status', '--porcelain=v1', '--untracked-files=all'), before)
         self.assertEqual(_git(self.source, 'rev-parse', 'HEAD'), head)
-        for name in ('home', 'codex', 'claude', 'xdg-config', 'xdg-state'):
-            self.assertEqual(list((self.root / name).iterdir()), [])
+        self.assertEqual(home_snapshot(), homes_before)
 
     def test_declarative_only_preparation_is_valid(self):
         result = toolchains.prepare(self.copy)

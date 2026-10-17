@@ -29,6 +29,13 @@ Optional `DEEPSEEK_TEAM_STATE_DIR` overrides the saved shared root;
 `--state-dir` overrides worker/workspace/doctor storage for that command only.
 Changing the shared root does not migrate prior coordination tasks: preserve the
 old root and register new work in the newly selected root.
+After an upgrade, setup/init use the same provider-free safe collector for known
+owned roots. `deepseek-team gc --dry-run` is the default and reports keeps,
+deletions, allocated bytes and inodes; `gc --apply` performs only safe deletions.
+GC protects creation, preparation, start, import, review and verification, plus
+live leases and locks. Historical task status is not a lease. Unsafe or uncertain
+cleanup is reported and kept, never guessed from mtime alone. User guides and
+delegation configuration are preserved.
 
 An attached, enabled project uses its own DeepSeek hook context. When launching
 Codex or Claude Code from a common parent, select one explicitly attached root with
@@ -249,6 +256,10 @@ and rework; omit unknown costs rather than inventing a subscription dollar value
 Use `needs-rework` when the worker result needed fixes. Repeated attempts remain one
 case, and a recorded quality failure cannot be converted into a clean first-pass
 success by a later incorporation. Provider/environment failures stay unlabelled.
+Process success is only awaiting review: integrate and verify accepted changes
+before finalization. Repeated `coordination use` feedback remains allowed;
+`--disposition needs-rework` keeps the copy, while `--final` combines the final
+accepted or rejected disposition with finalization.
 
 If selected uncommitted source is required, never copy the whole checkout:
 
@@ -265,8 +276,14 @@ caches, writable in the copy), `--env NAME=VALUE` (only `JAVA_HOME`, `ANDROID_HO
 in the copy through the literal `{workspace}` placeholder) and `--probe COMMAND`
 (smoke commands that run only inside the worker namespace before the provider key).
 `--save-project` stores a private recipe that replays only those declarations into a
-later copy and never executes host commands; the legacy `workspace prepare ID --
-COMMAND` form still runs on the coordinator host with the prepared variables and PATH.
+later copy and never executes host commands. The finite immutable content cache keeps
+saved recipes independent of execution trees; each active workspace still
+materializes its tools independently inside the sandbox, mutable files are never
+hardlinked, and a missing or stale entry invalidates the recipe with re-preparation
+guidance. Aggregate byte/inode reservations with free margins honor the configured
+storage root and TMPDIR rather than assuming `/mnt/data`. The legacy `workspace
+prepare ID -- COMMAND` form still runs on the coordinator host with the prepared
+variables and PATH.
 Full-access never implies access to host-only JDK/SDK/tools, secrets, databases,
 services, or the network. Default runtimes are namespace-verified candidates, an explicit
 `--codex`/`--claude` pin is preserved rather than replaced, and runtime selection shares
@@ -287,10 +304,28 @@ relay or starts a model, and it preserves the original worker status, error, che
 quality. Bounded per-stream output is redacted and published owner-only under the
 workspace's private `diagnostics/` directory.
 
-A failed or interrupted workspace is retained. Inspect it before explicit
-`--resume-after-failure`; a verification rerun may inspect it without automatically
-resuming implementation. Do not automatically repeat implementation over unknown
-state. The default concurrency limit is eight workers (`max_workers`, configurable 1–64).
+One logical job (`job_id`) owns one stable workspace through preparation, a failed
+process, check or API error, a review gap without a PID, `needs-rework`, explicit
+resume and linked corrections. Each run records a distinct `attempt_id`; there is
+no automatic implementation retry. Final acceptance explicitly closes the lease and
+removes the checkout, its `.git`, `.deepseek-tools` and owned temporary
+environments. Rejecting, cancelling or abandoning the job finalizes it the same
+way. Compact job, attempt, check, exit and `work_inode` history, the final binary and
+untracked `changes.patch`, diagnostics, provenance and lessons are preserved; no
+checkout or runtime tree is archived and there is no TTL backlog. A parent feature
+may continue.
+
+Finalize explicitly with `coordination use ... --final` or
+`coordination finalize --task ID --assignment ID --evidence TEXT [--cancel]`.
+`workspace finalize ID`, `workspace cancel ID`, `workspace recover ID`,
+`workspace resume ID`, `workspace list` and `workspace history` expose the same
+lifecycle. `workspace recover` and `workspace resume` repair ownership/state only
+and never run a model. A failed attempt continues explicitly with
+`worker --workspace ID --resume-after-failure` in the same inode. A succeeded result
+that needs substantive correction gets `needs-rework`, then a newly planned linked
+assignment using the same still-unfinalized `--workspace ID`. A verification rerun
+may inspect an unfinalized copy without resuming implementation. The default
+concurrency limit is eight workers (`max_workers`, configurable 1–64).
 Eligible assignments remain worker-owned when slots are busy; launches wait FIFO.
 Use `config set --project --max-workers N` or `--global` to save a limit, or
 `worker --max-workers N` for one launch. `--no-wait` returns capacity code 75.
@@ -311,9 +346,12 @@ When new coordinator isolation is genuinely required, prefer a detached worktree
 worktree the coordinator created and why. After accepted integration, verify a clean status
 and commit reachability before removing only the coordinator's own temporary worktree and its
 fully merged branch. Preserve active, failed, unaccepted and foreign work: never bulk-prune,
-force-delete or rewrite work you do not own. There is no automatic cleanup engine and no broad
-cleanup command; worker copies remain retained outside the project for review and recovery and
-are never deleted automatically.
+force-delete or rewrite work you do not own. Finalization is explicit and limited to the
+accepted or cancelled job: `workspace finalize`/`workspace cancel` removes its checkout,
+`.git`, `.deepseek-tools` and owned temporary environments while preserving compact history,
+the final `changes.patch`, diagnostics, provenance and lessons. Use `gc --dry-run` before
+cleanup of known owned roots; mtime and a broad prune never authorize deletion. Worker copies
+and coordinator worktrees remain outside the project until that lifecycle completes.
 
 ### Integration boundary
 

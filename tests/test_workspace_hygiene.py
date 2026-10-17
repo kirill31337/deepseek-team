@@ -156,7 +156,7 @@ class WorkspaceHygieneGuidanceTests(HygieneFixture):
     """The generated and packaged guidance must actually carry the hygiene rules."""
 
     REQUIRED = ("Workspace and branch hygiene", "workspace.create", "detached worktree",
-                "synthetic branch", "bulk-prune", "automatic cleanup engine",
+                "synthetic branch", "bulk-prune", "workspace finalize",
                 "outside the project")
 
     def test_generated_and_packaged_guidance_describe_the_rules(self):

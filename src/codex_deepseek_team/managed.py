@@ -10,7 +10,25 @@ import tempfile
 import time
 
 from . import (check_evidence, coordination, development, prepared_inputs, relay,
-               runtime_preflight, settings, toolchains, workspace)
+               runtime_preflight, settings, toolchains, workspace,
+               execution_allocation, storage_budget)
+
+
+@contextmanager
+def _runtime_environment(copy):
+    # Both homes and control files belong to the job, including after SIGKILL.
+    # A pinned /proc alias keeps AF_UNIX addresses short for nested state roots.
+    with tempfile.TemporaryDirectory(prefix='runtime-', dir=copy.directory) as temporary:
+        root = Path(temporary)
+        with execution_allocation.runtime(root):
+            home, control = root / 'home', root / 'control'
+            home.mkdir(mode=0o700)
+            control.mkdir(mode=0o700)
+            fd = os.open(control, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            try:
+                yield home, control, Path('/proc/self/fd') / str(fd) / 'provider.sock'
+            finally:
+                os.close(fd)
 
 
 @contextmanager
@@ -54,6 +72,17 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
     preparation_cause = 'environment'
     try:
         sb, backend = api.resolve_os_sandbox('required')
+        if coord_task and getattr(args, 'resume_after_failure', False):
+            recorded = coordination._assignment(
+                coordination.load_task(source, coord_task), coord_assignment)
+            previous_id = recorded.get('workspace_id')
+            if not previous_id:
+                raise api.WorkerError(78, 'This failed job has no existing execution copy; '
+                                      'inspect preparation evidence and plan a new job.')
+            if copy is None:
+                copy = workspace.load(args.state_dir, previous_id)
+            elif copy.id != previous_id:
+                raise api.WorkerError(64, 'Explicit continuation must reuse the job\'s original workspace.')
         if copy is None:
             copy = workspace.create(Path.cwd(), args.state_dir)
         coord_before = None
@@ -66,12 +95,11 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
         with copy.lock(recover=getattr(args, 'resume_after_failure', False)), _preparation_status(copy):
             # Retained preflight failures must remain linked to their assignment,
             # even when runtime selection never reaches the readiness probes.
-            copy.metadata.update(coord_task=coord_task, coord_assignment=coord_assignment)
+            copy.metadata.update(coord_task=coord_task, coord_assignment=coord_assignment,
+                                 standalone_job=not bool(coord_task))
             copy.save()
             toolchains.apply_saved_recipe(copy)
-            with tempfile.TemporaryDirectory(prefix='session-', dir=args.state_dir) as session, \
-                    tempfile.TemporaryDirectory(prefix='dst-') as transport:
-                home, control = Path(session), Path(transport)
+            with _runtime_environment(copy) as (home, control, socket_path):
                 def context_factory(binary, runtime):
                     return development.prepared_context(copy, backend, home, control,
                         binary, runtime, writable=writable, effort=effort, api=api,
@@ -162,7 +190,8 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
                     }
                     coordination.assignment_started(
                         copy.source, coord_task, coord_assignment, copy.id, runtime,
-                        prepared_changes, effort=effort, execution=execution)
+                        prepared_changes, effort=effort, execution=execution,
+                        resume_running=getattr(args, 'resume_after_failure', False))
                     coord_started = True
                 provider = None
                 execution_started = False
@@ -174,7 +203,7 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
                                          model=api.MODEL, effort=effort)
                     copy.save()
                     args.validate_admission(started=coord_started)
-                    with relay.ProviderRelay(control / 'provider.sock', key) as provider:
+                    with relay.ProviderRelay(socket_path, key) as provider:
                         timeout = args.job_deadline - time.monotonic() if args.job_deadline else None
                         if timeout is not None and timeout <= 0:
                             raise api.WorkerError(124, 'DeepSeek worker exceeded its total timeout before execution.')
@@ -277,7 +306,8 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
             known = isinstance(error, (workspace.WorkspaceError, development.DevelopmentError,
                                        coordination.CoordinationError, api.WorkerError,
                                        runtime_preflight.RuntimePreflightError,
-                                       toolchains.ToolchainError, check_evidence.CheckEvidenceError))
+                                       toolchains.ToolchainError, check_evidence.CheckEvidenceError,
+                                       storage_budget.BudgetError))
             message = (error.message if known else
                        'Preparation cancelled before model execution.' if code == 130 else
                        'Preparation failed before model execution; inspect the local runtime and filesystem.')
@@ -299,7 +329,8 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
                       'inspect the task before another assignment.', file=api.sys.stderr)
         if isinstance(error, (workspace.WorkspaceError, development.DevelopmentError,
                               coordination.CoordinationError, runtime_preflight.RuntimePreflightError,
-                              toolchains.ToolchainError, check_evidence.CheckEvidenceError)):
+                              toolchains.ToolchainError, check_evidence.CheckEvidenceError,
+                              storage_budget.BudgetError)):
             raise api.WorkerError(error.code, str(error)) from None
         raise
     finally:

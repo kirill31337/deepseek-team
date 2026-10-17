@@ -48,7 +48,7 @@ Readiness is verified inside the namespace, not inferred from the host. A defaul
 
 Host-only tooling is not exposed. The coordinator prepares what a task needs explicitly with `workspace prepare`, copying an explicitly selected software directory into the read-only `.deepseek-tools/NAME` area and explicit non-secret files or build caches into workspace-relative destinations that stay writable in the owned copy. Only `JAVA_HOME`, `ANDROID_HOME`, `ANDROID_SDK_ROOT`, `GRADLE_USER_HOME`, `M2_HOME`, `KOTLIN_HOME` and `PATH` may be prepared, each using the literal `{workspace}` placeholder; `HOME`, provider variables, hook/config overrides and loader injection variables are never accepted. Declared `--probe` commands run only inside the namespace and must succeed before the provider key is read. Only these prepared roots are added as narrow read-only binds; the whole `/etc`, `/usr` or home trees are never mounted. Broad roots, credential-like paths, escaping links and cycles are rejected before anything is published. For a Java runtime, only ordinary files below `/etc/java-[0-9]+-openjdk/` and the exact `/etc/ssl/certs/java/cacerts` are materialized; the public `docs` and `src.zip`/`lib/src.zip` links are skipped, and every other escaping link fails.
 
-`--save-project` records a private recipe that replays only these declarations into a later copy, keyed by the canonical source-project path under private state. It never stores or automatically executes host commands. A malformed, unsafe or failed recipe fails closed; an absent recipe preserves normal explicit preparation. The legacy `workspace prepare ID -- COMMAND` form still runs on the coordinator host with the existing safe environment and the prepared workspace variables and `PATH`. Full-access never implies host SDKs, databases, services or secrets.
+`--save-project` records a private recipe that replays only these declarations into a later copy, keyed by the canonical source-project path under private state. It never stores or automatically executes host commands. A malformed, unsafe or failed recipe fails closed; an absent recipe preserves normal explicit preparation. A finite immutable content cache keeps saved recipes independent of any one execution tree: each active workspace still materializes its declared tools independently inside the existing sandbox mapping, mutable files are never hardlinked, and a missing or stale cache entry invalidates the recipe with actionable re-preparation guidance. Aggregate byte and inode reservations with free margins are made before allocation under the configured storage root and `TMPDIR`; `/mnt/data` is not a portable default. The legacy `workspace prepare ID -- COMMAND` form still runs on the coordinator host with the existing safe environment and the prepared workspace variables and `PATH`. Full-access never implies host SDKs, databases, services or secrets.
 
 ### Diagnostics, evidence and re-verification
 
@@ -56,13 +56,40 @@ Declared checks run in the namespace before the worker (baseline) and after it (
 
 `workspace verify ID [--check COMMAND] [--timeout SECONDS] [--json]` reruns the declared or supplied checks in the rebuilt prepared environment and sparse namespace. It never loads the provider key, starts a relay or starts a model, and it appends a unique verification run while preserving the original worker status, error, checks and quality. It creates no new quality case, holds the workspace ownership lock for the operation, and may inspect an originally failed copy without automatically resuming implementation. `doctor --offline` checks a managed full-access runtime by actually launching a candidate in a disposable empty sparse namespace with a per-candidate context; it allocates no model job and reads no key. The read-only native Codex and outer read-only Claude boundary is unchanged.
 
-## Queue, access and retained work
+## Queue, access and workspace lifecycle
 
 Fresh Auto access is read-only. Explicit permissions, manual profiles and project `off` remain authoritative. Independent implementation needs explicit full-access. Admission is immediate for eligible bounded work, with truthful quality feedback and measured economic vetoes; unknown costs are never claimed as savings.
 
 The worker queue separates assignment from execution. It defaults to eight concurrent workers and waits FIFO; busy slots do not reassign work to the coordinator. Queued launches recheck enabled state, access, routing authorization and project HEAD before secrets or provider launch. Workspace ownership locks prevent concurrent writes to one copy. Waiting and total timeout are unlimited by default; an explicit timeout includes queue time.
 
-A failed implementation retains its workspace and diff. Inspect them before explicit continuation; implementation never retries automatically. Orphaned assignments require stopped-process evidence and an exclusive workspace-lock check before explicit abandonment. Neither silence nor elapsed time alone proves the worker failed.
+One logical job (`job_id`) owns one stable workspace through preparation, a failed process, check or API error, a review gap without a PID, `needs-rework`, explicit resume and linked corrections. Every run records a distinct `attempt_id`; implementation never retries automatically. A successful process only means **awaiting review**. The coordinator integrates the accepted result and verifies it before final acceptance.
+
+Final acceptance closes the job lease and immediately removes the workspace checkout, its `.git`, `.deepseek-tools` and owned temporary environments. Rejecting, cancelling or abandoning the job finalizes it the same way. Compact job, attempt, check, exit and `work_inode` history, the final binary and untracked `changes.patch`, diagnostics, provenance and lessons are preserved. No checkout or runtime tree is archived, and no TTL backlog exists. A parent feature may continue after its child jobs are finalized.
+
+Repeated `coordination use` feedback remains available. `--disposition needs-rework` keeps the copy. Adding `--final` combines the final accepted or rejected disposition with finalization, and the same outcome can be requested explicitly:
+
+```bash
+deepseek-team coordination finalize --task TASK_ID --assignment ASSIGNMENT_ID \
+  --evidence "reviewed and integrated" [--cancel]
+deepseek-team workspace finalize WORKSPACE_ID
+deepseek-team workspace cancel WORKSPACE_ID
+deepseek-team workspace recover WORKSPACE_ID
+deepseek-team workspace resume WORKSPACE_ID
+deepseek-team workspace list
+deepseek-team workspace history WORKSPACE_ID
+```
+
+`workspace recover` and `workspace resume` repair ownership or state only and never start a model run. An inspected failed attempt continues explicitly with `worker --workspace WORKSPACE_ID --resume-after-failure` in the same workspace inode. A succeeded result that needs a substantive correction receives `needs-rework` first; the coordinator then plans a new linked assignment that reuses the same still-unfinalized `--workspace WORKSPACE_ID`. Orphaned assignments require stopped-process evidence and an exclusive workspace-lock check before explicit abandonment. Neither silence nor elapsed time alone proves that a worker failed.
+
+### Garbage collection
+
+`deepseek-team gc --dry-run` is the default and explains every keep or delete decision with measured allocated bytes and inodes. `gc --apply` performs only the safe deletions described by that report:
+
+```bash
+deepseek-team gc [--dry-run | --apply] [--state-dir PATH] [--all-roots] [--json]
+```
+
+GC protects workspaces during creation, preparation, start, import, review and verification, together with live leases and locks. Historical task status is not a lease. After an upgrade, `setup` and `init` run the same provider-free collector over known owned roots; user guides and delegation configuration are preserved. Unsafe or uncertain cleanup is reported and kept, and deletion is never inferred from mtime alone.
 
 ## Preflight and recovery
 
@@ -76,7 +103,7 @@ An optional path before `--json` selects another checkout. The command reads com
 
 New copy creation rejects credential-like paths and submodules before it allocates the copy, so repeatedly launching against the same blocked HEAD does not accumulate new copies. An early preparation failure in a coordinated managed launch records `failed`/`environment` with `failure_stage: preparation`, the reason and, when one exists, a workspace ID. The recorded `preparation_cause` distinguishes environment failures from admission refusals. Concrete environment failures retain their specific technical constraint; revoked permissions, routing refusals and admission timeouts do not grant a technical-retention exception. Cancellation is recorded as `cancelled` with exit code `130`. It reports no model work and no quality rejection, and it never retries automatically. The coordinator must inspect and disposition the attempt; a plain repeated launch of the same failed assignment is refused. When preflight blocked the source, there is no copy to resume.
 
-Two cases stay distinct. An old failed initial copy that lacks a baseline remains quarantined: `workspace show` still reports it, but `prepare`, `import` and `resume` do not rehabilitate it. An existing prepared copy whose later execution failed keeps the normal explicit inspect/disposition/resume workflow. Coordinated read-only work also uses a managed copy and the same guard; full-access is access to that isolated copy, never to production databases, logs or secrets.
+Two cases stay distinct. An old failed initial copy that lacks a baseline remains quarantined: `workspace show` still reports it, but `prepare` and `import` do not rehabilitate it. `workspace recover` and `workspace resume` restore ownership or state only and do not run a model. An existing prepared copy whose later execution failed keeps the normal explicit inspect/disposition workflow; `worker --workspace WORKSPACE_ID --resume-after-failure` is the explicit continuation in that same inode. Coordinated read-only work also uses a managed copy and the same guard; full-access is access to that isolated copy, never to production databases, logs or secrets.
 
 For legitimate project cleanup, preserve the server files and permissions you still need, remove the unwanted credential backup from Git tracking while preserving any required server file, commit that source change, and start a new coordination task based on the new HEAD. Do not rewrite history or delete server files blindly. A separate sanitized clone with a different HEAD is not a transparent replacement for the old assignment, and this release ships no supported automatic sanitized-snapshot feature.
 

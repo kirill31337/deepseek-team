@@ -6,9 +6,10 @@ A managed worker runs in a sparse Bubblewrap namespace: it sees the owned copy,
 the runtime prefixes it needs and a temporary HOME, but **not** the host root,
 your HOME, `/etc`, `/usr/lib` or installed SDKs. A launcher that works on the host
 can therefore fail inside the namespace when a sibling target or helper was never
-mounted. Preparation copies an explicitly selected toolchain into the owned copy
-so it is really visible there, and the declared smoke probes decide readiness
-before the provider key is read.
+mounted. Preparation materializes an explicitly selected toolchain into the owned
+copy so it is really visible there, and the declared smoke probes decide readiness
+before the provider key is read. Saved recipes use a finite immutable content
+cache, so they survive the removal of any one execution checkout.
 
 This page describes the implemented `workspace prepare` and `workspace verify`
 commands. Wording of individual options is the actual CLI surface; run
@@ -56,8 +57,9 @@ recorded in the private workspace metadata.
   copy of the same project. The recipe contains only declarations and **never
   executes or automatically replays a host command**. A malformed, unsafe,
   incompatible or failed recipe fails closed; a missing recipe preserves the old
-  behavior. Recipes, diagnostics and hashes stay in private state outside the
-  source patch.
+  behavior. The recipe refers to immutable cached content rather than a checkout
+  or runtime tree. Recipes, diagnostics and hashes stay in private state outside
+  the source patch.
 - **Legacy `-- COMMAND ARG ...`** is unchanged: it still runs on the coordinator
   host with the existing safe environment, and the prepared workspace variables and
   `PATH` are supplied to it. Keep artifacts and caches inside the copy rather than
@@ -68,6 +70,19 @@ longer declared are removed, and tracked source below a destination is preserved
 and refuses replacement. Preparation artifacts are added to the copy's private Git
 excludes (`.git/info/exclude`), not to the product's tracked ignore file, so they
 do not appear in the worker diff.
+
+## Immutable content cache and storage reservations
+
+The content cache is finite and immutable: entries have stable content identity,
+saved tool recipes remain independent of execution trees, and removing a finalized
+workspace does not invalidate a still-present entry. Each active workspace still
+materializes its declared tools independently inside the existing sandbox mapping;
+mutable workspace files are never hardlinked from the cache.
+
+A missing or stale cache entry invalidates the saved recipe with actionable
+guidance to run preparation again. Before allocation, aggregate byte and inode
+requirements are reserved together with free-space margins. Reservations honor the
+configured private storage root and `TMPDIR`; `/mnt/data` is not a portable default.
 
 ## Debian/OpenJDK materialization
 
@@ -184,7 +199,9 @@ rejected. It **never loads the provider key, starts a relay or starts a model**.
   directory; larger output is drained and flagged truncated. Use `--json` for the
   machine-readable result.
 - It may inspect an originally failed copy without automatically resuming
-  implementation. Continuation still requires an explicit decision.
+  implementation. Continuation still requires an explicit decision. Finalizing the
+  job removes this checkout and its owned temporary environments, so integrate and
+  re-verify before final acceptance.
 
 ## Baseline and evidence causes
 

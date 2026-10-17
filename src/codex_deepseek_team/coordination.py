@@ -6,7 +6,7 @@ restore context after compaction.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 import fcntl
 import hashlib
 import json
@@ -303,6 +303,13 @@ def completion_issues(task):
         if outcome not in ('accepted', 'cancelled'):
             issues.append(f"{item['id']}: {item['executor']} outcome is outstanding; "
                           "record an accepted or cancelled result with evidence")
+    current_jobs = {}
+    for row in task.get('assignments', []):
+        if row.get('job_id'):
+            current_jobs[row['job_id']] = row
+    for row in current_jobs.values():
+        if not row.get('job_finalization'):
+            issues.append(f"{row['id']}: logical job requires explicit finalize or cancel")
     return issues
 
 
@@ -1186,7 +1193,7 @@ def sync_lessons_feedback(root: Path, task_id: str) -> None:
 def assignment_started(root: Path, task_id: str, assignment_id: str,
                        workspace_id: str, runtime: str,
                        prepared_changes: list[str], effort: str | None = None,
-                       execution: dict | None = None) -> dict:
+                       execution: dict | None = None, *, resume_running: bool = False) -> dict:
     """Start one attempt and snapshot its original context before execution.
 
     ``execution`` is optional, bounded pre-execution evidence supplied by the
@@ -1202,6 +1209,39 @@ def assignment_started(root: Path, task_id: str, assignment_id: str,
         if canonical_effort is None:
             raise CoordinationError('Worker effort must be low, high or max (legacy medium maps to high).', 64)
         effort = canonical_effort
+    identity = None
+    if isinstance(workspace_id, str) and re.fullmatch('[0-9a-f]{32}', workspace_id):
+        from . import workspace, workspace_lifecycle
+        existing = _assignment(load_task(root, task_id), assignment_id)
+        if existing['status'] not in ('planned', 'failed', 'running'):
+            raise CoordinationError('Assignment is already active or completed.', 64)
+        if (existing.get('status') == 'failed' and existing.get('workspace_id')
+                and existing['workspace_id'] != workspace_id):
+            raise CoordinationError('A logical job continuation must reuse its original workspace.', 64)
+        if existing.get('job_finalization'):
+            raise CoordinationError('This logical job was finalized; plan a new job.', 73)
+        try:
+            copy = workspace.load(_state_root(), workspace_id)
+        except workspace.WorkspaceError:
+            # Legacy synthetic/nonlocal references have unknown identity. Do
+            # not fabricate provenance or rewrite their historic records.
+            copy = None
+        if copy is not None:
+            if copy.source.resolve() != _project_root(root):
+                raise CoordinationError('Workspace belongs to another source project.', 78)
+            try:
+                previous = workspace_lifecycle.read(copy)
+                binding = previous.get('binding') if previous else None
+                if binding and binding != {'task_id': task_id, 'assignment_id': assignment_id}:
+                    old = _assignment(load_task(root, binding['task_id']), binding['assignment_id'])
+                    if (old.get('workspace_id') != workspace_id
+                            or (old.get('disposition') or {}).get('kind') != 'needs-rework'):
+                        raise CoordinationError('Linked correction requires reviewed needs-rework on the prior assignment.', 64)
+                if existing['status'] != 'running' or resume_running:
+                    identity = workspace_lifecycle.prepare_attempt(copy, task_id, assignment_id,
+                                                                  replace_pending=resume_running)
+            except workspace.WorkspaceError as cause:
+                raise CoordinationError(str(cause), cause.code) from None
     with _lock(root), _routing_batch(root) as service:
         task = load_task(root, task_id)
         row = _assignment(task, assignment_id)
@@ -1231,19 +1271,23 @@ def assignment_started(root: Path, task_id: str, assignment_id: str,
                     _atomic(_task_path(root, task_id), task)
                 service.validate_start(row['routing_decision_id'], already_running=True,
                     access=_effective_task_access(task, settings.resolve(root)))
-            return task
-        if row["status"] not in ("planned", "failed"):
+            if not resume_running:
+                return task
+        if row["status"] not in ("planned", "failed") and not resume_running:
             raise CoordinationError("Assignment is already active or completed.", 64)
-        if row['status'] == 'failed':
-            if row.get('disposition') is None:
+        if row['status'] == 'failed' or (row['status'] == 'running' and resume_running):
+            if row['status'] == 'failed' and row.get('disposition') is None:
                 raise CoordinationError('Review and disposition the failed attempt before explicit continuation.', 64)
+            if row.get('workspace_id') and row['workspace_id'] != workspace_id:
+                raise CoordinationError('A logical job continuation must reuse its original workspace; '
+                                        'new execution needs a separately planned job.', 64)
             history = row.setdefault('attempt_history', [])
             history.append({key: row.get(key) for key in ('status', 'workspace_id', 'runtime', 'effort',
                 'started_at', 'finished_at', 'checks', 'disposition', 'error_kind', 'exit_code',
                 'failure_stage', 'preparation_cause', 'routing_features', 'routing_decision_id',
                 'execution_snapshot', 'worker_changes', 'result_summary', 'baseline_checks',
                 'verification_cause', 'prepared_input_changes', 'verification_runs',
-                'readiness_checks')})
+                'readiness_checks', 'job_id', 'attempt_id')})
         if item.get('features'):
             declared = validate_features(item['features'])
             features = validate_features(dict(item['features'], runtime=runtime,
@@ -1270,6 +1314,9 @@ def assignment_started(root: Path, task_id: str, assignment_id: str,
                    failure_stage=None, preparation_cause=None, queue_state='running',
                    execution_snapshot=snapshot, baseline_checks=[], verification_cause=None,
                    prepared_input_changes=[], verification_runs=[], readiness_checks=[])
+        if identity:
+            row.update(job_id=identity[0], attempt_id=identity[1])
+            snapshot['execution'].update(job_id=identity[0], attempt_id=identity[1])
         row.pop('finished_at', None)
         task.update(status="active", updated_at=time.time())
         _atomic(_task_path(root, task_id), task)
@@ -1478,6 +1525,19 @@ def assignment_preparation_failed(root: Path, task_id: str, assignment_id: str,
         raise CoordinationError('Worker runtime must be a non-empty runtime name.', 64)
     cancelled = exit_code == 130
     summary = str(result_summary)[:4000]
+    identity = None
+    if isinstance(workspace_id, str) and re.fullmatch('[0-9a-f]{32}', workspace_id):
+        from . import workspace, workspace_gc, workspace_lifecycle
+        if os.path.lexists(_state_root() / 'workspaces' / workspace_id):
+            try:
+                copy = workspace_gc._load_record(_state_root(), workspace_id)
+                if copy.source.resolve() != _project_root(root):
+                    raise CoordinationError('Preparation workspace belongs to another project.', 78)
+                lease = workspace_lifecycle.read(copy)
+                if lease:
+                    identity = lease['job_id'], copy.metadata.get('attempt_id')
+            except workspace.WorkspaceError as error:
+                raise CoordinationError(str(error), error.code) from None
     with _lock(root):
         task = load_task(root, task_id)
         row = _assignment(task, assignment_id)
@@ -1498,6 +1558,10 @@ def assignment_preparation_failed(root: Path, task_id: str, assignment_id: str,
             row['verification_cause'] = verification_cause
         if workspace_id is not None:
             row['workspace_id'] = str(workspace_id)
+        if identity:
+            row['job_id'] = identity[0]
+            if identity[1]:
+                row['attempt_id'] = identity[1]
         if runtime is not None:
             row['runtime'] = runtime
         if canonical_effort is not None:
@@ -1522,6 +1586,45 @@ def assignment_preparation_failed(root: Path, task_id: str, assignment_id: str,
 def use_result(root: Path, task_id: str, assignment_id: str,
                disposition: str, evidence: str, *, cost_usd: float | None = None,
                rework: dict | None = None, quality: dict | None = None) -> dict:
+    # A correction reopens execution intent. Serialize it with actual final
+    # acceptance before writing feedback, so a concurrent finalizer cannot
+    # delete the copy between the disposition and its retry lease.
+    if disposition in ('incorporated', 'reproduced', 'rejected', 'needs-rework'):
+        from . import workspace, workspace_gc, workspace_lifecycle
+        row = _assignment(load_task(root, task_id), assignment_id)
+        identifier = row.get('workspace_id')
+        if (isinstance(identifier, str) and re.fullmatch('[0-9a-f]{32}', identifier)
+                and os.path.lexists(_state_root() / 'workspaces' / identifier)):
+            try:
+                copy = workspace_gc._load_record(_state_root(), identifier)
+                with ExitStack() as owned:
+                    with workspace_lifecycle.fence(_state_root()):
+                        owned.enter_context(workspace_gc._owner(copy))
+                        lease = workspace_lifecycle.read(copy)
+                        assessment_only = bool(lease and lease['phase'] in workspace_lifecycle.FINAL_PHASES
+                            and quality is not None and rework is None
+                            and disposition == (row.get('disposition') or {}).get('kind'))
+                        if (disposition == 'needs-rework' and lease
+                                and lease['phase'] in workspace_lifecycle.FINAL_PHASES and not assessment_only):
+                            raise CoordinationError('This job is finalized; plan a new job for further changes.', 73)
+                    if copy.source.resolve() != _project_root(root):
+                        raise CoordinationError('Result workspace belongs to another project.', 78)
+                    result = _use_result(root, task_id, assignment_id, disposition, evidence,
+                                         cost_usd=cost_usd, rework=rework, quality=quality,
+                                         _finalized_assessment=assessment_only)
+                if disposition == 'rejected' and not row.get('job_finalization'):
+                    return finalize_assignment(root, task_id, assignment_id, evidence, cancelled=True)
+                return result
+            except workspace.WorkspaceError as cause:
+                raise CoordinationError(str(cause), cause.code) from None
+    return _use_result(root, task_id, assignment_id, disposition, evidence,
+                       cost_usd=cost_usd, rework=rework, quality=quality)
+
+
+def _use_result(root: Path, task_id: str, assignment_id: str,
+                disposition: str, evidence: str, *, cost_usd: float | None = None,
+                rework: dict | None = None, quality: dict | None = None,
+                _finalized_assessment: bool = False) -> dict:
     """Record the coordinator disposition and queue its durable lessons event.
 
     ``rework`` is validated by the lessons service and ``quality`` by the closed
@@ -1560,10 +1663,18 @@ def use_result(root: Path, task_id: str, assignment_id: str,
         row = _assignment(task, assignment_id)
         if row.get("status") not in ("succeeded", "failed"):
             raise CoordinationError("Cannot disposition an unfinished assignment.", 64)
+        frozen = bool(row.get('job_finalization') or row.get('job_finalization_request') or _finalized_assessment)
+        if frozen and (disposition != (row.get('disposition') or {}).get('kind') or rework is not None):
+            raise CoordinationError('Final job disposition is immutable; append a quality assessment with its original disposition.', 73)
         item = assignment_deliverable(task, assignment_id)
         context = _outcome_context(task, row, item, disposition, quality=quality)
-        row["disposition"] = {"kind": disposition, "evidence": evidence[:2000],
-                              "at": time.time()}
+        if not frozen:
+            row["disposition"] = {"kind": disposition, "evidence": evidence[:2000],
+                                  "at": time.time()}
+        if disposition == 'needs-rework' and row.get('job_finalization_request'):
+            row.setdefault('job_lifecycle_events', []).append({
+                'event': 'finalization-aborted-for-rework', 'at': time.time(),
+                'request': row.pop('job_finalization_request')})
         row.setdefault("lessons_feedback", []).append({
             "event": {"task_id": task_id, "assignment_id": assignment_id,
                       "disposition": disposition, "evidence": recorded_evidence,
@@ -1590,7 +1701,80 @@ def use_result(root: Path, task_id: str, assignment_id: str,
         _atomic(_task_path(root, task_id), task)
     sync_routing_feedback(root, task_id)
     sync_lessons_feedback(root, task_id)
+    if disposition == 'needs-rework' and not _finalized_assessment:
+        from . import workspace, workspace_lifecycle
+        recorded = _assignment(load_task(root, task_id), assignment_id)
+        identifier = recorded.get('workspace_id')
+        if isinstance(identifier, str) and re.fullmatch('[0-9a-f]{32}', identifier):
+            copy = workspace.load(_state_root(), identifier)
+            if copy.source.resolve() != _project_root(root):
+                raise CoordinationError('Rework workspace belongs to another project.', 78)
+            # No coordination lock is held while acquiring the lifecycle fence.
+            workspace_lifecycle.rework(copy)
     return load_task(root, task_id)
+
+
+def finalize_assignment(root: Path, task_id: str, assignment_id: str,
+                        evidence: str, *, cancelled=False) -> dict:
+    """Explicit final review of one job; parent feature completion is unrelated.
+
+    Feedback remains append-only/repeatable. Finalization separately attests that
+    integration is done and no further correction is expected for this job.
+    """
+    if not isinstance(evidence, str) or not evidence.strip():
+        raise CoordinationError('Final job acceptance requires evidence.', 64)
+    from . import workspace, workspace_gc, workspace_lifecycle
+    task = load_task(root, task_id)
+    row = _assignment(task, assignment_id)
+    if row.get('job_finalization'):
+        return task
+    disposition = (row.get('disposition') or {}).get('kind')
+    if row.get('status') not in ('succeeded', 'failed') or disposition is None:
+        raise CoordinationError('Review and disposition the finished result before finalizing.', 64)
+    if disposition == 'needs-rework' and not cancelled:
+        raise CoordinationError('This job still needs corrections; keep its existing workspace.', 64)
+    identifier = row.get('workspace_id')
+    if not isinstance(identifier, str) or not re.fullmatch('[0-9a-f]{32}', identifier):
+        raise CoordinationError('Assignment has no verified owned execution copy.', 64)
+    try:
+        copy = workspace_gc._load_record(_state_root(), identifier)
+        if copy.source.resolve() != _project_root(root):
+            raise CoordinationError('Assignment workspace belongs to another project.', 78)
+        def attest():
+            lease = workspace_lifecycle.read(copy)
+            binding = lease.get('binding') if lease else None
+            if binding and binding != {'task_id': task_id, 'assignment_id': assignment_id}:
+                raise CoordinationError('Finalize the latest correction assignment of this logical job.', 64)
+            with _lock(root):
+                current = load_task(root, task_id)
+                actual = _assignment(current, assignment_id)
+                if actual.get('job_finalization'):
+                    return
+                decision = (actual.get('disposition') or {}).get('kind')
+                if (actual.get('workspace_id') != identifier
+                        or actual.get('status') not in ('succeeded', 'failed')
+                        or decision is None or (decision == 'needs-rework' and not cancelled)):
+                    raise CoordinationError('Final review changed before acceptance; execution copy preserved.', 75)
+                actual['job_finalization_request'] = {
+                    'at': time.time(), 'evidence': evidence[:2000], 'cancelled': bool(cancelled),
+                    'workspace_id': identifier}
+                _atomic(_task_path(root, task_id), current)
+        report = workspace_gc.finalize(copy, reason=evidence[:1000],
+            cancelled=cancelled or disposition == 'rejected', before_finalize=attest)
+    except workspace.WorkspaceError as cause:
+        raise CoordinationError(str(cause), cause.code) from None
+    with _lock(root):
+        task = load_task(root, task_id)
+        row = _assignment(task, assignment_id)
+        if row.get('workspace_id') != identifier:
+            raise CoordinationError('Assignment binding changed during finalization.', 73)
+        if row.get('job_finalization'):
+            return task
+        row['job_finalization'] = dict(report, at=time.time(), evidence=evidence[:2000])
+        row.pop('job_finalization_request', None)
+        task['updated_at'] = time.time()
+        _atomic(_task_path(root, task_id), task)
+    return task
 
 
 def abandon_assignment(root: Path, task_id: str, assignment_id: str,
@@ -1613,9 +1797,10 @@ def abandon_assignment(root: Path, task_id: str, assignment_id: str,
             changes, _ = copy.changes()
             assignment_finished(root, task_id, assignment_id, 'failed', evidence,
                                 changes, [], error_kind='cancelled', exit_code=130)
-            result = use_result(root, task_id, assignment_id, 'rejected', evidence)
             copy.failed('cancelled', 130)
-            return result
+            # Already holding the owner lock; publish without reacquiring it.
+            _use_result(root, task_id, assignment_id, 'rejected', evidence)
+        return finalize_assignment(root, task_id, assignment_id, evidence, cancelled=True)
     except workspace.WorkspaceError as error:
         raise CoordinationError(error.message, error.code) from None
 

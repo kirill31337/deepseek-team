@@ -14,6 +14,7 @@ declarations again and never runs them. Smoke probes are returned by
 """
 from __future__ import annotations
 
+from contextlib import ExitStack, contextmanager, nullcontext
 import fcntl
 import hashlib
 import json
@@ -45,6 +46,7 @@ _MAX_LINK_DEPTH = 64
 _MAX_PROBES = 64
 _MAX_PROBE_LENGTH = 8192
 _MAX_RECIPE_BYTES = 1 << 20
+_ALLOCATION_BLOCK = 4096
 
 # Debian-style JDK configuration links. Only ordinary files below a concrete
 # OpenJDK configuration directory and the exact public truststore may leave the
@@ -266,7 +268,8 @@ def _validate_probes(probes) -> list[str]:
     return normalized
 
 
-def _validate_host_source(copy, value, *, what: str, require_directory: bool) -> Path:
+def _validate_host_source(copy, value, *, what: str, require_directory: bool,
+                          allow_workspace_input: bool = False) -> Path:
     if isinstance(value, os.PathLike):
         value = os.fspath(value)
     if not isinstance(value, str) or not value or '\0' in value:
@@ -286,11 +289,28 @@ def _validate_host_source(copy, value, *, what: str, require_directory: bool) ->
     copy_root = Path(os.path.realpath(copy.path))
     state_root = Path(os.path.realpath(_state_root(copy)))
     source_root = _canonical_source(copy)
-    if resolved == copy_root or resolved.is_relative_to(copy_root):
+    from . import toolchain_cache
+    if toolchain_cache.is_entry_path(state_root, resolved):
+        return toolchain_cache.validate_entry(state_root, resolved,
+                                              require_directory=require_directory)
+    if '.git' in resolved.parts:
+        raise ToolchainError(f'Refusing checkout or Git metadata {what.lower()} source: '
+                             f'{_display(resolved)}.')
+    if resolved == copy_root:
         raise ToolchainError(f'{what} source cannot be the owned copy itself: {_display(resolved)}.')
-    if (resolved == state_root or resolved.is_relative_to(state_root)
-            or state_root.is_relative_to(resolved)):
+    if resolved.is_relative_to(copy_root) and not allow_workspace_input:
+        raise ToolchainError(f'{what} source cannot be inside the owned copy: {_display(resolved)}.')
+    if resolved == state_root or state_root.is_relative_to(resolved):
         raise ToolchainError(f'{what} source cannot overlap private workspace state: {_display(resolved)}.')
+    if resolved.is_relative_to(state_root):
+        workspaces = state_root / 'workspaces'
+        relative = resolved.relative_to(workspaces) if resolved.is_relative_to(workspaces) else None
+        ordinary_workspace_input = (allow_workspace_input and relative is not None
+                                    and len(relative.parts) >= 3
+                                    and relative.parts[1] == 'work'
+                                    and '.git' not in relative.parts)
+        if not ordinary_workspace_input:
+            raise ToolchainError(f'{what} source cannot overlap private workspace state: {_display(resolved)}.')
     if resolved == source_root or source_root.is_relative_to(resolved):
         raise ToolchainError(f'{what} source cannot be the source project root or its parent: '
                              f'{_display(resolved)}.')
@@ -550,6 +570,195 @@ def _copy_entry(entry, source: Path, target: Path, root: Path, java: bool, label
 def _java_tool(source: Path) -> bool:
     return os.path.lexists(source / 'bin' / 'java')
 
+def _rounded_allocation(size: int) -> int:
+    return max(1, ((int(size) + _ALLOCATION_BLOCK - 1) // _ALLOCATION_BLOCK)) * _ALLOCATION_BLOCK
+
+
+def _add_requirement(total: dict, extra: dict) -> None:
+    total['disk_bytes'] += int(extra['disk_bytes'])
+    total['inodes'] += int(extra['inodes'])
+
+
+def _materialization_requirement(source: Path, *, java: bool = False,
+                                 label: str = 'source') -> dict:
+    """Validate a copy tree without content reads and bound its apparent allocation.
+
+    Sparse files are charged by apparent size rather than allocated blocks, and
+    every directory, entry, materialized symlink target and block-rounded file
+    contributes so the result is conservative for the destination copy.
+    """
+    source = Path(source)
+    root = Path(os.path.realpath(source))
+    requirement = {'disk_bytes': 0, 'inodes': 0}
+    active = set()
+
+    def account_file(info) -> None:
+        requirement['disk_bytes'] += _rounded_allocation(info.st_size)
+        requirement['inodes'] += 1
+
+    def account_directory(info) -> None:
+        requirement['disk_bytes'] += _ALLOCATION_BLOCK
+        requirement['inodes'] += 1
+
+    def visit_directory(path: Path, relative: Path) -> None:
+        identity = _identity(path)
+        if identity in active:
+            raise ToolchainError(f'Cyclic directory materialization in {label}: {_display(relative)}.')
+        active.add(identity)
+        try:
+            try:
+                info = os.stat(path)
+            except OSError:
+                raise ToolchainError(f'Prepared {label} tree is not readable: {_display(path)}.') from None
+            if not stat.S_ISDIR(info.st_mode):
+                raise ToolchainError(f'Prepared {label} entry changed type: {_display(relative)}.')
+            account_directory(info)
+            try:
+                entries = list(os.scandir(path))
+            except OSError:
+                raise ToolchainError(f'Prepared {label} tree is not readable: {_display(path)}.') from None
+            for entry in entries:
+                visit_entry(entry, Path(entry.path), relative / entry.name)
+        finally:
+            active.discard(identity)
+
+    def visit_entry(entry, path: Path, relative: Path) -> None:
+        if entry.name == '.git':
+            raise ToolchainError(f'Refusing to prepare Git metadata from {label}: {_display(relative)}.')
+        if workspace._credential_like(relative):
+            raise ToolchainError(f'Refusing credential-like {label} entry: {_display(relative)}.')
+        try:
+            info = entry.stat(follow_symlinks=False)
+        except OSError:
+            raise ToolchainError(f'Prepared {label} entry is unavailable: {_display(relative)}.') from None
+        if stat.S_ISLNK(info.st_mode):
+            if java and _java_omitted_link(relative, path):
+                return
+            final = _resolve_link(path)
+            if final is None:
+                missing = _missing_target(path)
+                if _within(missing, root) or (java and _java_external_allowed(str(missing))):
+                    return
+                raise ToolchainError(f'Refusing dangling {label} symlink with an unapproved target: '
+                                     f'{_display(relative)} -> {_display(missing)}.')
+            real = Path(os.path.realpath(final))
+            if workspace._credential_like(real):
+                raise ToolchainError(f'Refusing credential-like {label} symlink target: '
+                                     f'{_display(relative)}.')
+            try:
+                node = os.lstat(real)
+            except OSError:
+                raise ToolchainError(f'Link target is unavailable: {_display(relative)}.') from None
+            inside = _within(real, root)
+            if stat.S_ISREG(node.st_mode):
+                if not inside and not (java and _java_external_allowed(str(real))):
+                    raise ToolchainError(f'Refusing escaping {label} symlink: {_display(relative)} '
+                                         f'-> {_display(real)}.')
+                account_file(node)
+                return
+            if stat.S_ISDIR(node.st_mode):
+                if not inside:
+                    raise ToolchainError(f'Refusing escaping {label} symlink directory: '
+                                         f'{_display(relative)} -> {_display(real)}.')
+                visit_directory(real, relative)
+                return
+            raise ToolchainError(f'Refusing special file behind {label} symlink: {_display(relative)}.')
+        if stat.S_ISDIR(info.st_mode):
+            visit_directory(path, relative)
+            return
+        if stat.S_ISREG(info.st_mode):
+            account_file(info)
+            return
+        raise ToolchainError(f'Refusing special file in {label}: {_display(relative)}.')
+
+    try:
+        info = os.lstat(root)
+    except OSError:
+        raise ToolchainError(f'Prepared {label} source is unavailable: {_display(source)}.') from None
+    if stat.S_ISDIR(info.st_mode):
+        visit_directory(root, Path('.'))
+    elif stat.S_ISREG(info.st_mode):
+        if workspace._credential_like(root):
+            raise ToolchainError(f'Refusing credential-like {label} source: {_display(source)}.')
+        account_file(info)
+    else:
+        raise ToolchainError(f'Prepared {label} source must be an ordinary file or directory.')
+    return requirement
+
+
+def _destination_requirement(copy, destination: str) -> dict:
+    """Charge directories that preparation still has to create for a destination."""
+    total = {'disk_bytes': 0, 'inodes': 0}
+    current = copy.path
+    for part in PurePosixPath(destination).parts[:-1]:
+        current = current / part
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            total['disk_bytes'] += _ALLOCATION_BLOCK
+            total['inodes'] += 1
+            continue
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            break
+    return total
+
+
+@contextmanager
+def _reserve_materialization(target, requirement: dict):
+    """Admit one known materialization through the shared allocation pool."""
+    from . import execution_allocation, storage_budget
+    try:
+        with execution_allocation.reserve(target, disk_bytes=requirement['disk_bytes'],
+                                          inodes=requirement['inodes']):
+            yield
+    except storage_budget.BudgetError as error:
+        raise ToolchainError(str(error), error.code) from None
+
+
+def _managed_source_owner(copy, source):
+    source_real = Path(os.path.realpath(source))
+    for candidate in (source_real, *source_real.parents):
+        if (candidate.name == 'work' and re.fullmatch('[0-9a-f]{32}', candidate.parent.name)
+                and candidate.parent.parent.name == 'workspaces'):
+            return candidate.parent.parent.parent, candidate.parent.name
+    if copy is not None and source_real.is_relative_to(_state_root(copy) / 'workspaces'):
+        raise ToolchainError('Managed workspace sources must stay beneath an owned work tree.')
+    return None
+
+
+@contextmanager
+def _borrowed_workspace_source(copy, source):
+    """Hold another managed copy's raw owner lock while its source is copied."""
+    source_real = Path(os.path.realpath(source))
+    owner = _managed_source_owner(copy, source)
+    if owner is None:
+        yield
+        return
+    state, workspace_id = owner
+    if (copy is not None and copy._locked
+            and copy.directory == state / 'workspaces' / workspace_id):
+        yield
+        return
+    from . import workspace as workspace_module, workspace_lifecycle, workspace_gc
+    try:
+        # Prove this is existing managed control state before fence() may create
+        # any control file; ordinary lookalike input paths stay untouched.
+        workspace_module.load(state, workspace_id)
+        with ExitStack() as locks:
+            with workspace_lifecycle.fence(state):
+                other = workspace_module.load(state, workspace_id)
+                locks.enter_context(workspace_gc._owner(other))
+            other = workspace_module.load(state, workspace_id)
+            other.verify()
+            if not source_real.is_relative_to(Path(os.path.realpath(other.path))):
+                raise ToolchainError('Managed workspace source changed while it was locked.')
+            yield
+    except workspace_module.WorkspaceError as error:
+        raise ToolchainError('Cannot borrow the source workspace; provide a durable cache '
+                             'snapshot instead: ' + str(error), error.code) from None
+
+
+
 
 def _validate_tools_root(copy) -> Path | None:
     """Return the private tool area only when it is an ordinary owned directory."""
@@ -650,26 +859,135 @@ def _write_excludes(copy, patterns: list[str]) -> None:
             pass
 
 
-def _save_recipe(copy, metadata: dict) -> None:
+@contextmanager
+def _recipe_lock(copy):
     directory = _state_root(copy) / RECIPES_DIRNAME
     _ensure_private_directory(directory)
     key = _recipe_key(copy)
     lock = directory / (key + '.lock')
-    fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
     try:
         info = os.fstat(fd)
         if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
                 or info.st_uid != os.geteuid() or info.st_mode & 0o077):
             raise ToolchainError('Private toolchain recipe lock is unsafe.')
         fcntl.flock(fd, fcntl.LOCK_EX)
-        payload = {'version': TOOLCHAIN_VERSION, 'kind': RECIPE_KIND,
-                   'source_project': metadata['source_project'], 'saved_at': time.time(),
-                   'tools': metadata['tools'], 'copies': metadata['copies'],
-                   'environment': metadata['environment'], 'probes': metadata['probes']}
-        _atomic_private_write(directory / (key + '.json'),
-                              (json.dumps(payload, indent=2, ensure_ascii=True) + '\n').encode())
+        yield directory, key
     finally:
         os.close(fd)
+
+
+def _stable_recipe_sources(copy, metadata: dict) -> tuple[dict, list[dict]]:
+    """Replace tool and execution-copy sources with verified shared cache paths."""
+    from . import toolchain_cache
+    state = _state_root(copy)
+    stable_tools = {}
+    for name, entry in metadata['tools'].items():
+        prepared = copy.path / TOOLS_DIRNAME / name
+        cached = toolchain_cache.snapshot(state, prepared, _owned_copy=copy)
+        stable = dict(entry)
+        stable['source'] = str(cached)
+        stable_tools[name] = stable
+    workspaces = Path(os.path.realpath(state / 'workspaces'))
+    stable_copies = []
+    for entry in metadata['copies']:
+        stable = dict(entry)
+        source = Path(entry['source'])
+        try:
+            canonical = source.resolve(strict=True)
+        except (OSError, RuntimeError):
+            canonical = source
+        if canonical.is_relative_to(workspaces):
+            prepared = copy.path / entry['destination']
+            if not os.path.lexists(prepared):
+                raise ToolchainError('A prepared execution-copy input disappeared before its '
+                                     'recipe snapshot could be stored.')
+            stable['source'] = str(toolchain_cache.snapshot(state, prepared, _owned_copy=copy))
+        stable_copies.append(stable)
+    return stable_tools, stable_copies
+
+
+def _save_recipe(copy, metadata: dict) -> None:
+    tools, copies = _stable_recipe_sources(copy, metadata)
+    payload = {'version': TOOLCHAIN_VERSION, 'kind': RECIPE_KIND,
+               'source_project': metadata['source_project'], 'saved_at': time.time(),
+               'tools': tools, 'copies': copies,
+               'environment': metadata['environment'], 'probes': metadata['probes']}
+    with _recipe_lock(copy) as (directory, key):
+        _atomic_private_write(directory / (key + '.json'),
+                              (json.dumps(payload, indent=2, ensure_ascii=True) + '\n').encode())
+
+
+def _source_missing(value) -> Path | None:
+    if not isinstance(value, str) or not value or '\0' in value:
+        return None
+    path = Path(value)
+    if not path.is_absolute() or '.git' in path.parts or workspace._credential_like(path):
+        return None
+    try:
+        path.resolve(strict=True)
+    except (FileNotFoundError, NotADirectoryError):
+        return path
+    except (OSError, RuntimeError):
+        return None
+    return None
+
+
+def _missing_recipe_source(declarations: dict) -> Path | None:
+    for source in declarations['tools'].values():
+        missing = _source_missing(source)
+        if missing is not None:
+            return missing
+    for source, _ in declarations['copies']:
+        missing = _source_missing(source)
+        if missing is not None:
+            return missing
+    return None
+
+
+def _validate_safe_before_invalidation(copy, declarations: dict) -> None:
+    """Never invalidate a recipe that is unsafe independently of a missing source."""
+    for name, source in declarations['tools'].items():
+        if _source_missing(source) is None:
+            _validate_host_source(copy, source, what=f'Tool {name}', require_directory=True)
+    seen = set()
+    for source, destination in declarations['copies']:
+        normalized = _validate_destination(copy, destination)
+        if normalized in seen:
+            raise ToolchainError(f'Duplicate copy destination: {_display(normalized)}.')
+        for other in seen:
+            if normalized.startswith(other + '/') or other.startswith(normalized + '/'):
+                raise ToolchainError(f'Overlapping copy destinations: {_display(other)} and '
+                                     f'{_display(normalized)}.')
+        seen.add(normalized)
+        if _source_missing(source) is None:
+            _validate_host_source(copy, source, what='Copy', require_directory=False,
+                                  allow_workspace_input=True)
+
+
+def _invalidate_recipe(copy, expected_payload: dict) -> bool:
+    """Remove only the exact stale recipe observed, preserving unsafe replacements."""
+    with _recipe_lock(copy) as (directory, key):
+        try:
+            current = _read_recipe(copy)
+        except ToolchainError:
+            return False
+        if current != expected_payload:
+            return False
+        path = directory / (key + '.json')
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            return False
+        try:
+            fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+        return True
 
 
 def _read_recipe(copy) -> dict | None:
@@ -720,6 +1038,7 @@ def _validate_recipe(copy, payload) -> dict:
         if (not isinstance(entry, dict)
                 or set(entry) != {'source', 'files', 'bytes', 'links_skipped'}
                 or not isinstance(entry.get('source'), str)
+                or not Path(entry['source']).is_absolute() or '\0' in entry['source']
                 or not isinstance(entry.get('files'), int) or isinstance(entry.get('files'), bool)
                 or not isinstance(entry.get('bytes'), int) or isinstance(entry.get('bytes'), bool)
                 or not isinstance(entry.get('links_skipped'), int)
@@ -732,7 +1051,8 @@ def _validate_recipe(copy, payload) -> dict:
     checked_copies = []
     for entry in copies:
         if (not isinstance(entry, dict) or set(entry) != {'source', 'destination'}
-                or not isinstance(entry.get('source'), str)):
+                or not isinstance(entry.get('source'), str)
+                or not Path(entry['source']).is_absolute() or '\0' in entry['source']):
             raise ToolchainError('Private toolchain recipe has a malformed copy declaration.')
         checked_copies.append(dict(entry))
     return {'source_project': payload['source_project'],
@@ -748,11 +1068,12 @@ def _materialize(copy, declarations: dict, *, recover: bool) -> dict:
     environment = declarations['environment']
     probes = declarations['probes']
 
+    from . import toolchain_cache
     tool_sources = {}
     for name, source in tools.items():
         tool_sources[name] = _validate_host_source(copy, source, what=f'Tool {name}',
                                                    require_directory=True)
-    copy_sources = []
+    normalized_copies = []
     seen_destinations = set()
     for source, destination in copies:
         normalized = _validate_destination(copy, destination)
@@ -763,8 +1084,12 @@ def _materialize(copy, declarations: dict, *, recover: bool) -> dict:
                 raise ToolchainError(f'Overlapping copy destinations: {_display(other)} and '
                                      f'{_display(normalized)}.')
         seen_destinations.add(normalized)
+        normalized_copies.append((source, normalized))
+    copy_sources = []
+    for source, normalized in normalized_copies:
         resolved = _validate_host_source(copy, source, what='Copy',
-                                         require_directory=False)
+                                         require_directory=False,
+                                         allow_workspace_input=True)
         copy_sources.append((resolved, normalized))
 
     previous_tools, previous_destinations = _existing_patterns(copy)
@@ -803,67 +1128,106 @@ def _materialize(copy, declarations: dict, *, recover: bool) -> dict:
     stage_root = None
     staged_map = []
     created_tools_root = False
-    try:
-        if tool_sources or copy_sources:
-            try:
-                os.mkdir(tools_root, 0o755)
-                created_tools_root = True
-            except FileExistsError:
-                _validate_tools_root(copy)
-            stage_root = tools_root / ('.stage-' + uuid.uuid4().hex)
-            stage_root.mkdir(mode=0o700)
-        tool_stats = {}
-        if tool_sources:
-            (stage_root / 'tools').mkdir(mode=0o700)
-        for name, source in tool_sources.items():
-            destination = stage_root / 'tools' / name
-            tool_stats[name] = _copy_tree(source, destination, java=_java_tool(source), label='tool')
-            staged_map.append((copy.path / TOOLS_DIRNAME / name, destination))
-        if copy_sources:
-            (stage_root / 'copies').mkdir(mode=0o700)
-        for index, (source, destination) in enumerate(copy_sources):
-            staged = stage_root / 'copies' / str(index)
-            if source.is_dir():
-                _copy_tree(source, staged, java=False, label='copy')
-            else:
-                _copy_file(source, staged, {'files': 0, 'bytes': 0})
-            staged_map.append((copy.path / destination, staged))
-
-        _validate_environment_paths(copy, environment, staged=staged_map)
-
-        for name in tool_sources:
-            final = tools_root / name
-            if os.path.lexists(final):
-                _remove(final)
-            _replace(stage_root / 'tools' / name, final)
-        for index, (source, destination) in enumerate(copy_sources):
-            final = copy.path / destination
-            _ensure_directory_chain(copy, PurePosixPath(destination).parts[:-1])
-            if os.path.lexists(final):
-                _remove(final)
-            _replace(stage_root / 'copies' / str(index), final)
-        # A repeated prepare replaces the declaration set exactly: previously
-        # recorded artifacts that are no longer declared never linger unrecorded.
-        for name in removed_tools:
-            final = tools_root / name
-            if os.path.lexists(final):
-                _remove(final)
-        for destination in removed_destinations:
-            stale = copy.path / destination
-            if not os.path.lexists(stale):
+    cache_state = _state_root(copy)
+    allocating = bool(tool_sources or copy_sources)
+    with ExitStack() as source_locks:
+        locked_sources = set()
+        for source in list(tool_sources.values()) + [item[0] for item in copy_sources]:
+            if toolchain_cache.is_entry_path(cache_state, source):
                 continue
-            _remove(stale)
-    finally:
-        if stage_root is not None:
+            owner_id = _managed_source_owner(copy, source)
+            key = owner_id if owner_id not in (None, copy.id) else os.path.realpath(source)
+            if key in locked_sources:
+                continue
+            locked_sources.add(key)
+            source_locks.enter_context(_borrowed_workspace_source(copy, source))
+        requirement = {'disk_bytes': 4 * _ALLOCATION_BLOCK, 'inodes': 4}
+        if allocating:
+            for name, source in tool_sources.items():
+                _add_requirement(requirement, _materialization_requirement(
+                    source, java=_java_tool(source), label='tool'))
+            for source, destination in copy_sources:
+                if toolchain_cache.is_entry_path(cache_state, source):
+                    _add_requirement(
+                        requirement,
+                        toolchain_cache.materialization_requirement(cache_state, source))
+                else:
+                    _add_requirement(requirement, _materialization_requirement(
+                        source, java=False, label='copy'))
+                _add_requirement(requirement, _destination_requirement(copy, destination))
+        admission = (_reserve_materialization(copy.path, requirement)
+                     if allocating else nullcontext())
+        with admission:
             try:
-                _remove(stage_root)
-            except OSError:
-                pass
-        if created_tools_root and os.path.isdir(tools_root):
-            try:
-                os.rmdir(tools_root)
-            except OSError:
-                pass
+                if allocating:
+                    try:
+                        os.mkdir(tools_root, 0o755)
+                        created_tools_root = True
+                    except FileExistsError:
+                        _validate_tools_root(copy)
+                    stage_root = tools_root / ('.stage-' + uuid.uuid4().hex)
+                    stage_root.mkdir(mode=0o700)
+                tool_stats = {}
+                if tool_sources:
+                    (stage_root / 'tools').mkdir(mode=0o700)
+                for name, source in tool_sources.items():
+                    destination = stage_root / 'tools' / name
+                    if toolchain_cache.is_entry_path(cache_state, source):
+                        tool_stats[name] = toolchain_cache.materialize(
+                            cache_state, source, destination, java=False, label='tool',
+                            reserve=False)
+                    else:
+                        tool_stats[name] = _copy_tree(source, destination,
+                                                      java=_java_tool(source), label='tool')
+                    staged_map.append((copy.path / TOOLS_DIRNAME / name, destination))
+                if copy_sources:
+                    (stage_root / 'copies').mkdir(mode=0o700)
+                for index, (source, destination) in enumerate(copy_sources):
+                    staged = stage_root / 'copies' / str(index)
+                    if toolchain_cache.is_entry_path(cache_state, source):
+                        toolchain_cache.materialize(cache_state, source, staged,
+                                                    java=False, label='copy', reserve=False)
+                    elif source.is_dir():
+                        _copy_tree(source, staged, java=False, label='copy')
+                    else:
+                        _copy_file(source, staged, {'files': 0, 'bytes': 0})
+                    staged_map.append((copy.path / destination, staged))
+
+                _validate_environment_paths(copy, environment, staged=staged_map)
+
+                for name in tool_sources:
+                    final = tools_root / name
+                    if os.path.lexists(final):
+                        _remove(final)
+                    _replace(stage_root / 'tools' / name, final)
+                for index, (source, destination) in enumerate(copy_sources):
+                    final = copy.path / destination
+                    _ensure_directory_chain(copy, PurePosixPath(destination).parts[:-1])
+                    if os.path.lexists(final):
+                        _remove(final)
+                    _replace(stage_root / 'copies' / str(index), final)
+                # A repeated prepare replaces the declaration set exactly: previously
+                # recorded artifacts that are no longer declared never linger unrecorded.
+                for name in removed_tools:
+                    final = tools_root / name
+                    if os.path.lexists(final):
+                        _remove(final)
+                for destination in removed_destinations:
+                    stale = copy.path / destination
+                    if not os.path.lexists(stale):
+                        continue
+                    _remove(stale)
+            finally:
+                if stage_root is not None:
+                    try:
+                        _remove(stage_root)
+                    except OSError:
+                        pass
+                if created_tools_root and os.path.isdir(tools_root):
+                    try:
+                        os.rmdir(tools_root)
+                    except OSError:
+                        pass
 
     metadata = {'version': TOOLCHAIN_VERSION, 'prepared_at': time.time(),
                 'source_project': str(_canonical_source(copy)),
@@ -957,6 +1321,16 @@ def apply_saved_recipe(copy) -> dict:
     if payload is None:
         return {'applied': False, 'reason': 'no-recipe', 'toolchain': None}
     declarations = _validate_recipe(copy, payload)
+    missing = _missing_recipe_source(declarations)
+    if missing is not None:
+        _validate_safe_before_invalidation(copy, declarations)
+        removed = _invalidate_recipe(copy, payload)
+        detail = ('The stale recipe was removed under its lock; '
+                  if removed else
+                  'The stale recipe could not be removed safely and was preserved; ')
+        raise ToolchainError(
+            f'Toolchain recipe source is missing: {_display(missing)}. {detail}'
+            'prepare this copy again with available sources and --save-project to refresh it.', 78)
     try:
         metadata = _materialize(copy, declarations, recover=False)
     except ToolchainError:
