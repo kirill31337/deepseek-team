@@ -536,8 +536,12 @@ else:
             with self.assertRaises(coordination.CoordinationError):
                 coordination.abandon_assignment(self.root, task['id'], aid, 'Inspected', confirmed_stopped=True)
             self.assertEqual(coordination.load_task(self.root, task['id'])['assignments'][0]['status'], 'running')
-        abandoned = coordination.abandon_assignment(self.root, task['id'], aid,
-                              'Workspace inspected and worker process group confirmed stopped', confirmed_stopped=True)
+        # This unit checks cancellation telemetry; namespace capture has its own
+        # real-host acceptance tests. The fixture has no working-tree changes.
+        with patch('codex_deepseek_team.workspace_gc._capture', return_value=b''):
+            abandoned = coordination.abandon_assignment(self.root, task['id'], aid,
+                                  'Workspace inspected and worker process group confirmed stopped', confirmed_stopped=True)
+        self.assertFalse(copy.path.exists())
         self.assertEqual(abandoned['assignments'][0]['status'], 'failed')
         self.assertEqual(abandoned['assignments'][0]['error_kind'], 'cancelled')
         self.assertEqual([row['outcome'] for row in self.service.observations()], ['cancelled'])

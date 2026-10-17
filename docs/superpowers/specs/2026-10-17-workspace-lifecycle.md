@@ -31,6 +31,14 @@ leased when no worker process exists. Coordinator hooks renew their own jobs;
 Stop does not finalize them. Historic assignment references and a parent task's
 active/planned status do not constitute live leases.
 
+A live coordinator may perform library/CLI operations through an actual child
+process. Revalidate its PID/start/boot/namespace identity and ancestry, retain
+the original coordinator owner and generation, and never adopt an unrelated
+live owner. Leases and kernel owner locks remain authoritative. Process scans
+add positive argv/cwd/fd/maps evidence scoped to a copy; a ptrace restriction on
+an unrelated keyring or runner process is not evidence against every copy.
+An unobservable recorded job owner still preserves its job.
+
 Standalone/library creation participates in the same protocol. Recovery uses
 lease ownership, real operation locks, retry state and process references; a
 directory age alone is insufficient evidence. Malformed or unsafe metadata

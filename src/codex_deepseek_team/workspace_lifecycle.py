@@ -208,6 +208,8 @@ def identity_state(identity):
         fields = (proc / 'stat').read_text().rsplit(')', 1)[1].split()
         if fields[0] in ('Z', 'X'):
             return 'dead'
+        if fields[19] != identity['start_time']:
+            return 'dead'  # PID reuse is provable even when its namespace is hidden.
         actual = process_identity(identity['pid'])
         if actual is None:
             return 'unknown'
@@ -316,6 +318,25 @@ def live(row):
     return row is not None and row['phase'] not in FINAL_PHASES and identity_live(row['owner'])
 
 
+def owner_authorizes_process(identity):
+    """A child operation may use its live coordinator's lease without adopting it."""
+    if identity_state(identity) != 'live':
+        return False
+    pid = os.getpid()
+    for _ in range(128):
+        if pid == identity['pid']:
+            actual = process_identity(pid)
+            return actual is not None and all(actual.get(k) == v for k, v in identity.items())
+        if pid <= 1:
+            return False
+        try:
+            fields = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
+            pid = int(fields[1])
+        except (OSError, ValueError, IndexError):
+            return False
+    return False
+
+
 def prepare_attempt(copy, task_id, assignment_id, *, replace_pending=False):
     """Reserve the same attempt identity for the ledger and workspace begin."""
     with fence(copy.directory.parent.parent):
@@ -352,6 +373,10 @@ def renew(copy, owner=None, *, recover=False):
         if not _valid_identity(owner):
             raise error('Cannot identify the logical job owner.')
         if row['owner'] != owner:
+            if owner_authorizes_process(row['owner']):
+                row['heartbeat'] = time.time()
+                write(copy, row)
+                return row
             if identity_state(row['owner']) != 'dead':
                 raise error('Another live or unobservable coordinator owns this logical job.', 75)
             if not recover:

@@ -20,6 +20,7 @@ class FinalizationCliTests(LifecycleFixture):
         return code, output.getvalue(), errors.getvalue()
 
     def test_final_use_cleans_one_job_while_parent_stays_active(self):
+        self.require_capture()
         task, assignment = self.task()
         copy = self.copy()
         self.run_attempt(task, assignment, copy, 'succeeded')
@@ -31,6 +32,7 @@ class FinalizationCliTests(LifecycleFixture):
         self.assertEqual(coordination.load_task(self.source, task['id'])['status'], 'active')
 
     def test_explicit_finalize_accepts_previously_reviewed_result(self):
+        self.require_capture()
         task, assignment = self.task()
         copy = self.copy()
         self.run_attempt(task, assignment, copy, 'failed')

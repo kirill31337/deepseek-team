@@ -122,6 +122,8 @@ def _remove_tree(parent, name, expected):
 def _references(paths):
     """Find real same-user open state; never publish argv/maps/file content."""
     prefixes = tuple(str(path).rstrip('/') for path in paths)
+    identifiers = {Path(path).parent.name for path in paths
+                   if Path(path).name == 'work' and re.fullmatch('[0-9a-f]{32}', Path(path).parent.name)}
 
     def inside(value):
         value = value.removesuffix(' (deleted)')
@@ -134,17 +136,31 @@ def _references(paths):
             if proc.stat().st_uid != os.geteuid():
                 continue
             identity = lifecycle.process_identity(int(proc.name)) or {'pid': int(proc.name)}
+            try:
+                argv = (proc / 'cmdline').read_bytes().split(b'\0')
+                for arg in argv:
+                    value = os.fsdecode(arg)
+                    candidate = value.split('=', 1)[-1]
+                    if (inside(value) or inside(candidate)
+                            or (int(proc.name) != os.getpid() and candidate in identifiers)):
+                        return identity
+            except (PermissionError, FileNotFoundError, ProcessLookupError):
+                pass
             for link in ('cwd', 'exe', 'root'):
                 try:
                     if inside(os.readlink(proc / link)):
                         return identity
-                except FileNotFoundError:
+                except (PermissionError, FileNotFoundError):
                     pass
-            for entry in (proc / 'fd').iterdir():
+            try:
+                descriptors = list((proc / 'fd').iterdir())
+            except PermissionError:
+                descriptors = []
+            for entry in descriptors:
                 try:
                     if inside(os.readlink(entry)):
                         return identity
-                except FileNotFoundError:
+                except (PermissionError, FileNotFoundError):
                     pass
             # An mmap can outlive the descriptor that originally opened it.
             with (proc / 'maps').open() as stream:
@@ -152,15 +168,15 @@ def _references(paths):
                     fields = line.split(None, 5)
                     if len(fields) == 6 and inside(fields[5].rstrip()):
                         return identity
-            argv = (proc / 'cmdline').read_bytes().split(b'\0')
-            if any(inside(os.fsdecode(arg)) for arg in argv if arg):
-                return identity
         except (FileNotFoundError, ProcessLookupError):
             continue
         except PermissionError:
-            # An inaccessible same-user process is uncertainty, not permission
-            # to delete its potentially open state.
-            return {'pid': int(proc.name), 'reason': 'uninspectable-process'}
+            # Linux may hide unrelated setuid/keyring/runner processes. Their
+            # existence is not evidence of a reference to every private copy.
+            # Recorded unobservable owners are protected by the lease checks;
+            # argv/cwd/fd/maps observations here provide additional positive
+            # evidence without overriding those authoritative owner locks.
+            continue
     return None
 
 
@@ -406,7 +422,8 @@ def _finalize(copy, *, reason, cancelled, orphan, owner_fd, before_finalize):
             if (lease and lease['phase'] not in lifecycle.FINAL_PHASES
                     and lifecycle.identity_state(lease['owner']) == 'unknown'):
                 raise lifecycle.error('Job owner is in an unobservable process namespace; copy preserved.', 75)
-            if lease and lifecycle.live(lease) and lease['owner'] != lifecycle.owner_identity():
+            if (lease and lifecycle.live(lease) and lease['owner'] != lifecycle.owner_identity()
+                    and not lifecycle.owner_authorizes_process(lease['owner'])):
                 raise lifecycle.error('Another coordinator owns this job; cannot finalize it.', 75)
             if before_finalize is not None:
                 before_finalize()

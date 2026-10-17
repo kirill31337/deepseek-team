@@ -51,6 +51,50 @@ class LifecycleFixture(unittest.TestCase):
 
 
 class JobLeaseTests(LifecycleFixture):
+    def test_reused_pid_is_dead_even_when_its_namespace_cannot_be_inspected(self):
+        api = self.api()
+        identity = api.process_identity(os.getpid())
+        with mock.patch.object(api, 'process_identity', return_value=None):
+            self.assertEqual(api.identity_state(identity), 'unknown')
+            self.assertEqual(api.identity_state(dict(identity, start_time='0')), 'dead')
+
+    def test_unrelated_live_owner_cannot_be_adopted_through_child_authorization(self):
+        copy = self.copy()
+        process = subprocess.Popen(['sleep', '30'])
+        try:
+            row = self.api().read(copy)
+            row['owner'] = self.api().process_identity(process.pid)
+            self.assertIsNotNone(row['owner'])
+            self.api().write(copy, row)
+            with self.assertRaises(workspace.WorkspaceError) as caught:
+                self.api().renew(copy, recover=True)
+            self.assertEqual(caught.exception.code, 75)
+            self.assertEqual(self.api().read(copy)['owner'], row['owner'])
+        finally:
+            process.terminate()
+            process.wait(timeout=10)
+
+    def test_coordinator_child_operation_keeps_the_live_parent_lease(self):
+        copy = self.copy()
+        row = self.api().read(copy)
+        row['owner'] = self.api().process_identity(os.getpid())
+        self.api().write(copy, row)
+        code = '''
+import json, sys
+from codex_deepseek_team import workspace, workspace_lifecycle
+copy = workspace.load(sys.argv[1], sys.argv[2])
+with copy.lock():
+    copy.changes()
+print(json.dumps(workspace_lifecycle.read(copy)))
+'''
+        result = subprocess.run([__import__('sys').executable, '-c', code, str(self.state), copy.id],
+            capture_output=True, text=True, timeout=30,
+            env=dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1] / 'src')))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        updated = json.loads(result.stdout)
+        self.assertEqual(updated['owner'], row['owner'])
+        self.assertEqual(updated['generation'], row['generation'])
+
     def test_standalone_cli_lease_survives_its_short_lived_command_in_the_same_shell(self):
         api = self.api()
         current = api.process_identity(os.getpid())

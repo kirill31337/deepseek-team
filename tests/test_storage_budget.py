@@ -257,7 +257,7 @@ class MeasurementTests(StorageBudgetTestBase):
             with self.assertRaises(storage_budget.BudgetError) as caught:
                 storage_budget.measure(tree)
         self.assertEqual(caught.exception.code, 78)
-        self.assertIn('owner', str(caught.exception).lower())
+        self.assertIn('foreign', str(caught.exception).lower())
 
 
 class ArgumentTests(StorageBudgetTestBase):

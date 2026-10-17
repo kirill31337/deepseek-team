@@ -13,6 +13,20 @@ from tests.test_workspace_lifecycle import LifecycleFixture
 
 
 class WorkspaceCollectionTests(LifecycleFixture):
+    def test_unrelated_uninspectable_process_does_not_veto_every_owned_copy(self):
+        gc = self.api('workspace_gc')
+        proc = self.root / 'fake-proc'
+        process = proc / '999999999'
+        process.mkdir(parents=True)
+        (process / 'cmdline').write_bytes(b'keyring-service\0')
+        with mock.patch.object(gc, 'Path', return_value=proc), \
+                mock.patch.object(gc.os, 'readlink', side_effect=PermissionError('ptrace restricted')):
+            self.assertIsNone(gc._references([self.root / 'owned-work']))
+        (process / 'cmdline').write_bytes(os.fsencode(self.root / 'owned-work') + b'\0')
+        with mock.patch.object(gc, 'Path', return_value=proc), \
+                mock.patch.object(gc.os, 'readlink', side_effect=PermissionError('ptrace restricted')):
+            self.assertEqual(gc._references([self.root / 'owned-work'])['pid'], 999999999)
+
     def test_same_device_file_bind_mount_is_detected_before_quarantine(self):
         from tests import test_gc_adversarial as adversarial
         adversarial._skip_without_namespace(self, 'mount')
@@ -155,6 +169,7 @@ print('file bind mount preserved before quarantine')
             self.assertTrue(copy.path.exists())
 
     def test_legacy_orphan_parent_status_does_not_keep_copy(self):
+        self.require_capture()
         gc = self.api('workspace_gc')
         for status in ('succeeded', 'failed', 'ready', 'preparing', 'running'):
             copy = self.copy()
