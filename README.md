@@ -376,6 +376,7 @@ pipx uninstall deepseek-team
 ## Further reading
 
 - [Routing guide](https://github.com/kirill31337/deepseek-team/blob/main/docs/ROUTING.md) - classifier, router, admission, evidence and feedback.
+- [Overhead contract](https://github.com/kirill31337/deepseek-team/blob/main/docs/OVERHEAD_CONTRACT.md) - shipped software guarantees and agent recommendations for check reuse, preparation memory, waiting and review.
 - [Delegation lessons](https://github.com/kirill31337/deepseek-team/blob/main/docs/DELEGATION_LESSONS.md) - the private journal, review cadence and bounded advisory rules.
 - [Hardening](https://github.com/kirill31337/deepseek-team/blob/main/docs/HARDENING.md) - coordinator and worker boundaries, preflight and recovery.
 - [Toolchains](https://github.com/kirill31337/deepseek-team/blob/main/docs/TOOLCHAINS.md) - prepare SDKs/JDKs, smoke probes, recipes, baseline and re-verification.

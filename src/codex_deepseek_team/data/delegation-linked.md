@@ -39,6 +39,8 @@ access widening or sandbox change.
 - `deepseek-team off` stays authoritative: while disabled, continue locally and do
   not delegate. Fresh or current access is never widened automatically, and
   read-only never becomes write access.
+- Corrective deliverables declare `correction_of`; the workspace-continuity contract
+  below governs automatic reuse, explicit resumes and durable summaries.
 - Plan every delegated deliverable before assigning it, and keep the native-subagent
   exception rules from the linked guide; nothing here relaxes either rule.
 - The coordinator still owns architecture, integration, security, final

@@ -11,6 +11,7 @@ import subprocess
 import tempfile
 
 from .config import sync_directory
+from . import overhead_contract
 
 
 START_MARKER = b"<!-- codex-deepseek-team:managed-block:start -->"
@@ -79,7 +80,13 @@ def _linked_guidance(runtime, root):
         body = LINKED_DATA_FILE.read_bytes()
     except OSError as error:
         raise ProjectError("packaged linked delegation guidance is unavailable") from error
-    return LINKED_MARKER + b"\n" + body.replace(b'{runtime}', runtime.encode('ascii')).strip(b"\n")
+    try:
+        contract = overhead_contract.instructions().encode('utf-8')
+    except overhead_contract.OverheadContractError as error:
+        raise ProjectError(str(error)) from error
+    return (LINKED_MARKER + b"\n"
+            + body.replace(b'{runtime}', runtime.encode('ascii')).strip(b"\n")
+            + b'\n\n' + contract.strip(b"\n"))
 
 
 def _is_linked(span):
@@ -98,7 +105,10 @@ def _guidance(runtime='codex', root=None, policy=None):
             policy = settings.resolve(root)
         except settings.SettingsError as error:
             raise ProjectError(str(error)) from None
-    dynamic = settings.instructions(policy, runtime).encode('utf-8')
+    try:
+        dynamic = settings.instructions(policy, runtime).encode('utf-8')
+    except overhead_contract.OverheadContractError as error:
+        raise ProjectError(str(error)) from error
     return body.replace(b'{runtime}', runtime.encode('ascii')).strip(b"\n") + b'\n\n' + dynamic
 
 

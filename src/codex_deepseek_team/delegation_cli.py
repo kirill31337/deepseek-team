@@ -9,7 +9,7 @@ import re
 import sys
 import subprocess
 
-from . import (check_evidence, lessons, project, runtime_preflight, settings,
+from . import (check_evidence, check_reuse, lessons, project, runtime_preflight, settings,
                state_storage, toolchains, worker, workspace)
 
 
@@ -201,6 +201,10 @@ def main(argv):
                 sub.add_argument('--reason', default='accepted' if name == 'finalize' else 'cancelled')
             if name == 'prepare':
                 sub.add_argument('--resume-after-failure', action='store_true')
+                sub.add_argument('--recheck-environment', action='store_true',
+                                 help='Allow one fresh declarative preparation observation '
+                                      'despite an unchanged recorded environmental failure; '
+                                      'it never bypasses recovery, admission or sandbox policy.')
                 for option in ('tool', 'copy', 'env'):
                     sub.add_argument('--' + option, action='append', default=[], metavar='NAME=VALUE')
                 sub.add_argument('--probe', action='append', default=[], metavar='COMMAND')
@@ -209,6 +213,11 @@ def main(argv):
                 sub.add_argument('--check', action='append', metavar='COMMAND')
                 sub.add_argument('--timeout', type=float, default=120,
                                  help='Per-command ceiling in seconds (default 120).')
+                sub.add_argument('--reuse-checks', action='store_true',
+                                 help='Attest deterministic local checks may reuse validated '
+                                      'successful evidence while all inputs are unchanged.')
+                sub.add_argument('--force', action='store_true',
+                                 help='Execute checks even when validated reusable evidence exists.')
             if name == 'import':
                 sub.add_argument('--include', action='append', required=True, metavar='FILE',
                                  help='Explicit repository-relative dirty file to copy; repeat as needed.')
@@ -349,15 +358,22 @@ def main(argv):
                     copies = pairs(args.copy)
                     toolchains.prepare(copy, tools=tools, copies=copies, environment=environment,
                         probes=args.probe, save_project=args.save_project,
-                        recover=args.resume_after_failure)
+                        recover=args.resume_after_failure,
+                        recheck_environment=args.recheck_environment)
                 if command:
+                    if args.recheck_environment:
+                        raise workspace.WorkspaceError(
+                            '--recheck-environment applies only to declarative preparation; '
+                            'legacy host preparation commands are never classified.', 64)
                     return workspace.prepare(copy, command, recover=args.resume_after_failure)
                 if not declarative:
                     raise workspace.WorkspaceError('workspace prepare requires options or -- COMMAND.', 64)
                 print('Prepared toolchains and project inputs for workspace ' + copy.id + '.')
                 return 0
             if args.command == 'verify':
-                result = workspace.verify_checks(copy, args.check, timeout=args.timeout)
+                result = workspace.verify_checks(
+                    copy, args.check, timeout=args.timeout,
+                    reuse_checks=args.reuse_checks, force=args.force)
                 if args.json:
                     print(json.dumps(result, indent=2))
                 else:
@@ -380,7 +396,8 @@ def main(argv):
         return 0
     except (settings.SettingsError, workspace.WorkspaceError, project.ProjectError,
             runtime_preflight.RuntimePreflightError, toolchains.ToolchainError,
-            check_evidence.CheckEvidenceError, worker.WorkerError) as error:
+            check_evidence.CheckEvidenceError, check_reuse.CheckReuseError,
+            worker.WorkerError) as error:
         print(str(error), file=sys.stderr)
         return getattr(error, 'code', 78)
     except (OSError, subprocess.SubprocessError):

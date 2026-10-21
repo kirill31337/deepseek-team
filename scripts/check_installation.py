@@ -18,6 +18,8 @@ DIST_NAME = 'deepseek-team'
 ENTRYPOINTS = ('deepseek-team',)
 RESOURCES = (
     'codex_deepseek_team/data/delegation.md',
+    'codex_deepseek_team/data/delegation-linked.md',
+    'codex_deepseek_team/data/overhead-contract.md',
     'codex_deepseek_team/data/apparmor/deepseek-team-bwrap',
 )
 _NORMALIZE_NAME = re.compile(r'[-_.]+')

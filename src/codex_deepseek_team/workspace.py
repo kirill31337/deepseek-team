@@ -595,8 +595,9 @@ def _publish_verifications(copy: Workspace) -> None:
         if (not isinstance(entry, dict) or set(entry) != {
                 'task_id', 'assignment_id', 'finished_at', 'run'}):
             raise WorkspaceError('Invalid pending verification evidence.', 64)
+        run = dict(entry['run'])
         coordination.record_verification(copy.source, entry['task_id'],
-            entry['assignment_id'], entry['run'], finished_at=entry['finished_at'])
+            entry['assignment_id'], run, finished_at=entry['finished_at'])
         del pending[0]
         if not pending:
             copy.metadata.pop('pending_verifications', None)
@@ -604,17 +605,20 @@ def _publish_verifications(copy: Workspace) -> None:
 
 
 def verify_checks(copy: Workspace, commands: list[str] | None = None,
-                  *, timeout: float = 120) -> dict:
+                  *, timeout: float = 120, reuse_checks: bool = False,
+                  force: bool = False) -> dict:
     """Run explicit checks in the original boundary, without a model or secrets.
 
     Verification is an appended observation. It does not begin another worker
     attempt or replace the original status, diff, checks or quality feedback.
     """
-    from . import (check_evidence, coordination, development, prepared_inputs,
+    from . import (check_evidence, check_reuse, coordination, development, prepared_inputs,
                    runtime_preflight, toolchains, verification, worker)
     import uuid
     if not isinstance(timeout, (int, float)) or not 0 < timeout < float('inf'):
         raise WorkspaceError('Verification timeout must be a positive finite number.', 64)
+    if type(reuse_checks) is not bool or type(force) is not bool:
+        raise WorkspaceError('Verification reuse and force must be booleans.', 64)
     with copy.lock(recover=True):
         selected = copy.metadata.get('verification_commands', []) if commands is None else commands
         if not isinstance(selected, list) or not selected:
@@ -666,7 +670,8 @@ def verify_checks(copy: Workspace, commands: list[str] | None = None,
             checks = []
             if not any(row['exit_code'] for row in probes):
                 checks = development.run_checks(layout, env, selected, timeout,
-                    directory=directory, phase='verify')
+                    directory=directory, phase='verify', copy=copy,
+                    reusable=reuse_checks, force=force)
             baseline = copy.metadata.get('baseline_checks', [])
             # A recovered environment may verify successfully after an old
             # baseline timeout; only current infrastructure failures block it.

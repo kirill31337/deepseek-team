@@ -161,7 +161,8 @@ class LiveDemoTests(LiveBase):
         real_run_checks = development.run_checks
 
         def spy(layout, env, commands, timeout=120, *, deadline=None,
-                directory=None, phase='post', redact_values=()):
+                directory=None, phase='post', redact_values=(), copy=None,
+                reusable=False, force=False):
             observed[phase] = dict(deadline=deadline, called_at=time.monotonic(),
                                    commands=list(commands), directory=directory,
                                    redact_values=tuple(redact_values))
@@ -169,7 +170,8 @@ class LiveDemoTests(LiveBase):
             # sandbox and still expires against the shared remaining budget.
             return real_run_checks(layout, env, commands, timeout, deadline=deadline,
                                    directory=directory, phase=phase,
-                                   redact_values=redact_values)
+                                   redact_values=redact_values, copy=copy,
+                                   reusable=reusable, force=force)
 
         started = time.monotonic()
         with patch.object(development, 'run_checks', spy), \

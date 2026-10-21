@@ -26,7 +26,7 @@ import stat
 import time
 import uuid
 
-from . import workspace
+from . import preparation_guard, workspace
 
 TOOLCHAIN_KEY = 'toolchain'
 TOOLCHAIN_VERSION = 1
@@ -70,6 +70,10 @@ class ToolchainError(Exception):
     def __init__(self, message: str, code: int = 78):
         self.message, self.code = message, code
         super().__init__(message)
+
+
+class MissingSourceError(ToolchainError):
+    """A declared materialization source is observably absent."""
 
 
 def _display(value) -> str:
@@ -277,8 +281,12 @@ def _validate_host_source(copy, value, *, what: str, require_directory: bool,
     raw = Path(value)
     try:
         resolved = raw.resolve(strict=True)
+    except (FileNotFoundError, NotADirectoryError):
+        raise MissingSourceError(
+            f'{what} source does not exist or is not readable: {_display(value)}.') from None
     except (OSError, RuntimeError):
-        raise ToolchainError(f'{what} source does not exist or is not readable: {_display(value)}.') from None
+        raise ToolchainError(
+            f'{what} source does not exist or is not readable: {_display(value)}.') from None
     home = Path.home()
     rejected = set(_BROAD_ROOTS) | {str(home), str(home / '.local')}
     if str(resolved) in rejected:
@@ -1271,14 +1279,39 @@ def _result(copy, metadata: dict, *, recipe_saved: bool) -> dict:
 
 
 def prepare(copy, *, tools=None, copies=None, environment=None, probes=None,
-            save_project: bool = False, recover: bool = False) -> dict:
+            save_project: bool = False, recover: bool = False,
+            recheck_environment: bool = False) -> dict:
     """Own the copy lock, publish declared preparation and record version-1 metadata."""
     with copy.lock(recover=recover):
-        copy.begin('preparation')
         try:
             declarations = {'tools': _normalize_tools(tools), 'copies': _normalize_copies(copies),
                             'environment': _validate_declared_environment(environment),
                             'probes': _validate_probes(probes)}
+        except ToolchainError as error:
+            copy.begin('preparation')
+            _record_failure(copy, error.code)
+            raise
+        except (OSError, ValueError, shutil.Error, workspace.WorkspaceError) as error:
+            copy.begin('preparation')
+            _record_failure(copy, 78)
+            raise ToolchainError('Toolchain preparation failed; the owned copy is retained for '
+                                 'inspection.') from error
+        conditions = None
+        try:
+            conditions = preparation_guard.declarative_conditions(
+                copy.source, state=_state_root(copy), declarations=declarations)
+            if conditions.fingerprint is not None and not recheck_environment:
+                hit = preparation_guard.lookup(_state_root(copy), conditions)
+                if hit is not None:
+                    raise preparation_guard.PreparationGuardError(
+                        preparation_guard.blocked_message(hit))
+        except preparation_guard.PreparationGuardError as error:
+            # A blocked attempt performs no materialization and does not turn a
+            # fresh copy into another failed one; --recheck-environment still
+            # requires the normal recover flag for an already-failed copy.
+            raise ToolchainError(str(error), error.code) from None
+        copy.begin('preparation')
+        try:
             metadata = _materialize(copy, declarations, recover=recover)
             copy.metadata[TOOLCHAIN_KEY] = metadata
             copy.save()
@@ -1286,6 +1319,10 @@ def prepare(copy, *, tools=None, copies=None, environment=None, probes=None,
             if save_project:
                 _save_recipe(copy, metadata)
                 recipe_saved = True
+        except MissingSourceError as error:
+            _remember_failure(copy, conditions, error)
+            _record_failure(copy, error.code)
+            raise
         except ToolchainError as error:
             _record_failure(copy, error.code)
             raise
@@ -1298,7 +1335,28 @@ def prepare(copy, *, tools=None, copies=None, environment=None, probes=None,
         except (OSError, workspace.WorkspaceError):
             _record_failure(copy, 78)
             raise
+        _clear_failure(copy, conditions)
         return _result(copy, metadata, recipe_saved=recipe_saved)
+
+
+def _remember_failure(copy, conditions, error: MissingSourceError) -> None:
+    if conditions is None or conditions.fingerprint is None:
+        return
+    try:
+        preparation_guard.record_failure(
+            _state_root(copy), conditions, 'materialization',
+            exit_code=error.code, workspace_id=copy.id)
+    except (preparation_guard.PreparationGuardError, OSError):
+        pass  # Never mask the original preparation failure.
+
+
+def _clear_failure(copy, conditions) -> None:
+    if conditions is None or conditions.fingerprint is None:
+        return
+    try:
+        preparation_guard.clear(_state_root(copy), conditions)
+    except (preparation_guard.PreparationGuardError, OSError):
+        pass  # Successful preparation is not failed by optional cleanup.
 
 
 def _record_failure(copy, code: int) -> None:
@@ -1328,7 +1386,7 @@ def apply_saved_recipe(copy) -> dict:
         detail = ('The stale recipe was removed under its lock; '
                   if removed else
                   'The stale recipe could not be removed safely and was preserved; ')
-        raise ToolchainError(
+        raise MissingSourceError(
             f'Toolchain recipe source is missing: {_display(missing)}. {detail}'
             'prepare this copy again with available sources and --save-project to refresh it.', 78)
     try:

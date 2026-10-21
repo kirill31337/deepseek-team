@@ -10,7 +10,9 @@ Fairness is provided by a per-directory queue of ticket files.  Every waiting
 caller owns a ticket flock for the whole time it waits; a ticket whose lock can
 be taken by somebody else belongs to a dead process and is reclaimed without
 trusting process ids.  Admission, ticket creation and slot probing all happen
-under a short-lived private allocator flock, while polling happens outside it.
+under a short-lived private allocator flock, while waiting happens outside it.
+Linux inotify hints wake waiters on release or death; every wake is revalidated,
+and a bounded sleep remains as the conservative fallback.
 
 Error codes reported through :class:`SlotError`:
 
@@ -23,6 +25,7 @@ from __future__ import annotations
 
 import fcntl
 from contextlib import contextmanager
+import errno
 import math
 import os
 from pathlib import Path
@@ -31,12 +34,17 @@ import stat
 import time
 from typing import Callable, Optional
 
+from . import slot_notifications
+
 
 DEFAULT_MAX_WORKERS = 8
 MAX_MAX_WORKERS = 64
 
 ALLOCATOR_LOCK = 'allocator.lock'
-_POLL_INTERVAL = 0.05
+# Kernel notifications normally wake a waiter immediately. This bounded
+# revalidation interval remains as a conservative fallback for unsupported
+# platforms, invalidated watches and missed or coalesced hints.
+_REVALIDATE_INTERVAL = 1.0
 _SLOT_NAME = 'worker-{number}.lock'
 _TICKET_RE = re.compile(r'^ticket-(\d+)$')
 _UNSAFE = ('Worker state requires a private user-owned directory (700) and '
@@ -78,9 +86,17 @@ def acquire(state: Path, *, limit: int = DEFAULT_MAX_WORKERS, timeout: float = 0
 
     directory = _open_state(state)
     ticket_fd = ticket_name = None
+    notifier = None
     on_wait_fired = False
     deadline = None if timeout == 0 else time.monotonic() + timeout
     try:
+        if wait:
+            try:
+                # Install the watch before the first probe so a release or death
+                # between probing and waiting is retained as a hint.
+                notifier = slot_notifications.open_notifier(directory)
+            except slot_notifications.NotifierUnavailable:
+                notifier = None
         sequence = None
         while True:
             if deadline is not None and time.monotonic() >= deadline:
@@ -102,23 +118,42 @@ def acquire(state: Path, *, limit: int = DEFAULT_MAX_WORKERS, timeout: float = 0
                 on_wait()
             on_wait_fired = True
             if deadline is None:
-                delay = _POLL_INTERVAL
+                delay = _REVALIDATE_INTERVAL
             else:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise SlotError(
                         75, f'Timed out after {timeout:g}s waiting for a worker slot.')
-                delay = min(_POLL_INTERVAL, remaining)
-            if delay > 0:
+                delay = min(_REVALIDATE_INTERVAL, remaining)
+            if delay <= 0:
+                continue
+            if notifier is not None and notifier.usable:
+                try:
+                    notifier.wait(delay)
+                except slot_notifications.NotifierUnavailable:
+                    notifier.close()
+                    notifier = None
+                if notifier is not None and not notifier.usable:
+                    notifier.close()
+                    notifier = None
+            else:
+                if notifier is not None:
+                    notifier.close()
+                    notifier = None
                 time.sleep(delay)
     finally:
-        if ticket_fd is not None:
-            try:
-                os.unlink(ticket_name, dir_fd=directory)
-            except OSError:
-                pass
-            os.close(ticket_fd)
-        os.close(directory)
+        if notifier is not None:
+            notifier.close()
+        try:
+            if ticket_fd is not None:
+                try:
+                    os.unlink(ticket_name, dir_fd=directory)
+                except OSError:
+                    pass
+                finally:
+                    os.close(ticket_fd)
+        finally:
+            os.close(directory)
 
 
 def _check_limit(limit: object) -> int:
@@ -154,8 +189,9 @@ def _open_state(state: Path) -> int:
         raise SlotError(error.code, str(error)) from None
 
 
-def _open_file(directory: int, name: str, *, create: bool) -> int:
-    flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+def _open_file(directory: int, name: str, *, create: bool, read_only: bool = False) -> int:
+    flags = ((os.O_RDONLY if read_only else os.O_RDWR)
+             | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
     if create:
         flags |= os.O_CREAT
     try:
@@ -168,6 +204,11 @@ def _open_file(directory: int, name: str, *, create: bool) -> int:
         raise SlotError(78, _UNSAFE) from None
     try:
         info = os.fstat(fd)
+        if not create and info.st_nlink == 0:
+            # A ticket owner may legitimately unlink its ticket between open and
+            # fstat. An inode no longer reachable by name is gone from the queue,
+            # not evidence of an unsafe directory.
+            raise FileNotFoundError(errno.ENOENT, 'runtime file was concurrently removed', name)
         if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
                 or info.st_uid != os.geteuid() or info.st_mode & 0o077):
             raise SlotError(78, _UNSAFE)
@@ -204,7 +245,7 @@ def _reclaim_stale_tickets(directory: int) -> None:
     """Drop tickets whose owner died (their ticket flock is now free)."""
     for _, name in _tickets(directory):
         try:
-            fd = _open_file(directory, name, create=False)
+            fd = _open_file(directory, name, create=False, read_only=True)
         except FileNotFoundError:
             continue
         try:
@@ -255,7 +296,7 @@ def _probe_slots(directory: int) -> tuple[int, list[int]]:
             free.append(number)
             continue
         try:
-            fd = _open_file(directory, name, create=False)
+            fd = _open_file(directory, name, create=False, read_only=True)
         except FileNotFoundError:
             free.append(number)
             continue
@@ -323,7 +364,10 @@ def idle_state(state: Path):
         if _probe_slots(directory)[0]:
             raise SlotError(75, 'Workers are still running in the previous state root.')
         for _, name in _tickets(directory):
-            fd = _open_file(directory, name, create=False)
+            try:
+                fd = _open_file(directory, name, create=False)
+            except FileNotFoundError:
+                continue
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             finally:

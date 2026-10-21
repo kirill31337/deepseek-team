@@ -310,7 +310,9 @@ class AutoDistributionCase(unittest.TestCase):
         planned = self.plan(task, [self.deliverable()])
         item = planned['deliverables'][0]
         self.assertNotIn('write_scope', item)
-        identity = ('id', 'kind', 'scope', 'acceptance', 'dependencies', 'checks', 'features')
+        identity = ('id', 'kind', 'scope', 'acceptance', 'dependencies', 'checks',
+                    'checks_reusable', 'features')
+        self.assertIs(item['checks_reusable'], False)
         self.assertEqual(coordination._definition(item), {key: item[key] for key in identity})
         legacy = coordination._binding(task['id'], dict(item))
         self.assertNotEqual(legacy, coordination._binding(

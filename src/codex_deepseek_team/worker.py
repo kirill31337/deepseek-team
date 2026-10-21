@@ -464,6 +464,13 @@ def parse_args():
     parser.add_argument('--coord-task', help='Persistent coordination task id for automatic runner accounting.')
     parser.add_argument('--coord-assignment', help='Planned coordination assignment id; must be used with --coord-task.')
     parser.add_argument('--resume-after-failure', action='store_true', help='Explicit continuation after inspecting partial work.')
+    parser.add_argument('--force-checks', action='store_true',
+                        help='Execute declared baseline/post checks instead of reusing '
+                             'validated successful evidence.')
+    parser.add_argument('--recheck-environment', action='store_true',
+                        help='Allow one fresh diagnostic preparation attempt despite an '
+                             'unchanged recorded environmental failure; admission, access, '
+                             'sandbox and failed-copy recovery rules still apply.')
     parser.add_argument('--codex', help='Codex executable to use; an explicit value is pinned.')
     parser.add_argument('--claude', help='Claude Code executable to use; an explicit value is pinned.')
     parser.add_argument('--state-dir', type=Path,

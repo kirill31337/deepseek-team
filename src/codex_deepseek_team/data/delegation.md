@@ -89,7 +89,7 @@ After review, record every verified result through `coordination use`, including
 
 ### Rework and corrective work
 
-After review, record the operational outcome and, when corrections were needed, the concrete defect evidence with the original `needs-rework`. A minor, tightly coupled correction may be performed by the coordinator when its concrete reason is recorded in the rework `summary`/`prevention` or the outer `--evidence`; substantive corrections normally return to DeepSeek as a bounded correction brief. That brief links the original assignment, states the concrete defect and its evidence, supplies the context the first attempt lacked, and carries a reproducer or executable acceptance checks; route it as its own deliverable, then verify the actual delta and integrate it. Correction size and worker quality are separate judgements: a one-line correctness or security defect can still be serious, a cosmetic edit can keep full credit, and a first failed attempt never mandates takeover. Architecture, security, integration and final verification stay coordinator-owned. No blind retries, no `off` bypass, no sandbox bypass and no automatic access widening; a completed assignment cannot be resumed directly, so a succeeded assignment needs a new planned correction linked to the original. A failed, inspected workspace may explicitly resume with `--resume-after-failure`. Repeated dispositions or attempts of one assignment stay one case, and the original failure is never laundered into a clean first pass; nothing here requires an endless loop or an artificial fixed quota.
+After review, record the operational outcome and, when corrections were needed, the concrete defect evidence with the original `needs-rework`. A minor, tightly coupled correction may be performed by the coordinator when its concrete reason is recorded in the rework `summary`/`prevention` or the outer `--evidence`; substantive corrections normally return to DeepSeek as a bounded correction brief. That brief links the original assignment, states the concrete defect and its evidence, supplies the context the first attempt lacked, and carries a reproducer or executable acceptance checks; route it as its own deliverable, then verify the actual delta and integrate it. Correction size and worker quality are separate judgements: a one-line correctness or security defect can still be serious, a cosmetic edit can keep full credit, and a first failed attempt never mandates takeover. Architecture, security, integration and final verification stay coordinator-owned. No blind retries, no `off` bypass, no sandbox bypass and no automatic access widening; a completed assignment cannot be resumed directly, so a succeeded assignment needs a new planned correction that declares `correction_of` for the original reviewed assignment. The runner resolves that assignment's saved workspace automatically, so the correction needs no remembered `--workspace`; a conflicting explicit value, or missing, ambiguous, stale, foreign or finalized predecessor state, blocks safely instead of allocating a fresh copy. A failed, inspected attempt of the same assignment may resume only explicitly with `--resume-after-failure`, in the same copy. Repeated dispositions or attempts of one assignment stay one case, and the original failure is never laundered into a clean first pass; nothing here requires an endless loop or an artificial fixed quota.
 
 ### Final reporting
 
@@ -322,8 +322,15 @@ Finalize explicitly with `coordination use ... --final` or
 lifecycle. `workspace recover` and `workspace resume` repair ownership/state only
 and never run a model. A failed attempt continues explicitly with
 `worker --workspace ID --resume-after-failure` in the same inode. A succeeded result
-that needs substantive correction gets `needs-rework`, then a newly planned linked
-assignment using the same still-unfinalized `--workspace ID`. A verification rerun
+that needs substantive correction gets `needs-rework`, then a newly planned correction
+declaring `correction_of` for the original assignment; the runner resolves the same
+still-unfinalized workspace automatically, with `--workspace` optional unless an
+explicit value conflicts. Missing, ambiguous, stale, foreign or finalized predecessor
+or copy state blocks safely instead of falling back to a new environment; deliberately
+independent work can still start a new job, and a finalized job needs deliberate new
+work. Stable project files, `workspace_id`, `job_id` and prepared tools are reused
+while process, HOME, sandbox and `attempt_id` are new; mandatory security and readiness
+checks are not bypassed. A verification rerun
 may inspect an unfinalized copy without resuming implementation. The default
 concurrency limit is eight workers (`max_workers`, configurable 1–64).
 Eligible assignments remain worker-owned when slots are busy; launches wait FIFO.

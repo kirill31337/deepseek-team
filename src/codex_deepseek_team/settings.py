@@ -14,6 +14,7 @@ import tomllib
 from types import MappingProxyType
 from typing import Mapping
 from .effort import EFFORT_POLICY_CHOICES, EFFORT_POLICY_LEVELS, normalize_policy_effort
+from . import overhead_contract
 from .worker_slots import DEFAULT_MAX_WORKERS, MAX_MAX_WORKERS
 
 PROJECT_FILE = '.deepseek-team.toml'
@@ -397,9 +398,11 @@ REWORK_GUIDANCE = (
     'assignments add positive evidence and can restore the class rating; old evidence loses '
     'weight over time, while duplicate feedback never manufactures another success.\n'
     'Corrections: record the concrete defect evidence and the original `needs-rework` first, then '
-    'route a bounded correction brief as its own assignment; it links the original assignment, '
-    'states the concrete defect and the context the first attempt lacked, and carries executable '
-    'acceptance checks. Substantive corrections normally return to DeepSeek; a minor bounded '
+    'route a bounded correction brief as its own assignment declaring `correction_of`; it links '
+    'the original assignment, states the concrete defect and the context the first attempt '
+    'lacked, and carries executable acceptance checks. The runner resolves its saved workspace '
+    'automatically, so a conflicting explicit `--workspace` fails rather than selecting another '
+    'copy. Substantive corrections normally return to DeepSeek; a minor bounded '
     'correction may be performed by the coordinator with its concrete reason recorded. '
     'Correction size and worker quality are separate judgements. No blind retries, no direct '
     'resume of a completed assignment, no `off` bypass, no sandbox bypass and no access '
@@ -616,8 +619,16 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
             'coordination finalize and workspace finalize/cancel. workspace recover and workspace '
             'resume repair ownership only and never run a model; worker --workspace ID '
             '--resume-after-failure continues a failed attempt in the same inode. After '
-            'needs-rework, a succeeded result that needs a substantive correction uses the same '
-            'unfinalized workspace in a newly planned linked assignment. Record verified coordinator and '
+            'needs-rework, a succeeded result that needs a substantive correction is planned with '
+            'correction_of for the original reviewed assignment; the runner resolves the same '
+            'unfinalized workspace automatically, --workspace is optional unless an explicit value '
+            'conflicts, and missing/ambiguous/stale/foreign/finalized state blocks instead of '
+            'allocating a fresh copy. Stable project files, workspace_id/job_id and prepared tools '
+            'are reused while process/HOME/sandbox/attempt_id are new; security and readiness '
+            'checks are never bypassed. SessionStart compact and UserPromptSubmit summaries expose '
+            'the durable workspace_id, job_id, attempt_id and correction reference from the '
+            'private ledger. A failed same-assignment attempt still resumes only explicitly with '
+            '--resume-after-failure and cannot switch copies. Record verified coordinator and '
             'native-agent outcomes with deepseek-team coordination result; accepted or explicitly '
             'cancelled outcomes are required for completion. Later recognized scope mutations '
             'require fresh acceptance. New substantial scope requires '
@@ -663,4 +674,5 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
           'stage, commit, push, publish, deploy, access production services or delegate.\n'
         + rework_guidance(runtime)
         + final_reporting_guidance()
+        + '\n' + overhead_contract.instructions()
     )

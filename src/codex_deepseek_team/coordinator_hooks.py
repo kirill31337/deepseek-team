@@ -10,7 +10,8 @@ import time
 import uuid
 
 from . import (activation, coordination, coordinator_activity, coordinator_context,
-                 lessons, project, scope_matching, settings, state_storage)
+                 lessons, overhead_contract, project, scope_matching, settings,
+                 state_storage)
 from .shell_mutation import classify_shell_mutation_scoped
 
 
@@ -400,7 +401,9 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
             # turn. settings.instructions already carries the reporting/rework text.
             text = text + settings.instructions(policy, runtime)
         else:
-            text = text + settings.final_reporting_guidance() + settings.rework_guidance(runtime)
+            text = (text + settings.final_reporting_guidance()
+                    + settings.rework_guidance(runtime) + '\n'
+                    + overhead_contract.instructions())
         text = _with_diagnostic(text, diagnostic)
         guidance = _lessons_guidance(root)
         if guidance:

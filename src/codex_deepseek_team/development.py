@@ -14,7 +14,7 @@ import subprocess
 import sys
 import time
 
-from . import check_evidence, relay, sandbox, verification
+from . import check_evidence, check_reuse, relay, sandbox, verification
 
 FULL_INSTRUCTIONS = '''You are an independent implementation worker in an assigned development copy.
 Implement the assigned goal and acceptance criteria. You may create, edit and delete
@@ -267,8 +267,21 @@ def missing_requirements(args: list[str], env: dict[str, str], item: dict) -> li
 def run_checks(args: list[str], env: dict[str, str], commands: list[str],
                timeout: float = 120, *, deadline: float | None = None,
                directory: Path | None = None, phase: str = 'post',
-               redact_values=()) -> list[dict]:
-    """Run declared verification inside the same sparse/no-network sandbox."""
+               redact_values=(), copy=None, reusable: bool = False,
+               force: bool = False) -> list[dict]:
+    """Run verification inside the same sparse/no-network sandbox.
+
+    A copy-backed invocation always passes through the reuse boundary so a
+    failed unmatched observation invalidates stale success.  Only the explicit
+    attestation reads or publishes cache metadata.  Readiness/security probes
+    keep the legacy direct path by not supplying a copy.
+    """
+    if copy is not None:
+        if directory is None:
+            raise check_reuse.CheckReuseError('Check reuse requires an evidence directory.')
+        return check_reuse.run_checks(copy, args, env, commands, timeout=timeout,
+            deadline=deadline, directory=directory, phase=phase, reusable=reusable,
+            force=force, redact_values=redact_values)
     return check_evidence.run_checks(args, env, commands, timeout, deadline=deadline,
         directory=directory, phase=phase, redact_values=redact_values)
 

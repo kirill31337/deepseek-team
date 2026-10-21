@@ -13,13 +13,28 @@ import tempfile
 import unittest
 from unittest import mock
 
-from codex_deepseek_team import project, settings
+from codex_deepseek_team import overhead_contract, project, settings
 
 
 LINKED = b"<!-- codex-deepseek-team:guidance:linked -->"
 PROFILE_HEADER = b"### Effective delegation profile"
 GUIDE_RELATIVE = Path("docs") / "agents" / "delegation.md"
-MAX_BLOCK = 4096
+MAX_BLOCK = 8192
+CONTINUITY_HEADING = "### Correction and workspace continuity"
+CONTINUITY_TOKENS = (
+    "correction_of",
+    "workspace_id",
+    "job_id",
+    "attempt_id",
+    "conflicting",
+    "ambiguous",
+    "stale",
+    "foreign",
+    "finalized",
+    "allocating or preparing a new copy",
+    "--resume-after-failure",
+    "not universal program enforcement",
+)
 
 
 class LinkedGuidanceCase(unittest.TestCase):
@@ -74,6 +89,25 @@ class LinkedGuidanceCase(unittest.TestCase):
         end = data.index(project.END_MARKER) + len(project.END_MARKER)
         return data[begin:end]
 
+    @staticmethod
+    def continuity_rule():
+        contract = overhead_contract.instructions()
+        start = contract.index(CONTINUITY_HEADING)
+        rest = contract[start + len(CONTINUITY_HEADING):]
+        ends = [index for index in (rest.find("\n### "), rest.find("\n## "))
+                if index >= 0]
+        if ends:
+            rest = rest[:min(ends)]
+        return (CONTINUITY_HEADING + rest).strip()
+
+    def assert_continuity_rule(self, text, label):
+        rule = self.continuity_rule()
+        normalized = " ".join(rule.split())
+        with self.subTest(surface=label):
+            self.assertEqual(text.count(rule), 1)
+            for token in CONTINUITY_TOKENS:
+                self.assertIn(token, normalized)
+
     # -- unmarked / new behavior stays exactly the same ------------------
     def test_new_attachment_has_no_marker_and_full_guidance(self):
         self.assertTrue(self.attach_full())
@@ -104,6 +138,21 @@ class LinkedGuidanceCase(unittest.TestCase):
         self.assertIn(b"off", block)
         self.assertIn(b"sandbox", block)
         self.assertLessEqual(len(block), MAX_BLOCK)
+
+    def test_linked_bootstrap_keeps_storage_recovery_selection_and_completion(self):
+        self.write_guide()
+        self.attach_full()
+        self.inject_marker()
+        self.assertTrue(project.attach(self.repo))
+        text = " ".join(self.block_bytes().decode("utf-8").split())
+        self.assertIn(
+            "setup/doctor/enabled bootstrap can save an automatic private replacement "
+            "for an unusable idle default", text)
+        self.assertIn("A new shared root requires new coordination work; existing "
+                      "tasks are never migrated automatically", text)
+        self.assertIn("select one explicitly attached root", text)
+        self.assertIn("it selects the hook context only", text)
+        self.assertIn("Stop still completes a delivered task automatically", text)
 
     def test_linked_mode_persists_across_refresh_and_is_idempotent(self):
         self.write_guide()
@@ -308,6 +357,28 @@ class LinkedGuidanceCase(unittest.TestCase):
                        b"sandbox", b"native", b"plan"):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, body)
+
+    def test_linked_generation_carries_continuity_rule_without_touching_user_bytes(self):
+        guide = self.write_guide(b"# Human guide\n\nKeep these bytes exactly.\n")
+        guide.chmod(0o640)
+        guide_before = guide.read_bytes()
+        guide_mode = stat.S_IMODE(guide.stat().st_mode)
+        prefix = b"# Project rules\r\nkeep me\r\n"
+        suffix = b"\ntrailing user note\n"
+        self.target().write_bytes(prefix)
+        self.attach_full()
+        self.inject_marker()
+        project.attach(self.repo)
+        self.target().write_bytes(self.target().read_bytes() + suffix)
+
+        block = self.block_bytes()
+        self.assert_continuity_rule(block.decode("utf-8"), "linked")
+        self.assertLessEqual(len(block), MAX_BLOCK)
+        self.assertTrue(self.target().read_bytes().startswith(prefix))
+        self.assertTrue(self.target().read_bytes().endswith(suffix))
+        self.assertEqual(guide.read_bytes(), guide_before)
+        self.assertEqual(stat.S_IMODE(guide.stat().st_mode), guide_mode)
+        self.assertNotIn(b"using the same still-unfinalized", block)
 
 
 if __name__ == "__main__":

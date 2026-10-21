@@ -6,7 +6,7 @@ restore context after compaction.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager, ExitStack
+from contextlib import contextmanager, ExitStack, nullcontext
 import fcntl
 import hashlib
 import json
@@ -49,8 +49,11 @@ OUTCOME_CONTEXT_LIMIT = 512 * 1024
 # Optional plan metadata that also becomes part of a deliverable's identity, so an
 # accepted or started scope cannot silently change by replanning. They stay
 # optional: read-only protected plans do not need a mutation authorization.
-OPTIONAL_DEFINITION_FIELDS = ("integration_of", "write_scope", "decision_artifacts")
+OPTIONAL_DEFINITION_FIELDS = ("integration_of", "write_scope", "decision_artifacts",
+                              "correction_of")
 _DELIVERABLE_ID = re.compile(r"[A-Za-z0-9_.-]{1,80}")
+_CORRECTION_TASK_ID = re.compile(r"task-[0-9a-f]{20}")
+_CORRECTION_ASSIGNMENT_ID = re.compile(r"as-[0-9a-f]{16}")
 # Stable, human-readable advice for a routing decision that retained the work.
 ROUTING_NEXT_STEPS = {
     "protected_kind": "keep this protected responsibility with the coordinator",
@@ -198,7 +201,7 @@ def open_task(root: Path, *, session_id: str, turn_id: str, prompt: str,
             return _read(path)
         now = time.time()
         task = {
-            "schema": 1, "id": task_id, "project": str(root),
+            "schema": 2, "id": task_id, "project": str(root),
             "session_id": session_id, "turn_id": turn_id,
             "prompt_sha256": hashlib.sha256(prompt.encode("utf-8", errors="replace")).hexdigest(),
             "base_head": _head(root), "created_at": now, "updated_at": now,
@@ -355,6 +358,8 @@ def begin_turn(root: Path, *, session_id: str, turn_id: str, prompt: str,
 
 
 def complete_task(root: Path, task_id: str) -> dict:
+    root = _project_root(root)
+    _reconcile_job_publications(root, task_id)
     with _lock(root):
         task = load_task(root, task_id)
         issues = validate_task(root, task_id) + completion_issues(task)
@@ -387,8 +392,20 @@ def _exact_project_path(value, field: str) -> str:
     return value
 
 
-def _plan_metadata(value, field: str) -> list:
-    """Validate one optional plan-metadata field and return its normalized list."""
+def _plan_metadata(value, field: str):
+    """Validate one optional plan-metadata field and return its normalized value."""
+    if field == "correction_of":
+        if not isinstance(value, dict) or set(value) != {"task_id", "assignment_id"}:
+            raise CoordinationError(
+                "correction_of must contain exactly task_id and assignment_id.", 64)
+        task_id = value.get("task_id")
+        assignment_id = value.get("assignment_id")
+        if (not isinstance(task_id, str) or not _CORRECTION_TASK_ID.fullmatch(task_id)
+                or not isinstance(assignment_id, str)
+                or not _CORRECTION_ASSIGNMENT_ID.fullmatch(assignment_id)):
+            raise CoordinationError(
+                "correction_of requires a task-20hex task id and as-16hex assignment id.", 64)
+        return {"task_id": task_id, "assignment_id": assignment_id}
     if not isinstance(value, list):
         raise CoordinationError(f"{field} must be a list.", 64)
     if field == "integration_of":
@@ -516,6 +533,8 @@ def _normalize_deliverable(raw: dict) -> dict:
         raise CoordinationError("Deliverables require id/kind/scope/executor/acceptance/dependencies/checks.", 64)
     if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", str(raw["id"])):
         raise CoordinationError("Invalid deliverable id.", 64)
+    if 'checks_reusable' in raw and type(raw['checks_reusable']) is not bool:
+        raise CoordinationError('checks_reusable must be a boolean.', 64)
     if raw["executor"] not in ("auto", "worker", "coordinator", "native-agent"):
         raise CoordinationError("Deliverable executor must be auto, worker, coordinator or native-agent.", 64)
     if raw['executor'] == 'worker' and raw['kind'] in PROTECTED_COORDINATOR_KINDS:
@@ -544,12 +563,15 @@ def _normalize_deliverable(raw: dict) -> dict:
     value["acceptance"] = list(raw["acceptance"])
     value["dependencies"] = list(raw["dependencies"])
     value["checks"] = list(raw["checks"])
+    value["checks_reusable"] = raw.get("checks_reusable", False)
     return value
 
 
 def _definition(item):
     definition = {key: item[key] for key in ('id', 'kind', 'scope', 'acceptance',
                                              'dependencies', 'checks', 'features')}
+    # The reuse attestation belongs to the immutable current definition.
+    definition['checks_reusable'] = item.get('checks_reusable', False)
     for field in OPTIONAL_DEFINITION_FIELDS:
         # Only present fields join the identity so historical plans, whose saved
         # routing bindings never carried them, keep validating unchanged.
@@ -567,6 +589,597 @@ def _binding(task_id, item):
     requested = (item.get('routing') or {}).get('requested_executor', item['executor'])
     return {'task_id': task_id, 'deliverable_id': item['id'],
             'plan_hash': fingerprint(dict(_definition(item), requested_executor=requested))}
+
+
+def _task_belongs_to(task, root: Path) -> bool:
+    try:
+        project = Path(os.path.realpath(str(task.get('project'))))
+    except (OSError, ValueError):
+        return False
+    return project == Path(os.path.realpath(str(root)))
+
+
+def _correction_workspace(root: Path, task: dict, reference: dict, *,
+                          explicit_workspace=None, bound_assignment=None,
+                          continuation_assignment=None, start_assignment=None):
+    """Resolve one reviewed predecessor without allocating or mutating a copy."""
+    from . import workspace, workspace_lifecycle
+
+    project_root = _project_root(root)
+    if not _task_belongs_to(task, project_root):
+        raise CoordinationError('Correction task belongs to another project.', 78)
+    predecessor_task_id = reference['task_id']
+    predecessor_assignment_id = reference['assignment_id']
+    try:
+        predecessor_task = load_task(project_root, predecessor_task_id)
+    except CoordinationError as error:
+        if error.code == 66:
+            raise CoordinationError('Correction predecessor task is missing; inspect the ledger.', 64) from None
+        raise
+    if not _task_belongs_to(predecessor_task, project_root):
+        raise CoordinationError('Correction predecessor task belongs to another project.', 78)
+    predecessor_row = next(
+        (row for row in predecessor_task.get('assignments', [])
+         if row.get('id') == predecessor_assignment_id), None)
+    if predecessor_row is None:
+        raise CoordinationError('Correction predecessor assignment is missing; inspect the ledger.', 64)
+    disposition = predecessor_row.get('disposition') or {}
+    if disposition.get('kind') != 'needs-rework':
+        raise CoordinationError(
+            'Correction predecessor must have a reviewed needs-rework disposition.', 64)
+    if predecessor_row.get('status') != 'succeeded':
+        raise CoordinationError(
+            'Correction predecessor must be a succeeded result; failed attempts require explicit resume.',
+            64)
+    if predecessor_row.get('job_finalization'):
+        raise CoordinationError('Correction predecessor job is finalized.', 73)
+    identifier = predecessor_row.get('workspace_id')
+    if not isinstance(identifier, str) or not re.fullmatch(r'[0-9a-f]{32}', identifier):
+        raise CoordinationError('Correction predecessor has no owned execution workspace.', 64)
+    history_workspaces = {
+        entry.get('workspace_id') for entry in predecessor_row.get('attempt_history', [])
+        if isinstance(entry, dict) and entry.get('workspace_id')}
+    if history_workspaces - {identifier}:
+        raise CoordinationError(
+            'Correction predecessor attempt history spans multiple workspaces; inspect the ledger.',
+            64)
+    current_head = task.get('base_head')
+    predecessor_head = predecessor_task.get('base_head')
+    if (not isinstance(current_head, str) or not current_head
+            or predecessor_head != current_head):
+        raise CoordinationError(
+            'Correction predecessor uses a different source/base HEAD; start a new job.', 64)
+    try:
+        copy = workspace.load(_state_root(), identifier)
+    except workspace.WorkspaceError as error:
+        raise CoordinationError(
+            'Correction predecessor workspace is unavailable: ' + error.message,
+            error.code) from None
+    if copy.source.resolve() != project_root:
+        raise CoordinationError('Correction predecessor workspace belongs to another project.', 78)
+    if copy.metadata.get('base_head') != current_head:
+        raise CoordinationError(
+            'Correction predecessor workspace base HEAD is stale; start a new job.', 64)
+    try:
+        lease = workspace_lifecycle.read(copy)
+    except workspace.WorkspaceError as error:
+        raise CoordinationError(
+            'Correction predecessor lease is unavailable: ' + error.message,
+            error.code) from None
+    if lease is None:
+        raise CoordinationError('Correction predecessor logical job lease is missing.', 73)
+    if lease['phase'] in workspace_lifecycle.FINAL_PHASES:
+        raise CoordinationError('Correction predecessor workspace is finalized.', 73)
+    expected_binding = {'task_id': predecessor_task_id,
+                        'assignment_id': predecessor_assignment_id}
+    continuation_row = None
+    prestart_failure = False
+    pending = lease.get('pending_attempt')
+    pending_binding = None
+    if (isinstance(pending, dict) and set(pending) == {
+            'task_id', 'assignment_id', 'id'}
+            and re.fullmatch('[0-9a-f]{32}', str(pending.get('id', '')))):
+        pending_binding = {'task_id': pending.get('task_id'),
+                           'assignment_id': pending.get('assignment_id')}
+    if (bound_assignment is None and start_assignment is not None
+            and pending_binding == {'task_id': task['id'],
+                                    'assignment_id': start_assignment}):
+        bound_assignment = start_assignment
+    if continuation_assignment is not None:
+        continuation_row = _assignment(task, continuation_assignment)
+        prestart_failure = (continuation_row.get('status') == 'failed'
+                            and continuation_row.get('failure_stage') == 'preparation'
+                            and not continuation_row.get('attempt_id'))
+    continuation_reserved = False
+    if continuation_row is not None and not prestart_failure:
+        current_attempt_id = continuation_row.get('attempt_id')
+        running_attempt = next(
+            (attempt for attempt in lease.get('attempts', [])
+             if isinstance(attempt, dict) and attempt.get('id') == current_attempt_id),
+            None)
+        running_reservation = bool(
+            continuation_row.get('status') == 'running'
+            and isinstance(running_attempt, dict)
+            and running_attempt.get('operation') == 'execution'
+            and running_attempt.get('status') == 'running'
+            and continuation_row.get('workspace_id') in (None, identifier)
+            and copy.metadata.get('attempt_id') == current_attempt_id)
+        continuation_reserved = (
+            pending_binding == {'task_id': task['id'],
+                                'assignment_id': continuation_assignment}
+            or running_reservation)
+    bound_to_current = ((bound_assignment is not None or continuation_assignment is not None)
+                        and not prestart_failure)
+    if bound_assignment is not None:
+        expected_binding = {'task_id': task['id'], 'assignment_id': bound_assignment}
+        current_row = _assignment(task, bound_assignment)
+        current_attempt_id = current_row.get('attempt_id')
+        running_attempt = next(
+            (attempt for attempt in lease.get('attempts', [])
+             if isinstance(attempt, dict) and attempt.get('id') == current_attempt_id),
+            None)
+        running_reservation = bool(
+            current_row.get('status') == 'running'
+            and isinstance(running_attempt, dict)
+            and running_attempt.get('operation') == 'execution'
+            and running_attempt.get('status') == 'running'
+            and current_row.get('workspace_id') in (None, identifier)
+            and copy.metadata.get('attempt_id') == current_attempt_id)
+        pending_reservation = pending_binding == {
+            'task_id': task['id'], 'assignment_id': bound_assignment}
+        if not pending_reservation and not running_reservation:
+            raise CoordinationError(
+                'Correction assignment start did not reserve this predecessor workspace.', 64)
+    elif continuation_assignment is not None and not prestart_failure:
+        expected_binding = {'task_id': task['id'], 'assignment_id': continuation_assignment}
+    actual_binding = lease.get('binding')
+    if actual_binding != expected_binding:
+        raise CoordinationError(
+            'Correction predecessor does not match its lease binding; link the authoritative assignment.',
+            64)
+    if (lease.get('workspace_id') != identifier
+            or copy.metadata.get('job_id') != lease.get('job_id')):
+        raise CoordinationError('Correction predecessor workspace/job identity is stale.', 64)
+    if predecessor_row.get('job_id') and predecessor_row['job_id'] != lease['job_id']:
+        raise CoordinationError('Correction predecessor is not the authoritative logical job.', 64)
+    attempt_id = predecessor_row.get('attempt_id')
+    known = {entry.get('id') for entry in lease.get('attempts', [])
+             if isinstance(entry, dict)}
+    if lease.get('pending_attempt'):
+        known.add(lease['pending_attempt'].get('id'))
+    if attempt_id:
+        if attempt_id not in known:
+            raise CoordinationError('Correction predecessor attempt is not the current lease attempt.', 64)
+        if (not bound_to_current and copy.metadata.get('attempt_id')
+                and copy.metadata['attempt_id'] != attempt_id):
+            raise CoordinationError('Correction predecessor execution record is stale.', 64)
+    if continuation_assignment is not None:
+        current_row = continuation_row or _assignment(task, continuation_assignment)
+        if current_row.get('status') not in ('failed', 'running'):
+            raise CoordinationError(
+                'Correction lineage can bind the current assignment only for explicit resume.', 64)
+        if (current_row.get('workspace_id') and current_row['workspace_id'] != identifier):
+            raise CoordinationError('Correction assignment is bound to a different workspace.', 64)
+        if current_row.get('job_id') and current_row['job_id'] != lease['job_id']:
+            raise CoordinationError('Correction assignment is bound to a different logical job.', 64)
+        if current_row.get('attempt_id'):
+            if current_row['attempt_id'] not in known:
+                raise CoordinationError('Correction assignment attempt is not in the lease history.', 64)
+            if (copy.metadata.get('attempt_id')
+                    and copy.metadata['attempt_id'] != current_row['attempt_id']
+                    and not continuation_reserved):
+                raise CoordinationError('Correction assignment execution record is stale.', 64)
+    if (not bound_to_current and copy.metadata.get('status') != 'succeeded'):
+        raise CoordinationError(
+            'Correction predecessor workspace does not retain a successful result; inspect it before recovery.',
+            64)
+    if bound_to_current and copy.metadata.get('status') not in ('running', 'succeeded', 'failed'):
+        raise CoordinationError(
+            'Correction workspace is not in a resumable execution state.', 64)
+    try:
+        copy.verify()
+        info = copy.path.stat()
+    except (workspace.WorkspaceError, OSError) as error:
+        message = getattr(error, 'message', 'execution tree is unavailable')
+        raise CoordinationError('Correction predecessor workspace is unstable: ' + message,
+                                getattr(error, 'code', 78)) from None
+    if ((info.st_ino, info.st_dev) != (lease.get('work_inode'), lease.get('work_device'))
+            or info.st_ino != copy.metadata.get('work_inode')):
+        raise CoordinationError('Correction predecessor execution inode is stale.', 73)
+    if explicit_workspace is not None:
+        explicit_id = getattr(explicit_workspace, 'id', explicit_workspace)
+        if explicit_id != identifier:
+            raise CoordinationError(
+                'Explicit --workspace does not match the assignment correction_of predecessor.',
+                64)
+    return copy
+
+
+def _logical_job_chain(root: Path, task_id: str, assignment_id: str):
+    """Follow authoritative correction links backwards through one job."""
+    project_root = _project_root(root)
+    task = load_task(project_root, task_id)
+    row = _assignment(task, assignment_id)
+    job_id = row.get('job_id')
+    workspace_id = row.get('workspace_id')
+    if not isinstance(job_id, str) or not re.fullmatch('[0-9a-f]{32}', job_id):
+        raise CoordinationError('Assignment has no authoritative logical job identity.', 64)
+    if not isinstance(workspace_id, str) or not re.fullmatch('[0-9a-f]{32}', workspace_id):
+        raise CoordinationError('Assignment has no authoritative execution workspace.', 64)
+    chain = []
+    seen = set()
+    while True:
+        current_key = (task['id'], row['id'])
+        if current_key in seen:
+            raise CoordinationError('Correction lineage contains a cycle; inspect the ledger.', 64)
+        seen.add(current_key)
+        if not _task_belongs_to(task, project_root):
+            raise CoordinationError('Correction lineage leaves this project.', 78)
+        if row.get('job_id') != job_id or row.get('workspace_id') != workspace_id:
+            raise CoordinationError(
+                'Correction lineage spans a different logical job; inspect the ledger.', 64)
+        item = _deliverable(task, row.get('deliverable_id'))
+        reference = row.get('correction_of') or (
+            item.get('correction_of') if isinstance(item, dict) else None)
+        chain.append((task['id'], row['id']))
+        if reference is None:
+            return chain
+        reference = _plan_metadata(reference, 'correction_of')
+        task = load_task(project_root, reference['task_id'])
+        row = _assignment(task, reference['assignment_id'])
+
+
+def _publish_job_finalization(root: Path, task_id: str, assignment_id: str,
+                              report: dict) -> None:
+    """Idempotently publish one terminal lease across its authoritative lineage."""
+    from . import workspace, workspace_gc, workspace_lifecycle
+
+    if not isinstance(report, dict):
+        raise CoordinationError('Logical job finalization publication is malformed.', 73)
+    project_root = _project_root(root)
+    task = load_task(project_root, task_id)
+    row = _assignment(task, assignment_id)
+    workspace_id = (row.get('workspace_id') or report.get('workspace_id')
+                    or report.get('id'))
+    if not isinstance(workspace_id, str) or not re.fullmatch('[0-9a-f]{32}', workspace_id):
+        raise CoordinationError('Logical job finalization has no execution workspace.', 73)
+    if report.get('id') not in (None, workspace_id):
+        raise CoordinationError('Logical job finalization workspace does not match.', 73)
+    try:
+        copy = workspace_gc._load_record(_state_root(), workspace_id)
+        if copy.source.resolve() != project_root:
+            raise CoordinationError('Logical job workspace belongs to another project.', 78)
+        lease = workspace_lifecycle.read(copy)
+    except workspace.WorkspaceError as error:
+        raise CoordinationError(str(error), error.code) from None
+    if lease is None:
+        raise CoordinationError('Logical job finalization has no durable lease.', 73)
+    if lease['phase'] not in workspace_lifecycle.FINAL_PHASES:
+        raise CoordinationError('Logical job is not finalized; publication is deferred.', 75)
+    binding = lease.get('binding')
+    if (not isinstance(binding, dict) or set(binding) != {'task_id', 'assignment_id'}):
+        raise CoordinationError('Finalized logical job has no authoritative assignment binding.', 73)
+    try:
+        binding_task = load_task(project_root, binding['task_id'])
+        _assignment(binding_task, binding['assignment_id'])
+    except CoordinationError as error:
+        raise CoordinationError(
+            'Finalized logical job binding is unavailable: ' + error.message, error.code) from None
+    if not _task_belongs_to(binding_task, project_root):
+        raise CoordinationError('Finalized logical job binding belongs to another project.', 78)
+    chain = _logical_job_chain(
+        project_root, binding['task_id'], binding['assignment_id'])
+    if (task_id, assignment_id) not in chain:
+        raise CoordinationError(
+            'Requested assignment is not an authoritative predecessor of this logical job.', 64)
+    known_attempts = {
+        entry.get('id') for entry in lease.get('attempts', [])
+        if isinstance(entry, dict)}
+    if lease.get('pending_attempt'):
+        known_attempts.add(lease['pending_attempt'].get('id'))
+    rows = []
+    for chain_task_id, chain_assignment_id in chain:
+        chain_task = (task if chain_task_id == task['id']
+                      else load_task(project_root, chain_task_id))
+        chain_row = _assignment(chain_task, chain_assignment_id)
+        if (chain_row.get('job_id') != lease['job_id']
+                or chain_row.get('workspace_id') != workspace_id):
+            raise CoordinationError(
+                'Correction lineage no longer matches the finalized logical job.', 64)
+        attempt_id = chain_row.get('attempt_id')
+        if attempt_id and attempt_id not in known_attempts:
+            raise CoordinationError(
+                'Correction lineage attempt is not in the finalized job lease.', 64)
+        rows.append((chain_task_id, chain_assignment_id))
+
+    publication = dict(report)
+    publication['id'] = workspace_id
+    publication['job_id'] = lease['job_id']
+    publication.setdefault('at', time.time())
+    for chain_task_id, chain_assignment_id in rows:
+        with _lock(project_root):
+            chain_task = load_task(project_root, chain_task_id)
+            chain_row = _assignment(chain_task, chain_assignment_id)
+            if (chain_row.get('job_id') != lease['job_id']
+                    or chain_row.get('workspace_id') != workspace_id):
+                raise CoordinationError(
+                    'Correction lineage changed during finalization publication.', 75)
+            existing = chain_row.get('job_finalization')
+            changed = False
+            if existing is None:
+                chain_row['job_finalization'] = dict(publication)
+                changed = True
+            elif (existing.get('job_id') not in (None, lease['job_id'])
+                  or existing.get('id') not in (None, workspace_id)):
+                raise CoordinationError(
+                    'Existing finalization publication belongs to another logical job.', 73)
+            if chain_row.pop('job_finalization_request', None) is not None:
+                changed = True
+            if changed:
+                chain_task['updated_at'] = time.time()
+                _atomic(_task_path(project_root, chain_task_id), chain_task)
+
+
+def _reconcile_job_publications(root: Path, task_id: str) -> None:
+    """Repair a publication interrupted after one task ledger was written."""
+    from . import workspace, workspace_gc, workspace_lifecycle
+
+    project_root = _project_root(root)
+    task = load_task(project_root, task_id)
+    for row in task.get('assignments', []):
+        if row.get('job_finalization'):
+            _publish_job_finalization(
+                project_root, task_id, row['id'], row['job_finalization'])
+            continue
+        identifier = row.get('workspace_id')
+        if not isinstance(identifier, str) or not re.fullmatch('[0-9a-f]{32}', identifier):
+            continue
+        try:
+            copy = workspace_gc._load_record(_state_root(), identifier)
+            if copy.source.resolve() != project_root:
+                continue
+            lease = workspace_lifecycle.read(copy)
+        except workspace.WorkspaceError:
+            continue
+        if lease is None or lease['phase'] not in workspace_lifecycle.FINAL_PHASES:
+            continue
+        binding = lease.get('binding')
+        if (not isinstance(binding, dict)
+                or set(binding) != {'task_id', 'assignment_id'}):
+            continue
+        try:
+            chain = _logical_job_chain(
+                project_root, binding['task_id'], binding['assignment_id'])
+        except CoordinationError:
+            continue
+        report = None
+        for chain_task_id, chain_assignment_id in chain:
+            chain_row = _assignment(
+                load_task(project_root, chain_task_id), chain_assignment_id)
+            if chain_row.get('job_finalization'):
+                report = chain_row['job_finalization']
+                break
+        if report is not None:
+            _publish_job_finalization(
+                project_root, binding['task_id'], binding['assignment_id'], report)
+
+
+def resolve_correction_workspace(root: Path, task_id: str, assignment_id: str, *,
+                                 explicit_workspace=None):
+    """Return the predecessor copy for a linked correction, otherwise ``None``."""
+    task = load_task(root, task_id)
+    row = _assignment(task, assignment_id)
+    item = assignment_deliverable(task, assignment_id)
+    reference = item.get('correction_of')
+    if reference is None:
+        return None
+    copy = _correction_workspace(
+        root, task, _plan_metadata(reference, 'correction_of'),
+        explicit_workspace=explicit_workspace,
+        continuation_assignment=(assignment_id if row.get('status') in ('failed', 'running')
+                                 else None),
+        start_assignment=assignment_id)
+    if row.get('workspace_id') and row['workspace_id'] != copy.id:
+        raise CoordinationError('Correction assignment is already bound to a different workspace.', 64)
+    return copy
+
+
+def _overlapping_rework_matches(root: Path, task: dict, item: dict, *,
+                                exclude_assignment_id: str | None = None):
+    """Return unresolved same-task rework workspaces that overlap one item.
+
+    A saved workspace ID with a missing or unreadable record is unresolved, not
+    evidence that the job was finalized. Only a durable final lease (or an
+    explicit finalization publication) permits independent overlapping work.
+    """
+    from . import workspace, workspace_gc, workspace_lifecycle
+
+    project_root = _project_root(root)
+    matches = []
+    for row in task.get('assignments', []):
+        if row.get('id') == exclude_assignment_id:
+            continue
+        if ((row.get('disposition') or {}).get('kind') != 'needs-rework'
+                or row.get('job_finalization')):
+            continue
+        prior_item = _deliverable(task, row.get('deliverable_id'))
+        if prior_item is None:
+            continue
+        if not any(scope_matching.mutation_overlaps(root, prior_scope, scope)
+                   for prior_scope in prior_item.get('scope', [])
+                   for scope in item.get('scope', [])):
+            continue
+        identifier = row.get('workspace_id')
+        if not isinstance(identifier, str) or not re.fullmatch('[0-9a-f]{32}', identifier):
+            raise CoordinationError(
+                f"Reviewed needs-rework assignment {row.get('id')} has no recoverable "
+                'execution workspace; inspect it before overlapping work. A missing copy '
+                'is not proof that the logical job was finalized.', 78)
+        try:
+            copy = workspace_gc._load_record(_state_root(), identifier)
+            if copy.source.resolve() != project_root:
+                raise CoordinationError(
+                    'Reviewed needs-rework workspace belongs to another project.', 78)
+            lease = workspace_lifecycle.read(copy)
+        except workspace.WorkspaceError as error:
+            raise CoordinationError(
+                f'Reviewed needs-rework workspace {identifier} is unavailable: '
+                f'{error.message}. Inspect it before overlapping work; a missing copy '
+                'is not proof that the logical job was finalized.', error.code) from None
+        if lease is None:
+            raise CoordinationError(
+                f'Reviewed needs-rework workspace {identifier} has no logical job lease; '
+                'inspect it before overlapping work. A missing lease is not proof of '
+                'finalization.', 73)
+        if lease['phase'] in workspace_lifecycle.FINAL_PHASES:
+            continue
+        if (row.get('job_id') and row['job_id'] != lease['job_id']):
+            raise CoordinationError(
+                f'Reviewed needs-rework assignment {row.get("id")} no longer matches its '
+                'logical job lease; inspect the ledger before overlapping work.', 64)
+        try:
+            copy.verify()
+        except (workspace.WorkspaceError, OSError) as error:
+            message = getattr(error, 'message', 'execution tree is unavailable')
+            raise CoordinationError(
+                f'Reviewed needs-rework workspace {identifier} is unavailable: {message}. '
+                'Inspect it before overlapping work; a missing execution tree is not proof '
+                'that the logical job was finalized.', getattr(error, 'code', 78)) from None
+        matches.append((row, prior_item))
+    return matches
+
+
+def _reject_unlinked_overlaps(root: Path, task: dict, items: list[dict], *,
+                              exclude_assignment_id: str | None = None) -> None:
+    for item in items:
+        matches = _overlapping_rework_matches(
+            root, task, item, exclude_assignment_id=exclude_assignment_id)
+        if not matches:
+            continue
+        labels = [f"{row.get('id')} ({row.get('deliverable_id')})"
+                  for row, _prior in matches]
+        if len(matches) > 1:
+            raise CoordinationError(
+                f"Ambiguous correction for new assignment {item['id']}: " +
+                ', '.join(labels) +
+                ' all have non-final needs-rework workspaces overlapping its scope; '
+                'add correction_of for the authoritative predecessor.', 64)
+        row = matches[0][0]
+        raise CoordinationError(
+            f"Reviewed needs-rework workspace from assignment {row.get('id')} overlaps "
+            f"new assignment {item['id']}; add correction_of to link the authoritative "
+            'predecessor (failed attempts require explicit resume).', 64)
+
+
+def validate_assignment_start(root: Path, task_id: str, assignment_id: str, *,
+                              explicit_workspace=None):
+    """Validate continuity before a managed launch allocates or probes anything."""
+    task = load_task(root, task_id)
+    row = _assignment(task, assignment_id)
+    item = assignment_deliverable(task, assignment_id)
+    if item.get('correction_of') is not None:
+        return resolve_correction_workspace(
+            root, task_id, assignment_id, explicit_workspace=explicit_workspace)
+    if (row.get('status') != 'running'
+            and item.get('executor') in ('worker', 'auto')
+            and item.get('kind') in WORKER_WRITE_KINDS):
+        _reject_unlinked_overlaps(
+            root, task, [item], exclude_assignment_id=row['id'])
+    return None
+
+
+def _validate_correction_plan(root: Path, task: dict, deliverables: list[dict]) -> None:
+    """Validate durable links before routing or ledger mutation.
+
+    The unlinked replacement check is intentionally bounded to this task: a new
+    worker/auto write deliverable whose scope overlaps one or more reviewed
+    needs-rework assignments that still have a non-final workspace lease. It
+    rejects one candidate as an explicit-link omission and multiple candidates
+    as ambiguous. Non-overlapping work remains independent, and cross-task
+    corrections require an explicit ``correction_of`` reference.
+    """
+    started = _started_deliverable_ids(task)
+    references = {}
+    for item in deliverables:
+        reference = item.get('correction_of')
+        if reference is None or item['id'] in started:
+            continue
+        key = (reference['task_id'], reference['assignment_id'])
+        if key in references:
+            raise CoordinationError(
+                'Two correction deliverables cannot name the same predecessor.', 64)
+        references[key] = item
+    for (predecessor_task_id, predecessor_assignment_id), item in references.items():
+        reference = {'task_id': predecessor_task_id,
+                     'assignment_id': predecessor_assignment_id}
+        for existing in task.get('deliverables', []):
+            if (existing.get('id') != item['id']
+                    and existing.get('correction_of') == reference):
+                raise CoordinationError(
+                    'Correction predecessor already has a linked successor; link the latest correction assignment.',
+                    64)
+        _correction_workspace(root, task, reference)
+
+    previous_ids = {item.get('id') for item in task.get('deliverables', [])}
+    new_items = [item for item in deliverables
+                 if item.get('id') not in previous_ids
+                 and item.get('executor') in ('worker', 'auto')
+                 and item.get('kind') in WORKER_WRITE_KINDS
+                 and item.get('correction_of') is None]
+    if not new_items:
+        return
+    _reject_unlinked_overlaps(root, task, new_items)
+
+
+def _canonical_features(item, task):
+    raw = item.get('features', {})
+    if not isinstance(raw, dict):
+        raise ValueError('features must be an object')
+    defaults = {'kind': item['kind'], 'runtime': task.get('runtime', 'codex'),
+                'effort': normalize_effort(task['policy'].get('effort')) or DEFAULT_EFFORT}
+    features = validate_features({**defaults, **raw})
+    if features['kind'] != item['kind']:
+        raise ValueError('feature kind differs from deliverable kind')
+    return features
+
+
+def _logical_definition(item, task):
+    definition = {key: item[key] for key in ('id', 'kind', 'scope', 'acceptance',
+                                             'dependencies', 'checks')}
+    definition['checks_reusable'] = item.get('checks_reusable', False)
+    if 'retention' in item:
+        definition['retention'] = item['retention']
+    for field in OPTIONAL_DEFINITION_FIELDS:
+        if field in item:
+            definition[field] = item[field]
+    if item.get('executor') == 'native-agent':
+        definition['delegation_reason'] = item.get('delegation_reason')
+        definition['native_exception'] = item.get('native_exception')
+    definition['features'] = _canonical_features(item, task)
+    definition['requested_executor'] = _requested_executor(item)
+    return definition
+
+
+def _same_logical_plan(task, deliverables, classification, small_evidence):
+    """Compare the submitted distribution with the saved one before any side effect.
+
+    Derived routing state, assignment rows, results and phase are deliberately
+    excluded. The requested executor is compared instead of its resolved value,
+    so an identical ``auto`` distribution remains identical after routing.
+    """
+    try:
+        saved = [_logical_definition(item, task) for item in task.get('deliverables', [])]
+        incoming = [_logical_definition(item, task) for item in deliverables]
+    except (RoutingError, KeyError, TypeError, ValueError):
+        return False
+    return (task.get('classification') == classification
+            and task.get('small_evidence') == small_evidence
+            and saved == incoming)
+
+
+def _plan_is_durable(task):
+    """Only the post-routing publication proves a current plan is durable."""
+    return task.get('routing_committed') is True
 
 
 def _prepare_routing(root, task, items, service):
@@ -623,7 +1236,9 @@ def _valid_auto_decision(root, task, item):
         return False
     service = RoutingService(root)
     decision_id = routing.get('decision_id')
-    if not service.validate_plan_decision(decision_id, item.get('features'), _binding(task['id'], item), executor=item['executor']):
+    if not service.validate_plan_decision(
+            decision_id, item.get('features'), _binding(task['id'], item),
+            executor=item['executor']):
         return False
     decision = service.decision(decision_id)
     return item['executor'] == ('worker' if decision['action'] == 'worker' else 'coordinator')
@@ -654,60 +1269,87 @@ def plan_task(root: Path, task_id: str, plan: dict) -> dict:
                 "Small-task exemption requires one concrete non-wildcard scope; "
                 "otherwise register a substantial distribution.", 64)
     root = _project_root(root)
-    with _lock(root), _routing_batch(root) as service:
+    with _lock(root):
         task = load_task(root, task_id)
-        if classification == "substantial" and task['policy'].get('delegation_level') == 'auto':
-            # Reject an explicit executor bypass before any durable ledger record
-            # or routing decision exists for this revision. Started deliverables
-            # are immutable and keep their already-validated saved decision.
-            bypasses = _auto_executor_issues(deliverables, _started_deliverable_ids(task))
-            if bypasses:
-                raise CoordinationError(
-                    'Auto distribution cannot be bypassed: ' + '; '.join(bypasses) + '.', 64)
-        try:
-            _prepare_routing(root, task, deliverables, service)
-        except RoutingError as error:
-            raise CoordinationError(error.message, error.code) from None
-        previous = {a["deliverable_id"]: a for a in task.get("assignments", [])}
-        incoming_ids = {item["id"] for item in deliverables}
-        historical_missing = [
-            row["deliverable_id"] for row in task.get("assignments", [])
-            if row.get("status") not in ("planned",) and row.get("deliverable_id") not in incoming_ids
-        ]
-        historical_missing.extend(item['id'] for item in task.get('deliverables', [])
-                                  if (item.get('routing_feedback') or item.get('result')
-                                      or item.get('native_dispatches'))
-                                  and item['id'] not in incoming_ids)
-        if historical_missing:
+        if task.get('schema') != 2:
             raise CoordinationError(
-                "Plan revision cannot remove started/completed deliverables: " +
-                ", ".join(historical_missing) +
-                ". Add a new deliverable id for revised scope.", 64)
-        assignments = []
-        for item in deliverables:
-            prior = previous.get(item["id"])
-            if item["executor"] != "worker":
-                if prior and prior.get("status") != "planned":
+                'Unsupported coordination plan format; existing records are preserved. '
+                'Open a new task with the current package.', 78)
+        if (_same_logical_plan(task, deliverables, classification, plan.get("small_evidence"))
+                and _plan_is_durable(task)):
+            # An identical logical distribution is already durable. Do not open
+            # the routing store, rewrite the ledger, reset phase or replace IDs.
+            return task
+        _validate_correction_plan(root, task, deliverables)
+        with _routing_batch(root) as service:
+            if classification == "substantial" and task['policy'].get('delegation_level') == 'auto':
+                # Reject an explicit executor bypass before any durable ledger record
+                # or routing decision exists for this revision. Started deliverables
+                # are immutable and keep their already-validated saved decision.
+                bypasses = _auto_executor_issues(deliverables, _started_deliverable_ids(task))
+                if bypasses:
                     raise CoordinationError(
-                        "Plan revision cannot reassign a started/completed DeepSeek worker deliverable; "
-                        "add a new deliverable id for the native/coordinator scope.", 64)
-                continue
-            if item["id"] in previous:
-                assignments.append(previous[item["id"]])
-                continue
-            assignment_id = "as-" + hashlib.sha256(
-                f"{task_id}\0{item['id']}".encode()).hexdigest()[:16]
-            assignments.append({
-                "id": assignment_id, "deliverable_id": item["id"],
-                "status": "planned", "workspace_id": None, "runtime": None,
-                "effort": None, "prepared_changes": [], "worker_changes": [], "checks": [],
-                "result_summary": None, "disposition": None,
-            })
-        task.update(classification=classification,
-                    small_evidence=plan.get("small_evidence"),
-                    deliverables=deliverables, assignments=assignments,
-                    status="planned", updated_at=time.time())
-        # Persist the ledger before the surrounding routing transaction commits.
+                        'Auto distribution cannot be bypassed: ' + '; '.join(bypasses) + '.', 64)
+            try:
+                _prepare_routing(root, task, deliverables, service)
+            except RoutingError as error:
+                raise CoordinationError(error.message, error.code) from None
+            previous = {a["deliverable_id"]: a for a in task.get("assignments", [])}
+            incoming_ids = {item["id"] for item in deliverables}
+            historical_missing = [
+                row["deliverable_id"] for row in task.get("assignments", [])
+                if row.get("status") not in ("planned",) and row.get("deliverable_id") not in incoming_ids
+            ]
+            historical_missing.extend(item['id'] for item in task.get('deliverables', [])
+                                      if (item.get('routing_feedback') or item.get('result')
+                                          or item.get('native_dispatches'))
+                                      and item['id'] not in incoming_ids)
+            if historical_missing:
+                raise CoordinationError(
+                    "Plan revision cannot remove started/completed deliverables: " +
+                    ", ".join(historical_missing) +
+                    ". Add a new deliverable id for revised scope.", 64)
+            assignments = []
+            for item in deliverables:
+                prior = previous.get(item["id"])
+                if item["executor"] != "worker":
+                    if prior and prior.get("status") != "planned":
+                        raise CoordinationError(
+                            "Plan revision cannot reassign a started/completed DeepSeek worker deliverable; "
+                            "add a new deliverable id for the native/coordinator scope.", 64)
+                    continue
+                if item["id"] in previous:
+                    prior_assignment = previous[item["id"]]
+                    if prior_assignment.get('status') == 'planned':
+                        if item.get('correction_of') is None:
+                            prior_assignment.pop('correction_of', None)
+                        else:
+                            prior_assignment['correction_of'] = dict(item['correction_of'])
+                    assignments.append(prior_assignment)
+                    continue
+                assignment_id = "as-" + hashlib.sha256(
+                    f"{task_id}\0{item['id']}".encode()).hexdigest()[:16]
+                assignment = {
+                    "id": assignment_id, "deliverable_id": item["id"],
+                    "status": "planned", "workspace_id": None, "runtime": None,
+                    "effort": None, "prepared_changes": [], "worker_changes": [], "checks": [],
+                    "result_summary": None, "disposition": None,
+                }
+                if item.get('correction_of') is not None:
+                    assignment['correction_of'] = dict(item['correction_of'])
+                assignments.append(assignment)
+            task.pop('routing_committed', None)
+            task['schema'] = 2
+            task.update(classification=classification,
+                        small_evidence=plan.get("small_evidence"),
+                        deliverables=deliverables, assignments=assignments,
+                        status="planned", updated_at=time.time())
+            # Persist the ledger before the surrounding routing transaction commits.
+            _atomic(_task_path(root, task_id), task)
+        # The marker is published only after the routing transaction commits.
+        # If the process stops in between, the next identical plan repairs it
+        # instead of treating a partially durable distribution as a no-op.
+        task['routing_committed'] = True
         _atomic(_task_path(root, task_id), task)
         return task
 
@@ -1029,12 +1671,16 @@ def _unknown_lessons_block() -> dict:
 
 def _deliverable_snapshot(item) -> dict:
     declared = _declared_features(item)
-    return {"id": item.get("id"), "kind": item.get("kind"),
-            "scope": _bounded_snapshot_value(item.get("scope") or [], text=300, items=200),
-            "acceptance": _bounded_snapshot_value(item.get("acceptance") or []),
-            "dependencies": _bounded_snapshot_value(item.get("dependencies") or []),
-            "checks": _bounded_snapshot_value(item.get("checks") or []),
-            "features": _bounded_snapshot_value(declared) if declared else None}
+    value = {"id": item.get("id"), "kind": item.get("kind"),
+             "scope": _bounded_snapshot_value(item.get("scope") or [], text=300, items=200),
+             "acceptance": _bounded_snapshot_value(item.get("acceptance") or []),
+             "dependencies": _bounded_snapshot_value(item.get("dependencies") or []),
+             "checks": _bounded_snapshot_value(item.get("checks") or []),
+             "checks_reusable": item.get("checks_reusable", False),
+             "features": _bounded_snapshot_value(declared) if declared else None}
+    if item.get("correction_of") is not None:
+        value["correction_of"] = dict(item["correction_of"])
+    return value
 
 
 def _execution_snapshot(root: Path, task: dict, item: dict, workspace_id: str, runtime: str,
@@ -1210,116 +1856,187 @@ def assignment_started(root: Path, task_id: str, assignment_id: str,
             raise CoordinationError('Worker effort must be low, high or max (legacy medium maps to high).', 64)
         effort = canonical_effort
     identity = None
-    if isinstance(workspace_id, str) and re.fullmatch('[0-9a-f]{32}', workspace_id):
-        from . import workspace, workspace_lifecycle
-        existing = _assignment(load_task(root, task_id), assignment_id)
-        if existing['status'] not in ('planned', 'failed', 'running'):
-            raise CoordinationError('Assignment is already active or completed.', 64)
-        if (existing.get('status') == 'failed' and existing.get('workspace_id')
-                and existing['workspace_id'] != workspace_id):
-            raise CoordinationError('A logical job continuation must reuse its original workspace.', 64)
-        if existing.get('job_finalization'):
-            raise CoordinationError('This logical job was finalized; plan a new job.', 73)
-        try:
-            copy = workspace.load(_state_root(), workspace_id)
-        except workspace.WorkspaceError:
-            # Legacy synthetic/nonlocal references have unknown identity. Do
-            # not fabricate provenance or rewrite their historic records.
-            copy = None
-        if copy is not None:
-            if copy.source.resolve() != _project_root(root):
-                raise CoordinationError('Workspace belongs to another source project.', 78)
-            try:
-                previous = workspace_lifecycle.read(copy)
-                binding = previous.get('binding') if previous else None
-                if binding and binding != {'task_id': task_id, 'assignment_id': assignment_id}:
-                    old = _assignment(load_task(root, binding['task_id']), binding['assignment_id'])
-                    if (old.get('workspace_id') != workspace_id
-                            or (old.get('disposition') or {}).get('kind') != 'needs-rework'):
-                        raise CoordinationError('Linked correction requires reviewed needs-rework on the prior assignment.', 64)
-                if existing['status'] != 'running' or resume_running:
-                    identity = workspace_lifecycle.prepare_attempt(copy, task_id, assignment_id,
-                                                                  replace_pending=resume_running)
-            except workspace.WorkspaceError as cause:
-                raise CoordinationError(str(cause), cause.code) from None
-    with _lock(root), _routing_batch(root) as service:
+    has_workspace = (isinstance(workspace_id, str)
+                     and re.fullmatch('[0-9a-f]{32}', workspace_id))
+    from . import workspace, workspace_lifecycle
+    # Match the owner -> lifecycle fence -> ledger order used by finalization.
+    # No lease is reserved until access and routing have passed under this gate.
+    fence = (workspace_lifecycle.fence(_state_root()) if has_workspace
+             else nullcontext())
+    with fence, _lock(root):
         task = load_task(root, task_id)
         row = _assignment(task, assignment_id)
         item = assignment_deliverable(task, assignment_id)
+        correction = item.get('correction_of')
+        if has_workspace:
+            if row['status'] not in ('planned', 'failed', 'running'):
+                raise CoordinationError('Assignment is already active or completed.', 64)
+            if (row.get('status') == 'failed' and row.get('workspace_id')
+                    and row['workspace_id'] != workspace_id):
+                raise CoordinationError(
+                    'A logical job continuation must reuse its original workspace.', 64)
+            if row.get('job_finalization'):
+                raise CoordinationError('This logical job was finalized; plan a new job.', 73)
         _check_assignment_access(root, task, item)
-        if row['status'] == 'running':
-            # The managed runner holds the workspace's exclusive OS lock. An
-            # exact explicit continuation can reconcile a crash between the
-            # ledger rename and SQLite commit without starting another case.
-            expected = dict(workspace_id=workspace_id, runtime=runtime,
-                            prepared_changes=sorted(set(prepared_changes)))
-            # A running row may predate canonical effort levels ('medium' == 'high').
-            effort_matches = (normalize_effort(row.get('effort')) == effort
-                              or (effort is None and row.get('effort') is None))
-            if any(row.get(key) != value for key, value in expected.items()) or not effort_matches:
-                raise CoordinationError('Running assignment continuation must match its original workspace and execution conditions.', 64)
-            if row.get('routing_decision_id'):
+
+        copy = None
+        if has_workspace:
+            if correction is not None:
                 try:
-                    service.decision(row['routing_decision_id'])
+                    copy = resolve_correction_workspace(
+                        root, task_id, assignment_id, explicit_workspace=workspace_id)
+                except workspace.WorkspaceError as cause:
+                    raise CoordinationError(str(cause), cause.code) from None
+            else:
+                try:
+                    copy = workspace.load(_state_root(), workspace_id)
+                except workspace.WorkspaceError:
+                    # Legacy synthetic/nonlocal references have unknown identity. Do
+                    # not fabricate provenance or rewrite their historic records.
+                    copy = None
+                if copy is not None:
+                    if copy.source.resolve() != _project_root(root):
+                        raise CoordinationError(
+                            'Workspace belongs to another source project.', 78)
+                    try:
+                        previous = workspace_lifecycle.read(copy)
+                        binding = previous.get('binding') if previous else None
+                        if binding and binding != {'task_id': task_id,
+                                                   'assignment_id': assignment_id}:
+                            raise CoordinationError(
+                                'A new assignment must declare correction_of to reuse another '
+                                'assignment workspace.', 64)
+                    except workspace.WorkspaceError as cause:
+                        raise CoordinationError(str(cause), cause.code) from None
+        if (correction is None and row.get('status') != 'running'
+                and item.get('executor') in ('worker', 'auto')
+                and item.get('kind') in WORKER_WRITE_KINDS):
+            _reject_unlinked_overlaps(
+                root, task, [item], exclude_assignment_id=assignment_id)
+
+        with _routing_batch(root) as service:
+            if row['status'] == 'running':
+                # An exact replay returns the original assignment and attempt without
+                # rewriting either durable record. Explicit resume_running is the only
+                # path that reserves a new attempt.
+                expected = dict(workspace_id=workspace_id, runtime=runtime,
+                                prepared_changes=sorted(set(prepared_changes)))
+                # A running row may predate canonical effort levels ('medium' == 'high').
+                effort_matches = (normalize_effort(row.get('effort')) == effort
+                                  or (effort is None and row.get('effort') is None))
+                if (any(row.get(key) != value for key, value in expected.items())
+                        or not effort_matches):
+                    raise CoordinationError(
+                        'Running assignment continuation must match its original workspace '
+                        'and execution conditions.', 64)
+                if row.get('routing_decision_id'):
+                    try:
+                        service.decision(row['routing_decision_id'])
+                    except RoutingError as error:
+                        if (error.code != 66 or (item.get('routing') or {}).get(
+                                'requested_executor') == 'auto'):
+                            raise CoordinationError(error.message, error.code) from None
+                        # A manual start may have captured its decision in the
+                        # interrupted transaction. Recreate before any execution.
+                        decision = service.predict(
+                            row['routing_features'],
+                            access=task['policy']['effective_access'])
+                        row['routing_decision_id'] = decision['id']
+                        _atomic(_task_path(root, task_id), task)
+                    try:
+                        service.validate_start(
+                            row['routing_decision_id'], already_running=True,
+                            access=_effective_task_access(task, settings.resolve(root)))
+                    except RoutingError as error:
+                        raise CoordinationError(error.message, error.code) from None
+                if not resume_running:
+                    return task
+            if row['status'] not in ('planned', 'failed') and not resume_running:
+                raise CoordinationError('Assignment is already active or completed.', 64)
+            if row['status'] == 'failed' or (row['status'] == 'running' and resume_running):
+                if row['status'] == 'failed' and row.get('disposition') is None:
+                    raise CoordinationError(
+                        'Review and disposition the failed attempt before explicit '
+                        'continuation.', 64)
+                if row.get('workspace_id') and row['workspace_id'] != workspace_id:
+                    raise CoordinationError(
+                        'A logical job continuation must reuse its original workspace; '
+                        'new execution needs a separately planned job.', 64)
+
+            if item.get('features'):
+                declared = validate_features(item['features'])
+                features = validate_features(dict(
+                    item['features'], runtime=runtime,
+                    effort=effort or DEFAULT_EFFORT, model='deepseek-flash'))
+                auto = (item.get('routing') or {}).get('requested_executor') == 'auto'
+                if auto and features != declared:
+                    raise CoordinationError(
+                        'Worker runtime/effort must match its automatic routing decision; '
+                        'replan before starting.', 64)
+                try:
+                    decision = (service.decision(item['routing']['decision_id']) if auto else
+                                service.predict(
+                                    features, access=task['policy']['effective_access']))
+                    if auto:
+                        service.validate_start(
+                            decision['id'],
+                            access=_effective_task_access(task, settings.resolve(root)))
                 except RoutingError as error:
-                    if error.code != 66 or (item.get('routing') or {}).get('requested_executor') == 'auto':
-                        raise
-                    # A manual start may have captured its decision in the
-                    # interrupted transaction. Recreate before any execution.
-                    decision = service.predict(row['routing_features'], access=task['policy']['effective_access'])
-                    row['routing_decision_id'] = decision['id']
-                    _atomic(_task_path(root, task_id), task)
-                service.validate_start(row['routing_decision_id'], already_running=True,
-                    access=_effective_task_access(task, settings.resolve(root)))
-            if not resume_running:
-                return task
-        if row["status"] not in ("planned", "failed") and not resume_running:
-            raise CoordinationError("Assignment is already active or completed.", 64)
+                    raise CoordinationError(error.message, error.code) from None
+                row['routing_features'] = features
+                row['routing_decision_id'] = decision['id']
+
         if row['status'] == 'failed' or (row['status'] == 'running' and resume_running):
-            if row['status'] == 'failed' and row.get('disposition') is None:
-                raise CoordinationError('Review and disposition the failed attempt before explicit continuation.', 64)
-            if row.get('workspace_id') and row['workspace_id'] != workspace_id:
-                raise CoordinationError('A logical job continuation must reuse its original workspace; '
-                                        'new execution needs a separately planned job.', 64)
             history = row.setdefault('attempt_history', [])
-            history.append({key: row.get(key) for key in ('status', 'workspace_id', 'runtime', 'effort',
-                'started_at', 'finished_at', 'checks', 'disposition', 'error_kind', 'exit_code',
-                'failure_stage', 'preparation_cause', 'routing_features', 'routing_decision_id',
-                'execution_snapshot', 'worker_changes', 'result_summary', 'baseline_checks',
-                'verification_cause', 'prepared_input_changes', 'verification_runs',
-                'readiness_checks', 'job_id', 'attempt_id')})
-        if item.get('features'):
-            declared = validate_features(item['features'])
-            features = validate_features(dict(item['features'], runtime=runtime,
-                                              effort=effort or DEFAULT_EFFORT, model='deepseek-flash'))
-            auto = (item.get('routing') or {}).get('requested_executor') == 'auto'
-            if auto and features != declared:
-                raise CoordinationError('Worker runtime/effort must match its automatic routing decision; replan before starting.', 64)
+            history.append({key: row.get(key) for key in (
+                'status', 'workspace_id', 'runtime', 'effort', 'started_at',
+                'finished_at', 'checks', 'disposition', 'error_kind', 'exit_code',
+                'failure_stage', 'preparation_cause', 'routing_features',
+                'routing_decision_id', 'execution_snapshot', 'worker_changes',
+                'result_summary', 'baseline_checks', 'verification_cause',
+                'prepared_input_changes', 'verification_runs', 'readiness_checks',
+                'job_id', 'attempt_id')})
+
+        if copy is not None:
+            # Recheck immediately before reservation; a concurrent access change
+            # must not be converted into a pending attempt.
+            _check_assignment_access(root, task, item)
             try:
-                decision = (service.decision(item['routing']['decision_id']) if auto else
-                            service.predict(features, access=task['policy']['effective_access']))
-                if auto:
-                    service.validate_start(decision['id'],
-                        access=_effective_task_access(task, settings.resolve(root)))
-            except RoutingError as error:
-                raise CoordinationError(error.message, error.code) from None
-            row['routing_features'] = features
-            row['routing_decision_id'] = decision['id']
+                identity = workspace_lifecycle.prepare_attempt(
+                    copy, task_id, assignment_id,
+                    replace_pending=bool(resume_running))
+                if correction is not None:
+                    # The predecessor and its pending/current attempt must still be
+                    # the authoritative same-job binding after reservation.
+                    _correction_workspace(
+                        root, task, _plan_metadata(correction, 'correction_of'),
+                        explicit_workspace=workspace_id,
+                        bound_assignment=assignment_id)
+            except workspace.WorkspaceError as cause:
+                raise CoordinationError(str(cause), cause.code) from None
+
         now = time.time()
         snapshot = _execution_snapshot(root, task, item, workspace_id, runtime,
                                        prepared_changes, effort, execution, started_at=now)
-        row.update(status="running", workspace_id=workspace_id, runtime=runtime,
+        row.update(status='running', workspace_id=workspace_id, runtime=runtime,
                    effort=effort, prepared_changes=sorted(set(prepared_changes)),
                    started_at=now, disposition=None, error_kind=None, exit_code=None,
                    failure_stage=None, preparation_cause=None, queue_state='running',
                    execution_snapshot=snapshot, baseline_checks=[], verification_cause=None,
                    prepared_input_changes=[], verification_runs=[], readiness_checks=[])
+        if correction is not None:
+            row['correction_of'] = dict(correction)
         if identity:
             row.update(job_id=identity[0], attempt_id=identity[1])
             snapshot['execution'].update(job_id=identity[0], attempt_id=identity[1])
         row.pop('finished_at', None)
-        task.update(status="active", updated_at=time.time())
-        _atomic(_task_path(root, task_id), task)
+        task.update(status='active', updated_at=time.time())
+        try:
+            _atomic(_task_path(root, task_id), task)
+        except OSError:
+            raise CoordinationError(
+                'Cannot safely access routing state; check ownership, permissions '
+                'and database integrity.', 78) from None
         return task
 
 
@@ -1332,6 +2049,10 @@ def assignment_finished(root: Path, task_id: str, assignment_id: str,
                         prepared_input_changes: list[str] | None = None) -> dict:
     if status not in ("succeeded", "failed"):
         raise CoordinationError("Assignment result status must be succeeded or failed.", 64)
+    # Reuse-bearing terminal rows share the strict publication contract used
+    # for appended verification runs, before any durable assignment mutation.
+    _validate_check_evidence([row for row in checks if isinstance(row, dict)
+                              and ('reused' in row or 'reused_from' in row)])
     if baseline_checks is not None:
         _validate_check_evidence(baseline_checks)
     _validate_verification_cause(verification_cause)
@@ -1392,7 +2113,7 @@ def _validate_check_evidence(rows) -> None:
     allowed = {'command', 'exit_code', 'phase', 'stdout_path', 'stderr_path',
                'stdout_truncated', 'stderr_truncated', 'diagnostic_directory',
                'duration_seconds', 'error_kind', 'launch_error', 'timed_out',
-               'launch_failed', 'stdout_sha256', 'stderr_sha256'}
+               'launch_failed', 'stdout_sha256', 'stderr_sha256', 'reused', 'reused_from'}
     if not isinstance(rows, list) or len(rows) > 1000:
         raise CoordinationError('Verification evidence must be a bounded check list.', 64)
     for row in rows:
@@ -1404,6 +2125,19 @@ def _validate_check_evidence(rows) -> None:
         for field in ('stdout_truncated', 'stderr_truncated', 'timed_out', 'launch_failed'):
             if field in row and type(row[field]) is not bool:
                 raise CoordinationError('Verification flags must be boolean.', 64)
+        if 'reused' in row and type(row['reused']) is not bool:
+            raise CoordinationError('Verification reused flag must be boolean.', 64)
+        if 'reused_from' in row and row.get('reused') is not True:
+            raise CoordinationError('Reuse provenance requires a reused result.', 64)
+        if row.get('reused') is True:
+            if (not isinstance(row.get('reused_from'), str) or
+                    re.fullmatch(r'[0-9a-f]{32}', row['reused_from']) is None or
+                    row['exit_code'] != 0 or
+                    any(row.get(flag) is not False for flag in
+                        ('stdout_truncated', 'stderr_truncated', 'timed_out', 'launch_failed')) or
+                    any(not row.get(field) for field in
+                        ('stdout_path', 'stderr_path', 'stdout_sha256', 'stderr_sha256'))):
+                raise CoordinationError('Reused verification requires complete successful evidence.', 64)
         for field in ('stdout_sha256', 'stderr_sha256'):
             if field in row and (not isinstance(row[field], str) or
                     re.fullmatch(r'[0-9a-f]{64}', row[field]) is None):
@@ -1535,7 +2269,7 @@ def assignment_preparation_failed(root: Path, task_id: str, assignment_id: str,
                     raise CoordinationError('Preparation workspace belongs to another project.', 78)
                 lease = workspace_lifecycle.read(copy)
                 if lease:
-                    identity = lease['job_id'], copy.metadata.get('attempt_id')
+                    identity = lease['job_id'], None
             except workspace.WorkspaceError as error:
                 raise CoordinationError(str(error), error.code) from None
     with _lock(root):
@@ -1727,7 +2461,9 @@ def finalize_assignment(root: Path, task_id: str, assignment_id: str,
     task = load_task(root, task_id)
     row = _assignment(task, assignment_id)
     if row.get('job_finalization'):
-        return task
+        _publish_job_finalization(
+            root, task_id, assignment_id, row['job_finalization'])
+        return load_task(root, task_id)
     disposition = (row.get('disposition') or {}).get('kind')
     if row.get('status') not in ('succeeded', 'failed') or disposition is None:
         raise CoordinationError('Review and disposition the finished result before finalizing.', 64)
@@ -1763,18 +2499,9 @@ def finalize_assignment(root: Path, task_id: str, assignment_id: str,
             cancelled=cancelled or disposition == 'rejected', before_finalize=attest)
     except workspace.WorkspaceError as cause:
         raise CoordinationError(str(cause), cause.code) from None
-    with _lock(root):
-        task = load_task(root, task_id)
-        row = _assignment(task, assignment_id)
-        if row.get('workspace_id') != identifier:
-            raise CoordinationError('Assignment binding changed during finalization.', 73)
-        if row.get('job_finalization'):
-            return task
-        row['job_finalization'] = dict(report, at=time.time(), evidence=evidence[:2000])
-        row.pop('job_finalization_request', None)
-        task['updated_at'] = time.time()
-        _atomic(_task_path(root, task_id), task)
-    return task
+    publication = dict(report, at=time.time(), evidence=evidence[:2000])
+    _publish_job_finalization(root, task_id, assignment_id, publication)
+    return load_task(root, task_id)
 
 
 def abandon_assignment(root: Path, task_id: str, assignment_id: str,
@@ -2137,6 +2864,7 @@ def ensure_assignment_ready(root: Path, task_id: str, assignment_id: str, copy,
 
 def summary(task: dict) -> str:
     level = task['policy']['delegation_level']
+    deliverables = {item.get('id'): item for item in task.get('deliverables', [])}
     lines = [
         f"DeepSeek Team coordination task {task['id']}: "
         f"{str(level) + '%' if level != 'auto' else 'Auto'}/{task['policy']['effective_access']}; "
@@ -2146,6 +2874,14 @@ def summary(task: dict) -> str:
     ]
     for row in task.get("assignments", []):
         text = f"- {row['id']} deliverable={row['deliverable_id']} status={row['status']}"
+        text += (f"; workspace_id={row.get('workspace_id') or 'none'}"
+                 f"; job_id={row.get('job_id') or 'none'}"
+                 f"; attempt_id={row.get('attempt_id') or 'none'}")
+        item = deliverables.get(row.get('deliverable_id')) or {}
+        correction = row.get('correction_of') or item.get('correction_of')
+        if isinstance(correction, dict):
+            text += (f"; correction_of={correction.get('task_id')}/"
+                     f"{correction.get('assignment_id')}")
         if row.get("effort"):
             text += f"; effort={row['effort']}"
         if row.get('queue_state'):

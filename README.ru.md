@@ -396,6 +396,7 @@ pipx uninstall deepseek-team
 ## Дополнительная документация
 
 - [Как выбирается исполнитель](https://github.com/kirill31337/deepseek-team/blob/main/docs/ROUTING.ru.md) — классификатор, маршрутизатор, допуск, доказательства и обратная связь.
+- [Контракт накладных расходов](https://github.com/kirill31337/deepseek-team/blob/main/docs/OVERHEAD_CONTRACT.ru.md) — гарантии программы и рекомендации агенту по переиспользованию проверок, памяти о подготовке, ожиданию и review.
 - [Журнал доработок и правила делегирования](https://github.com/kirill31337/deepseek-team/blob/main/docs/DELEGATION_LESSONS.ru.md) — приватный журнал, периодичность разбора и ограниченные рекомендательные правила.
 - [Изоляция воркеров и правила безопасности](https://github.com/kirill31337/deepseek-team/blob/main/docs/HARDENING.ru.md) — границы координатора и воркеров, проверка источника и восстановление.
 - [Инструменты и повторная проверка](https://github.com/kirill31337/deepseek-team/blob/main/docs/TOOLCHAINS.ru.md) — подготовка SDK/JDK, smoke-проверки, рецепты, базовая линия и повторная проверка.

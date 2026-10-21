@@ -99,17 +99,16 @@ class JobIntegrationTests(LifecycleFixture):
         self.run_attempt(task, assignment, copy, 'failed')
         coordination.use_result(self.source, task['id'], assignment, 'needs-rework', 'first failure reviewed')
         self.run_attempt(task, assignment, copy, 'succeeded')
+        coordination.use_result(self.source, task['id'], assignment, 'needs-rework', 'second review requires correction')
         task = coordination.plan_task(self.source, task['id'], {
             'classification': 'substantial', 'deliverables': [
                 {'id': name, 'kind': 'implementation', 'scope': ['app.txt'],
                  'executor': 'worker', 'acceptance': ['fixed'],
-                 'dependencies': [], 'checks': ['python3 -V']}
+                 'dependencies': [], 'checks': ['python3 -V'],
+                 **({'correction_of': {'task_id': task['id'], 'assignment_id': assignment}}
+                    if name == 'correction' else {})}
                 for name in ('fix', 'correction')]})
         correction = task['assignments'][-1]['id']
-        with copy.lock():
-            with self.assertRaises(coordination.CoordinationError):
-                coordination.assignment_started(self.source, task['id'], correction, copy.id, 'codex', [])
-        coordination.use_result(self.source, task['id'], assignment, 'needs-rework', 'second review requires correction')
         self.run_attempt(task, correction, copy, 'succeeded')
         self.assertEqual(copy.path.stat().st_ino, inode)
         lease = self.api().read(copy)
