@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -24,6 +25,22 @@ from codex_deepseek_team import (check_reuse, coordination, delegation_cli,
 from tests import test_coordination as fixtures
 
 LAUNCHER = shutil.which('env') or '/usr/bin/env'
+
+
+def private_python(root: Path, name: str, *, mode: int = 0o700) -> Path:
+    """Return an independently copied interpreter owned by this fixture."""
+    directory = Path(root) / name
+    directory.mkdir()
+    directory.chmod(0o700)
+    executable = directory / 'python'
+    shutil.copyfile(sys.executable, executable)
+    executable.chmod(mode)
+    info = os.lstat(executable)
+    if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+            or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) != mode):
+        raise RuntimeError('fixture interpreter is not an isolated private copy')
+    return executable
 
 
 class CheckReuseCase(unittest.TestCase):
@@ -51,11 +68,13 @@ class CheckReuseCase(unittest.TestCase):
         settings.set_values(self.repo / settings.PROJECT_FILE,
                             delegation_level=75, access='full-access')
         self.copy = workspace.create(self.repo, self.state)
+        self.python = private_python(self.root, 'fixture-python')
         self.counter = self.root / 'counter'
         self.env = {
             'PATH': os.environ.get('PATH', '/usr/local/bin:/usr/bin:/bin'),
             'LANG': 'C.UTF-8',
             'HOME': str(self.root / 'runtime-home'),
+            'PYTHONHOME': sys.base_prefix,
         }
 
     def counter_code(self, *, counter=None, extra=''):
@@ -70,7 +89,7 @@ class CheckReuseCase(unittest.TestCase):
 
     def command(self, *, counter=None, extra='', suffix=''):
         code = self.counter_code(counter=counter, extra=extra)
-        return (f'{shlex.quote(sys.executable)} -c {shlex.quote(code)}' + suffix)
+        return (f'{shlex.quote(str(self.python))} -c {shlex.quote(code)}' + suffix)
 
     def count(self, path=None):
         path = self.counter if path is None else path
@@ -318,7 +337,7 @@ class LayoutIdentityTests(CheckReuseCase):
             "p.write_text(str(int(p.read_text()) + 1) if p.exists() else '1')",
             "sys.stdout.write(Path('input.txt').read_text())",
         ))
-        return f'{shlex.quote(sys.executable)} -c {shlex.quote(code)}'
+        return f'{shlex.quote(str(self.python))} -c {shlex.quote(code)}'
 
     def test_project_bind_layout_suffixes_stay_distinct(self):
         command = self.layout_command()
@@ -427,7 +446,7 @@ class InvalidationTests(CheckReuseCase):
         bindir.mkdir()
         tool = bindir / 'counter-tool'
         # A tiny POSIX launcher keeps the command name stable while its bytes change.
-        tool.write_text('#!/bin/sh\nexec ' + shlex.quote(sys.executable) + ' -c ' +
+        tool.write_text('#!/bin/sh\nexec ' + shlex.quote(str(self.python)) + ' -c ' +
                         shlex.quote(self.counter_code()) + '\n')
         tool.chmod(0o700)
         env = dict(self.env, PATH=str(bindir) + os.pathsep + self.env['PATH'])
@@ -654,6 +673,30 @@ class IneligibleInputTests(CheckReuseCase):
                 directory=self.copy.directory / 'diagnostics', reusable=True)
         self.assertEqual(self.count(), 0)
 
+    def test_unsafe_command_interpreter_is_never_reused_until_safe(self):
+        info = os.lstat(self.python)
+        self.assertTrue(stat.S_ISREG(info.st_mode))
+        self.assertEqual(info.st_nlink, 1)
+        self.assertEqual(info.st_uid, os.geteuid())
+        self.assertEqual(stat.S_IMODE(info.st_mode), 0o700)
+        self.python.chmod(0o775)
+        self.addCleanup(self.python.chmod, 0o700)
+        self.run_checks()
+        unsafe = self.run_checks()
+        self.assertFalse(unsafe[0]['reused'])
+        self.assertEqual(self.count(), 2)
+        self.assertNotIn('check_reuse', self.copy.metadata)
+
+        self.python.chmod(0o700)
+        safe = self.run_checks()
+        reused = self.run_checks()
+        self.assertFalse(safe[0]['reused'])
+        self.assertTrue(reused[0]['reused'])
+        self.assertTrue(reused[0]['reused_from'])
+        self.assertEqual(reused[0]['stdout_path'], safe[0]['stdout_path'])
+        self.assertEqual(self.count(), 3)
+        self.assertEqual(len(self.cache_entries()), 1)
+
     def test_root_owned_system_executable_is_hashable_for_nonroot_workspace(self):
         executable = Path(shutil.which('env') or LAUNCHER)
         if os.stat(executable).st_uid != 0:
@@ -679,7 +722,7 @@ class WorkspaceVerifyCallPathTests(CheckReuseCase):
 
         def select(*unused, **unused_keywords):
             return runtime_preflight.RuntimeSelection(
-                runtime='codex', binary=sys.executable, layout=[LAUNCHER], environment=env)
+                runtime='codex', binary=str(self.python), layout=[LAUNCHER], environment=env)
 
         with mock.patch.object(worker, 'resolve_os_sandbox', return_value=(None, None)), \
                 mock.patch.object(runtime_preflight, 'select_runtime', side_effect=select), \
@@ -751,6 +794,8 @@ class ManagedCheckReuseTests(fixtures.CoordinationCase):
     def setUp(self):
         super().setUp()
         self.copy = workspace.create(self.repo, self.state)
+        self.python = private_python(self.root, 'managed-command-python')
+        self.runtime_python = private_python(self.root, 'managed-runtime-python')
         self.counter = self.root / 'managed-counter'
         self.probe_counter = self.root / 'managed-probe-counter'
         self.check = self.command(self.counter)
@@ -774,7 +819,7 @@ class ManagedCheckReuseTests(fixtures.CoordinationCase):
                 "p.write_text(str(int(p.read_text()) + 1) if p.exists() else '1')")
         if extra:
             code += '\n' + extra
-        return f'{shlex.quote(sys.executable)} -c {shlex.quote(code)}'
+        return f'{shlex.quote(str(self.python))} -c {shlex.quote(code)}'
 
     def count(self, path):
         return int(path.read_text()) if path.exists() else 0
@@ -803,6 +848,7 @@ class ManagedCheckReuseTests(fixtures.CoordinationCase):
             'LANG': 'C.UTF-8',
             'HOME': str(self.root / 'managed-runtime-home'),
             'TMPDIR': str(self.root / 'managed-runtime-tmp'),
+            'PYTHONHOME': sys.base_prefix,
             'DEEPSEEK_API_KEY': 'canary-managed-provider-key',
         }
         self.managed_env = env
@@ -837,13 +883,15 @@ class ManagedCheckReuseTests(fixtures.CoordinationCase):
         with mock.patch.object(worker, 'resolve_os_sandbox', return_value=(None, None)), \
                 mock.patch.object(runtime_preflight, 'select_runtime',
                     return_value=runtime_preflight.RuntimeSelection(
-                        runtime='codex', binary=sys.executable,
+                        runtime='codex', binary=str(self.runtime_python),
                         layout=[LAUNCHER], environment=env)), \
                 mock.patch.object(toolchains, 'probes_for', return_value=[self.probe]), \
                 mock.patch.object(worker, 'load_api_key', return_value='test-provider-key'), \
                 mock.patch.object(worker, 'execute', return_value=(0, result, '')), \
                 mock.patch.object(relay, 'ProviderRelay', Relay):
-            return managed.run(args, self.policy(), worker, self.copy)
+            code = managed.run(args, self.policy(), worker, self.copy)
+        self.copy = workspace.load(self.state, self.copy.id)
+        return code
 
     def test_managed_baseline_post_reuse_uses_real_call_path(self):
         self.assertEqual(self.run_managed(force_checks=False), 0)
@@ -862,6 +910,51 @@ class ManagedCheckReuseTests(fixtures.CoordinationCase):
         self.assertTrue(first['checks'][0]['reused_from'])
         self.assertFalse(self.copy.metadata['baseline_checks'][0]['reused'])
         self.assertTrue(self.copy.metadata['checks'][0]['reused'])
+
+    def correction_of(self, previous):
+        task, assignment = previous
+        coordination.use_result(
+            self.repo, task['id'], assignment, 'needs-rework',
+            'focused test continues in the same logical workspace')
+        return {'task_id': task['id'], 'assignment_id': assignment}
+
+    def run_fresh_managed(self, suffix, expected_count, previous=None):
+        task, assignment = self.make_task(
+            suffix=suffix, check=self.check, checks_reusable=True,
+            correction_of=self.correction_of(previous) if previous else None)
+        self.assertEqual(self.run_managed(task=task, assignment=assignment), 0)
+        self.assertNotIn('check_reuse', self.copy.metadata)
+        self.assertFalse(self.copy.metadata['baseline_checks'][0]['reused'])
+        self.assertFalse(self.copy.metadata['checks'][0]['reused'])
+        self.assertEqual(self.count(self.counter), expected_count)
+        return task, assignment
+
+    def run_reused_managed(self, suffix, expected_count, previous):
+        task, assignment = self.make_task(
+            suffix=suffix, check=self.check, checks_reusable=True,
+            correction_of=self.correction_of(previous))
+        self.assertEqual(self.run_managed(task=task, assignment=assignment), 0)
+        self.assertFalse(self.copy.metadata['baseline_checks'][0]['reused'])
+        self.assertTrue(self.copy.metadata['checks'][0]['reused'])
+        self.assertTrue(self.copy.metadata['checks'][0]['reused_from'])
+        self.assertEqual(self.count(self.counter), expected_count)
+        return task, assignment
+
+    def test_managed_unsafe_command_interpreter_never_reuses_until_safe(self):
+        self.python.chmod(0o775)
+        self.addCleanup(self.python.chmod, 0o700)
+        first = self.run_fresh_managed('unsafe-command-one', 2)
+        second = self.run_fresh_managed('unsafe-command-two', 4, previous=first)
+        self.python.chmod(0o700)
+        self.run_reused_managed('safe-command', 5, previous=second)
+
+    def test_managed_unsafe_runtime_binary_never_reuses_until_safe(self):
+        self.runtime_python.chmod(0o775)
+        self.addCleanup(self.runtime_python.chmod, 0o700)
+        first = self.run_fresh_managed('unsafe-runtime-one', 2)
+        second = self.run_fresh_managed('unsafe-runtime-two', 4, previous=first)
+        self.runtime_python.chmod(0o700)
+        self.run_reused_managed('safe-runtime', 5, previous=second)
 
     def test_managed_force_checks_executes_baseline_and_post(self):
         self.assertEqual(self.run_managed(force_checks=True), 0)
