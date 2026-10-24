@@ -541,6 +541,14 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
             # Closing a newer draft or completed plan must not hide older work.
             if coordination.close_unstarted_task(root, unfinished['id']):
                 continue
+            try:
+                # A saved explicit intent can have completed cleanup before the
+                # first ledger publication. Reconcile before asking for cancel.
+                coordination._reconcile_job_publications(root, unfinished['id'])
+                unfinished = coordination.load_task(root, unfinished['id'])
+            except coordination.CoordinationError as error:
+                reasons.append(unfinished['id'] + ': Finalization recovery refused: ' + str(error))
+                continue
             issues = coordination.validate_task(root, unfinished['id'])
             pending = [a['id'] for a in unfinished.get('assignments', [])
                        if a.get('status') in ('planned', 'running')]

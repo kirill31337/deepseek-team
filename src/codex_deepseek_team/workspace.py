@@ -350,12 +350,15 @@ def changed_since(copy: Workspace, before: dict[str, str]) -> list[str]:
                   if before.get(name) != after.get(name))
 
 
-def create(source: Path, state: Path | None = None) -> Workspace:
+def create(source: Path, state: Path | None = None, *, on_created=None,
+           expected_head: str | None = None) -> Workspace:
     # Preflight committed HEAD before any state directory, copy or fetch exists, so a
     # blocked source names its offenders and never leaves an incomplete retained copy.
     report = check_source(source)
     if not report['eligible']:
         raise WorkspaceError(_blocked_message(report['blockers']))
+    if expected_head is not None and report['head'] != expected_head:
+        raise WorkspaceError('Source HEAD changed since planning; plan a new job before allocation.', 78)
     source = Path(report['source'])
     head = report['head']
     try:
@@ -366,12 +369,12 @@ def create(source: Path, state: Path | None = None) -> Workspace:
     from . import execution_allocation, storage_budget
     try:
         with execution_allocation.checkout(source, head, state), workspace_lifecycle.fence(state):
-            return _create_owned(source, head, state)
+            return _create_owned(source, head, state, on_created=on_created)
     except storage_budget.BudgetError as cause:
         raise WorkspaceError(str(cause), cause.code) from None
 
 
-def _create_owned(source, head, state):
+def _create_owned(source, head, state, *, on_created=None):
     """The caller holds the creation/collection fence before work/ exists."""
     root = state / 'workspaces'
     _private(root, create=True)
@@ -388,6 +391,8 @@ def _create_owned(source, head, state):
         lease = workspace_lifecycle.initialize(copy)
         metadata['job_id'] = lease['job_id']
         copy.save()
+        if on_created is not None:
+            on_created(copy)
         git(work, 'init', '-q', '--template=', '-b', 'deepseek/' + copy.id)
         # Fetch exactly the preflighted commit: a concurrent HEAD move cannot swap the tree.
         git(work, 'fetch', '-q', '--depth=1', '--no-tags', '--no-recurse-submodules',

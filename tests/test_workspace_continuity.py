@@ -150,27 +150,6 @@ class WorkspaceContinuityTests(LifecycleFixture):
         return (copy.directory / 'lease.json').read_bytes()
 
     @contextlib.contextmanager
-    def fake_finalizer(self):
-        """Publish a terminal lease without requiring the capture namespace."""
-        def finalize(copy, *, reason='accepted', cancelled=False, orphan=False,
-                     before_finalize=None):
-            if before_finalize is not None:
-                before_finalize()
-            lease = workspace_lifecycle.read(copy) or workspace_lifecycle.initialize(copy)
-            if lease['phase'] not in workspace_lifecycle.FINAL_PHASES:
-                lease['phase'] = 'cancelled' if cancelled else 'finalized'
-                lease['final_reason'] = reason
-                lease['events'].append({
-                    'event': lease['phase'], 'at': 1.0, 'reason': reason})
-                workspace_lifecycle.write(copy, lease)
-            return {'id': copy.id, 'job_id': lease['job_id'],
-                    'action': 'already-cleaned', 'reason': reason,
-                    'allocated_bytes': 0, 'inodes': 0}
-
-        with mock.patch.object(workspace_gc, 'finalize', side_effect=finalize):
-            yield
-
-    @contextlib.contextmanager
     def local_finalizer(self):
         """Exercise real cleanup while stubbing only the namespace capture bytes."""
         with mock.patch.object(workspace_gc, '_capture',
@@ -520,7 +499,7 @@ class WorkspaceContinuityTests(LifecycleFixture):
             self.source, correction_task['id'], correction, 'incorporated',
             'cross-task correction accepted')
 
-        with self.fake_finalizer():
+        with self.local_finalizer():
             finalized = coordination.finalize_assignment(
                 self.source, correction_task['id'], correction,
                 'latest cross-task correction finalized')
@@ -686,7 +665,7 @@ class WorkspaceContinuityTests(LifecycleFixture):
         coordination.use_result(
             self.source, task['id'], assignment, 'incorporated',
             'accepted after review')
-        with self.fake_finalizer():
+        with self.local_finalizer():
             finalized = coordination.finalize_assignment(
                 self.source, task['id'], assignment, 'job closed explicitly')
         self.assertTrue(self.assignment_row(finalized, assignment)['job_finalization'])
@@ -695,7 +674,7 @@ class WorkspaceContinuityTests(LifecycleFixture):
             self.source, task['id'], assignment, 'repeat is idempotent')
         self.assertEqual(
             coordination._task_path(self.source, task['id']).read_bytes(), before_repeat)
-        shutil.rmtree(copy.path)
+        self.assertFalse(copy.path.exists())
         independent = self.correction_plan(
             task['id'], None, identifier='new-job', scope='app.txt')
         planned = coordination.plan_task(self.source, task['id'], independent)

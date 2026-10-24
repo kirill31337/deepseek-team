@@ -310,6 +310,10 @@ def completion_issues(task):
     for row in task.get('assignments', []):
         if row.get('job_id'):
             current_jobs[row['job_id']] = row
+        elif (isinstance(row.get('workspace_id'), str)
+              and re.fullmatch('[0-9a-f]{32}', row['workspace_id'])):
+            # An incomplete identity is not proof that an owned job is closed.
+            current_jobs[('workspace', row['workspace_id'])] = row
     for row in current_jobs.values():
         if not row.get('job_finalization'):
             issues.append(f"{row['id']}: logical job requires explicit finalize or cancel")
@@ -424,8 +428,9 @@ def _requested_executor(item: dict) -> str:
 
 
 def _started_deliverable_ids(task: dict) -> set[str]:
+    # A preparation binding freezes identity without claiming execution began.
     started = {row["deliverable_id"] for row in task.get("assignments", [])
-               if row.get("status") != "planned"}
+               if row.get("status") != "planned" or row.get('job_id')}
     started.update(item["id"] for item in task.get("deliverables", [])
                    if item.get("routing_feedback") or item.get("result")
                    or item.get("native_dispatches") or 'result_invalidated_at' in item)
@@ -690,6 +695,21 @@ def _correction_workspace(root: Path, task: dict, reference: dict, *,
         prestart_failure = (continuation_row.get('status') == 'failed'
                             and continuation_row.get('failure_stage') == 'preparation'
                             and not continuation_row.get('attempt_id'))
+    preparing_id = bound_assignment or continuation_assignment or start_assignment
+    preparation_reserved = False
+    if preparing_id is not None:
+        preparing_row = _assignment(task, preparing_id)
+        preparing_binding = {'task_id': task['id'], 'assignment_id': preparing_id}
+        history = lease.get('binding_history', [])
+        preparation_reserved = bool(
+            preparing_row.get('status') in ('planned', 'failed')
+            and not preparing_row.get('attempt_id')
+            and preparing_row.get('workspace_id') in (None, identifier)
+            and preparing_row.get('job_id') in (None, lease['job_id'])
+            and lease.get('binding') == preparing_binding
+            and isinstance(history, list) and len(history) >= 2
+            and history[-2:] == [expected_binding, preparing_binding]
+            and not lease.get('pending_attempt'))
     continuation_reserved = False
     if continuation_row is not None and not prestart_failure:
         current_attempt_id = continuation_row.get('attempt_id')
@@ -708,9 +728,12 @@ def _correction_workspace(root: Path, task: dict, reference: dict, *,
             pending_binding == {'task_id': task['id'],
                                 'assignment_id': continuation_assignment}
             or running_reservation)
-    bound_to_current = ((bound_assignment is not None or continuation_assignment is not None)
-                        and not prestart_failure)
-    if bound_assignment is not None:
+    bound_to_current = (preparation_reserved or
+                        ((bound_assignment is not None or continuation_assignment is not None)
+                         and not prestart_failure))
+    if preparation_reserved:
+        expected_binding = preparing_binding
+    elif bound_assignment is not None:
         expected_binding = {'task_id': task['id'], 'assignment_id': bound_assignment}
         current_row = _assignment(task, bound_assignment)
         current_attempt_id = current_row.get('attempt_id')
@@ -773,7 +796,7 @@ def _correction_workspace(root: Path, task: dict, reference: dict, *,
         raise CoordinationError(
             'Correction predecessor workspace does not retain a successful result; inspect it before recovery.',
             64)
-    if bound_to_current and copy.metadata.get('status') not in ('running', 'succeeded', 'failed'):
+    if bound_to_current and copy.metadata.get('status') not in ('ready', 'running', 'succeeded', 'failed'):
         raise CoordinationError(
             'Correction workspace is not in a resumable execution state.', 64)
     try:
@@ -829,95 +852,257 @@ def _logical_job_chain(root: Path, task_id: str, assignment_id: str):
         row = _assignment(task, reference['assignment_id'])
 
 
+def _finalization_request(request, root, task_id, assignment_id, copy, lease,
+                          cancelled):
+    """Validate both the old bounded intent and the fully identified new form."""
+    if (not isinstance(request, dict)
+            or type(request.get('cancelled')) is not bool
+            or request['cancelled'] != cancelled
+            or request.get('workspace_id') != copy.id
+            or not isinstance(request.get('evidence'), str)
+            or not request['evidence'].strip()
+            or type(request.get('at')) not in (int, float)
+            or not math.isfinite(request['at'])):
+        raise CoordinationError('Finalization intent is missing or conflicts with this job.', 73)
+    expected = {'project': str(root), 'task_id': task_id,
+                'assignment_id': assignment_id, 'job_id': lease['job_id']}
+    if any(key in request and request[key] != value for key, value in expected.items()):
+        raise CoordinationError('Finalization intent identity does not match this job.', 73)
+
+
+def _cleaned_job_evidence(copy, lease):
+    """Validate retained evidence without trusting a missing execution tree."""
+    from . import workspace_gc, workspace_lifecycle as lifecycle
+
+    cleanup = lease.get('cleanup')
+    if (not isinstance(cleanup, dict) or cleanup.get('state') != 'cleaned'
+            or (cleanup.get('device'), cleanup.get('inode')) !=
+               (lease['work_device'], lease['work_inode'])
+            or not re.fullmatch('[0-9a-f]{32}', str(cleanup.get('name', '')))):
+        raise CoordinationError('Logical job has no matching completed cleanup intent.', 73)
+    extras = cleanup.get('extras', [])
+    if not isinstance(extras, list) or any(not workspace_gc._valid_extra(e) for e in extras):
+        raise CoordinationError('Logical job cleanup environment history is malformed.', 73)
+    with lifecycle.directory(copy) as fd:
+        if lifecycle._exists(fd, 'work') or any(
+                workspace_gc._extra_name(name) for name in os.listdir(fd)):
+            raise CoordinationError('Cleaned job has replacement execution data; history preserved.', 73)
+        raw = lifecycle.read_file(fd, 'result.json')
+        try:
+            result = json.loads(raw)
+            patch = result['patch']
+            if (result.get('schema') != 1 or result.get('workspace_id') != copy.id
+                    or result.get('source') != str(copy.source)
+                    or result.get('job_id', lease['job_id']) != lease['job_id']
+                    or result.get('base_head') != (copy.metadata.get('base_head') or
+                                                  copy.metadata.get('source_head'))
+                    or patch.get('file') != 'changes.patch'):
+                raise ValueError()
+            contents = lifecycle.read_file(fd, 'changes.patch', maximum=workspace_gc.MAX_PATCH_BYTES)
+            if (contents is None or patch.get('bytes') != len(contents)
+                    or patch.get('sha256') != hashlib.sha256(contents).hexdigest()):
+                raise ValueError()
+        except (ValueError, TypeError, KeyError, AttributeError):
+            raise CoordinationError('Retained result does not identify the cleaned logical job.', 73) from None
+    state = copy.directory.parent.parent
+    with lifecycle.fence(state) as (root_fd, _):
+        if lifecycle._exists(root_fd, 'quarantine'):
+            qfd = state_storage.open_private_directory(state / 'quarantine', parent=root_fd)
+            try:
+                if any(lifecycle._exists(qfd, e['name']) for e in [cleanup, *extras]):
+                    raise CoordinationError('Cleaned job still has quarantined execution data.', 73)
+            finally:
+                os.close(qfd)
+
+
+def _preparation_only_history(copy, lease):
+    """Accept actual preparation attempts without fabricating execution history."""
+    attempts = lease['attempts']
+    if any(entry.get('operation') != 'preparation' or entry.get('status') == 'running'
+           for entry in attempts):
+        return False
+    count = copy.metadata.get('attempt', 0)
+    if type(count) is not int or count != len(attempts):
+        return False
+    expected = attempts[-1]['id'] if attempts else None
+    return (copy.metadata.get('attempt_id') == expected
+            and (not attempts or copy.metadata.get('operation') == 'preparation'))
+
+
+def _finalization_authority(root, task_id, assignment_id, copy, *,
+                            cancelled=None, recover_binding=False):
+    """Resolve publication authority before cleanup and again before publication.
+
+    Caller holds the owner lock, lifecycle fence and project ledger lock. A
+    proposed legacy binding is returned in memory; nothing is repaired until
+    every identity and history check has succeeded.
+    """
+    from . import workspace_lifecycle as lifecycle
+
+    task = load_task(root, task_id)
+    row = _assignment(task, assignment_id)
+    lease = lifecycle.read(copy)
+    if (task.get('id') != task_id or not _task_belongs_to(task, root)
+            or copy.source.resolve() != root):
+        raise CoordinationError('Logical job belongs to another project/task.', 78)
+    if (lease is None or row.get('workspace_id') != copy.id
+            or row.get('job_id') != lease['job_id']
+            or copy.metadata.get('job_id') != lease['job_id']
+            or copy.metadata.get('work_inode') != lease['work_inode']):
+        raise CoordinationError('Logical job workspace/job identity does not match.', 73)
+    lifecycle.authorize_finalization(lease)
+    terminal = lease['phase'] in lifecycle.FINAL_PHASES
+    if terminal:
+        if cancelled is not None and (lease['phase'] == 'cancelled') != cancelled:
+            raise CoordinationError('Finalization cannot change the original terminal decision.', 73)
+        if lease.get('cleanup', {}).get('state') == 'cleaned':
+            _cleaned_job_evidence(copy, lease)
+    binding = lease.get('binding')
+    repaired = False
+    if binding is None:
+        # This narrowly repairs the historical pre-model failure. Derive the
+        # candidate from durable metadata, never from the supplied assignment ID.
+        candidate = {'task_id': copy.metadata.get('coord_task'),
+                     'assignment_id': copy.metadata.get('coord_assignment')}
+        if (not recover_binding or candidate != {'task_id': task_id, 'assignment_id': assignment_id}
+                or row.get('status') != 'failed' or row.get('failure_stage') != 'preparation'
+                or row.get('attempt_id') or row.get('started_at') or row.get('execution_snapshot')
+                or not _preparation_only_history(copy, lease)
+                or lease.get('pending_attempt')
+                or row.get('attempt_history')
+                or lease.get('binding_history', []) not in ([], [candidate])
+                or (terminal and (lease['phase'] != 'cancelled'
+                    or lease.get('cleanup', {}).get('state') != 'cleaned'))):
+            raise CoordinationError('Missing binding has insufficient or conflicting preparation evidence.', 73)
+        if terminal:
+            _finalization_request(row.get('job_finalization_request'), root, task_id,
+                                  assignment_id, copy, lease, True)
+        lease = dict(lease)
+        lifecycle._record_binding(lease, candidate)
+        binding, repaired = candidate, True
+    if (not isinstance(binding, dict) or set(binding) != {'task_id', 'assignment_id'}
+            or not _CORRECTION_TASK_ID.fullmatch(str(binding.get('task_id', '')))
+            or not _CORRECTION_ASSIGNMENT_ID.fullmatch(str(binding.get('assignment_id', '')))):
+        raise CoordinationError('Logical job has no authoritative assignment binding.', 73)
+    metadata_binding = {'task_id': copy.metadata.get('coord_task'),
+                        'assignment_id': copy.metadata.get('coord_assignment')}
+    if any(value is not None for value in metadata_binding.values()) and metadata_binding != binding:
+        raise CoordinationError('Workspace metadata conflicts with the authoritative assignment binding.', 73)
+    chain = _logical_job_chain(root, binding['task_id'], binding['assignment_id'])
+    if (task_id, assignment_id) not in chain:
+        raise CoordinationError('Requested assignment is not in this logical job lineage.', 64)
+    history = lease.get('binding_history', [])
+    chronological = [{'task_id': t, 'assignment_id': a} for t, a in reversed(chain)]
+    if not isinstance(history, list) or (history and history != chronological[-len(history):]):
+        raise CoordinationError('Logical job binding history conflicts with its lineage.', 73)
+    known = {entry['id'] for entry in lease['attempts']}
+    pending = lease.get('pending_attempt')
+    if pending is not None:
+        if (not isinstance(pending, dict) or set(pending) != {'task_id', 'assignment_id', 'id'}
+                or any(pending.get(k) != v for k, v in binding.items())
+                or not re.fullmatch('[0-9a-f]{32}', str(pending.get('id', '')))):
+            raise CoordinationError('Logical job has conflicting execution reservation history.', 73)
+        known.add(pending['id'])
+    if copy.metadata.get('attempt_id') and copy.metadata['attempt_id'] not in known:
+        raise CoordinationError('Workspace execution identity is absent from the job history.', 73)
+    for chain_task_id, chain_assignment_id in chain:
+        chain_task = load_task(root, chain_task_id)
+        chain_row = _assignment(chain_task, chain_assignment_id)
+        if chain_task.get('id') != chain_task_id or not _task_belongs_to(chain_task, root):
+            raise CoordinationError('Logical job lineage belongs to another project/task.', 78)
+        if chain_task.get('base_head') != (copy.metadata.get('base_head') or copy.metadata.get('source_head')):
+            raise CoordinationError('Logical job lineage has a conflicting source baseline.', 73)
+        attempts = chain_row.get('attempt_history', [])
+        if not isinstance(attempts, list):
+            raise CoordinationError('Logical job assignment history is malformed.', 73)
+        snapshots = [chain_row, *attempts]
+        for snapshot in snapshots:
+            if (not isinstance(snapshot, dict)
+                    or snapshot.get('workspace_id') not in (None, copy.id)
+                    or snapshot.get('job_id') not in (None, lease['job_id'])
+                    or (snapshot.get('attempt_id') and snapshot['attempt_id'] not in known)):
+                raise CoordinationError('Logical job assignment/attempt history conflicts with its lease.', 73)
+            context = snapshot.get('execution_snapshot')
+            if context is not None:
+                execution = context.get('execution') if isinstance(context, dict) else None
+                if (not isinstance(execution, dict)
+                        or execution.get('workspace_id') not in (None, copy.id)
+                        or execution.get('job_id') not in (None, lease['job_id'])
+                        or (execution.get('attempt_id') and execution['attempt_id'] not in known)):
+                    raise CoordinationError('Execution snapshot conflicts with the logical job history.', 73)
+        if chain_row.get('workspace_id') != copy.id or chain_row.get('job_id') != lease['job_id']:
+            raise CoordinationError('Logical job lineage changed workspace/job identity.', 73)
+        publication = chain_row.get('job_finalization')
+        if publication is not None:
+            decision = (lease['phase'] == 'cancelled') if terminal else bool(cancelled)
+            if (not isinstance(publication, dict)
+                    or publication.get('id') != copy.id
+                    or publication.get('job_id') != lease['job_id']
+                    or publication.get('workspace_id', copy.id) != copy.id
+                    or publication.get('cancelled', decision) != decision
+                    or publication.get('action') not in ('cleaned', 'already-cleaned')):
+                raise CoordinationError('Existing finalization conflicts with this logical job.', 73)
+        request = chain_row.get('job_finalization_request')
+        if request is not None:
+            decision = (lease['phase'] == 'cancelled') if terminal else bool(cancelled)
+            _finalization_request(request, root, chain_task_id, chain_assignment_id,
+                                  copy, lease, decision)
+    return lease, chain, repaired
+
+
 def _publish_job_finalization(root: Path, task_id: str, assignment_id: str,
                               report: dict) -> None:
-    """Idempotently publish one terminal lease across its authoritative lineage."""
-    from . import workspace, workspace_gc, workspace_lifecycle
+    """Publish only a validated, cleaned job; interrupted publication is replayable."""
+    from . import workspace, workspace_gc, workspace_lifecycle as lifecycle
 
     if not isinstance(report, dict):
         raise CoordinationError('Logical job finalization publication is malformed.', 73)
-    project_root = _project_root(root)
-    task = load_task(project_root, task_id)
-    row = _assignment(task, assignment_id)
-    workspace_id = (row.get('workspace_id') or report.get('workspace_id')
-                    or report.get('id'))
-    if not isinstance(workspace_id, str) or not re.fullmatch('[0-9a-f]{32}', workspace_id):
-        raise CoordinationError('Logical job finalization has no execution workspace.', 73)
-    if report.get('id') not in (None, workspace_id):
-        raise CoordinationError('Logical job finalization workspace does not match.', 73)
+    root = _project_root(root)
+    row = _assignment(load_task(root, task_id), assignment_id)
+    identifier = row.get('workspace_id')
     try:
-        copy = workspace_gc._load_record(_state_root(), workspace_id)
-        if copy.source.resolve() != project_root:
-            raise CoordinationError('Logical job workspace belongs to another project.', 78)
-        lease = workspace_lifecycle.read(copy)
-    except workspace.WorkspaceError as error:
+        copy = workspace_gc._load_record(_state_root(), identifier)
+        with ExitStack() as owned:
+            with lifecycle.fence(_state_root()):
+                owned.enter_context(workspace_gc._owner(copy))
+            with lifecycle.fence(_state_root()), _lock(root):
+                lease, chain, _ = _finalization_authority(root, task_id, assignment_id, copy)
+                if lease['phase'] not in lifecycle.FINAL_PHASES:
+                    raise CoordinationError('Logical job is not finalized; publication is deferred.', 75)
+                _cleaned_job_evidence(copy, lease)
+                for key, value in (('id', copy.id), ('workspace_id', copy.id),
+                                   ('job_id', lease['job_id'])):
+                    if key in report and report[key] != value:
+                        raise CoordinationError('Finalization publication belongs to another logical job.', 73)
+                if report.get('cancelled', lease['phase'] == 'cancelled') != (lease['phase'] == 'cancelled'):
+                    raise CoordinationError('Finalization publication changes the terminal decision.', 73)
+                existing_reports, requests = [], []
+                for chain_task_id, chain_assignment_id in chain:
+                    chain_row = _assignment(load_task(root, chain_task_id), chain_assignment_id)
+                    if chain_row.get('job_finalization') is not None:
+                        existing_reports.append(chain_row['job_finalization'])
+                    if chain_row.get('job_finalization_request') is not None:
+                        requests.append(chain_row['job_finalization_request'])
+                if not existing_reports and not requests:
+                    raise CoordinationError('Logical job has no explicit finalization intent.', 73)
+                publication = dict(existing_reports[0] if existing_reports else report)
+                publication.update(id=copy.id, job_id=lease['job_id'])
+                publication.setdefault('cancelled', lease['phase'] == 'cancelled')
+                publication.setdefault('at', time.time())
+                for chain_task_id, chain_assignment_id in chain:
+                    chain_task = load_task(root, chain_task_id)
+                    chain_row = _assignment(chain_task, chain_assignment_id)
+                    changed = False
+                    if chain_row.get('job_finalization') is None:
+                        chain_row['job_finalization'] = dict(publication)
+                        changed = True
+                    if chain_row.pop('job_finalization_request', None) is not None:
+                        changed = True
+                    if changed:
+                        chain_task['updated_at'] = time.time()
+                        _atomic(_task_path(root, chain_task_id), chain_task)
+    except (workspace.WorkspaceError, state_storage.StorageError) as error:
         raise CoordinationError(str(error), error.code) from None
-    if lease is None:
-        raise CoordinationError('Logical job finalization has no durable lease.', 73)
-    if lease['phase'] not in workspace_lifecycle.FINAL_PHASES:
-        raise CoordinationError('Logical job is not finalized; publication is deferred.', 75)
-    binding = lease.get('binding')
-    if (not isinstance(binding, dict) or set(binding) != {'task_id', 'assignment_id'}):
-        raise CoordinationError('Finalized logical job has no authoritative assignment binding.', 73)
-    try:
-        binding_task = load_task(project_root, binding['task_id'])
-        _assignment(binding_task, binding['assignment_id'])
-    except CoordinationError as error:
-        raise CoordinationError(
-            'Finalized logical job binding is unavailable: ' + error.message, error.code) from None
-    if not _task_belongs_to(binding_task, project_root):
-        raise CoordinationError('Finalized logical job binding belongs to another project.', 78)
-    chain = _logical_job_chain(
-        project_root, binding['task_id'], binding['assignment_id'])
-    if (task_id, assignment_id) not in chain:
-        raise CoordinationError(
-            'Requested assignment is not an authoritative predecessor of this logical job.', 64)
-    known_attempts = {
-        entry.get('id') for entry in lease.get('attempts', [])
-        if isinstance(entry, dict)}
-    if lease.get('pending_attempt'):
-        known_attempts.add(lease['pending_attempt'].get('id'))
-    rows = []
-    for chain_task_id, chain_assignment_id in chain:
-        chain_task = (task if chain_task_id == task['id']
-                      else load_task(project_root, chain_task_id))
-        chain_row = _assignment(chain_task, chain_assignment_id)
-        if (chain_row.get('job_id') != lease['job_id']
-                or chain_row.get('workspace_id') != workspace_id):
-            raise CoordinationError(
-                'Correction lineage no longer matches the finalized logical job.', 64)
-        attempt_id = chain_row.get('attempt_id')
-        if attempt_id and attempt_id not in known_attempts:
-            raise CoordinationError(
-                'Correction lineage attempt is not in the finalized job lease.', 64)
-        rows.append((chain_task_id, chain_assignment_id))
-
-    publication = dict(report)
-    publication['id'] = workspace_id
-    publication['job_id'] = lease['job_id']
-    publication.setdefault('at', time.time())
-    for chain_task_id, chain_assignment_id in rows:
-        with _lock(project_root):
-            chain_task = load_task(project_root, chain_task_id)
-            chain_row = _assignment(chain_task, chain_assignment_id)
-            if (chain_row.get('job_id') != lease['job_id']
-                    or chain_row.get('workspace_id') != workspace_id):
-                raise CoordinationError(
-                    'Correction lineage changed during finalization publication.', 75)
-            existing = chain_row.get('job_finalization')
-            changed = False
-            if existing is None:
-                chain_row['job_finalization'] = dict(publication)
-                changed = True
-            elif (existing.get('job_id') not in (None, lease['job_id'])
-                  or existing.get('id') not in (None, workspace_id)):
-                raise CoordinationError(
-                    'Existing finalization publication belongs to another logical job.', 73)
-            if chain_row.pop('job_finalization_request', None) is not None:
-                changed = True
-            if changed:
-                chain_task['updated_at'] = time.time()
-                _atomic(_task_path(project_root, chain_task_id), chain_task)
 
 
 def _reconcile_job_publications(root: Path, task_id: str) -> None:
@@ -942,6 +1127,13 @@ def _reconcile_job_publications(root: Path, task_id: str) -> None:
         except workspace.WorkspaceError:
             continue
         if lease is None or lease['phase'] not in workspace_lifecycle.FINAL_PHASES:
+            continue
+        request = row.get('job_finalization_request')
+        if request is not None:
+            if not isinstance(request, dict):
+                raise CoordinationError('Malformed saved finalization intent; history preserved.', 73)
+            finalize_assignment(project_root, task_id, row['id'],
+                request.get('evidence'), cancelled=request.get('cancelled'))
             continue
         binding = lease.get('binding')
         if (not isinstance(binding, dict)
@@ -1076,6 +1268,8 @@ def validate_assignment_start(root: Path, task_id: str, assignment_id: str, *,
     """Validate continuity before a managed launch allocates or probes anything."""
     task = load_task(root, task_id)
     row = _assignment(task, assignment_id)
+    if row.get('job_finalization_request'):
+        raise CoordinationError('Logical job has a pending finalization intent; finish or explicitly cancel it before execution.', 73)
     item = assignment_deliverable(task, assignment_id)
     if item.get('correction_of') is not None:
         return resolve_correction_workspace(
@@ -1296,9 +1490,10 @@ def plan_task(root: Path, task_id: str, plan: dict) -> dict:
                 raise CoordinationError(error.message, error.code) from None
             previous = {a["deliverable_id"]: a for a in task.get("assignments", [])}
             incoming_ids = {item["id"] for item in deliverables}
+            started = _started_deliverable_ids(task)
             historical_missing = [
                 row["deliverable_id"] for row in task.get("assignments", [])
-                if row.get("status") not in ("planned",) and row.get("deliverable_id") not in incoming_ids
+                if row.get('deliverable_id') in started and row.get("deliverable_id") not in incoming_ids
             ]
             historical_missing.extend(item['id'] for item in task.get('deliverables', [])
                                       if (item.get('routing_feedback') or item.get('result')
@@ -1313,14 +1508,14 @@ def plan_task(root: Path, task_id: str, plan: dict) -> dict:
             for item in deliverables:
                 prior = previous.get(item["id"])
                 if item["executor"] != "worker":
-                    if prior and prior.get("status") != "planned":
+                    if prior and prior.get('deliverable_id') in started:
                         raise CoordinationError(
                             "Plan revision cannot reassign a started/completed DeepSeek worker deliverable; "
                             "add a new deliverable id for the native/coordinator scope.", 64)
                     continue
                 if item["id"] in previous:
                     prior_assignment = previous[item["id"]]
-                    if prior_assignment.get('status') == 'planned':
+                    if prior_assignment.get('status') == 'planned' and item['id'] not in started:
                         if item.get('correction_of') is None:
                             prior_assignment.pop('correction_of', None)
                         else:
@@ -1836,6 +2031,61 @@ def sync_lessons_feedback(root: Path, task_id: str) -> None:
             _atomic(_task_path(root, task_id), task)
 
 
+def assignment_preparing(root: Path, task_id: str, assignment_id: str, copy) -> dict:
+    """Bind an owned allocation before fallible preparation, without a start.
+
+    The caller holds the copy owner lock, or the creation fence for a newly
+    allocated copy. Association and execution have separate durable histories.
+    """
+    from . import workspace, workspace_lifecycle
+
+    root = _project_root(root)
+    with workspace_lifecycle.fence(copy.directory.parent.parent), _lock(root):
+        task = load_task(root, task_id)
+        row = _assignment(task, assignment_id)
+        item = assignment_deliverable(task, assignment_id)
+        if row.get('job_finalization_request'):
+            raise CoordinationError('Logical job has a pending finalization intent; preparation cannot resume.', 73)
+        if task.get('id') != task_id or not _task_belongs_to(task, root):
+            raise CoordinationError('Preparation task belongs to another project.', 78)
+        _check_assignment_access(root, task, item)
+        if row.get('status') not in ('planned', 'failed', 'running') or row.get('job_finalization'):
+            raise CoordinationError('Assignment cannot prepare a finalized or completed job.', 73)
+        if copy.source.resolve() != root:
+            raise CoordinationError('Preparation workspace belongs to another project.', 78)
+        try:
+            lease = workspace_lifecycle.read(copy)
+            if (lease is None or copy.metadata.get('job_id') != lease['job_id']
+                    or copy.metadata.get('work_inode') != lease['work_inode']
+                    or row.get('workspace_id') not in (None, copy.id)
+                    or row.get('job_id') not in (None, lease['job_id'])
+                    or (copy.metadata.get('base_head') or copy.metadata.get('source_head'))
+                       != task.get('base_head')):
+                raise CoordinationError('Preparation workspace/job identity does not match.', 73)
+            reference = item.get('correction_of')
+            if reference is not None:
+                # Validate the predecessor before moving its authoritative binding.
+                _correction_workspace(root, task, reference, explicit_workspace=copy.id,
+                    start_assignment=assignment_id,
+                    continuation_assignment=(assignment_id if row.get('status') in
+                                             ('failed', 'running') else None))
+            lease = workspace_lifecycle.bind_assignment(
+                copy, task_id, assignment_id, previous_binding=reference)
+        except workspace.WorkspaceError as cause:
+            raise CoordinationError(str(cause), cause.code) from None
+        copy.metadata.update(coord_task=task_id, coord_assignment=assignment_id,
+                             standalone_job=False)
+        copy.save()
+        if row.get('workspace_id') == copy.id and row.get('job_id') == lease['job_id']:
+            return task
+        row.update(workspace_id=copy.id, job_id=lease['job_id'])
+        if reference is not None:
+            row['correction_of'] = dict(reference)
+        task['updated_at'] = time.time()
+        _atomic(_task_path(root, task_id), task)
+        return task
+
+
 def assignment_started(root: Path, task_id: str, assignment_id: str,
                        workspace_id: str, runtime: str,
                        prepared_changes: list[str], effort: str | None = None,
@@ -1877,6 +2127,8 @@ def assignment_started(root: Path, task_id: str, assignment_id: str,
                     'A logical job continuation must reuse its original workspace.', 64)
             if row.get('job_finalization'):
                 raise CoordinationError('This logical job was finalized; plan a new job.', 73)
+        if row.get('job_finalization_request'):
+            raise CoordinationError('Logical job has a pending finalization intent; execution cannot start.', 73)
         _check_assignment_access(root, task, item)
 
         copy = None
@@ -2269,7 +2521,16 @@ def assignment_preparation_failed(root: Path, task_id: str, assignment_id: str,
                     raise CoordinationError('Preparation workspace belongs to another project.', 78)
                 lease = workspace_lifecycle.read(copy)
                 if lease:
-                    identity = lease['job_id'], None
+                    expected = {'task_id': task_id, 'assignment_id': assignment_id}
+                    metadata_binding = {'task_id': copy.metadata.get('coord_task'),
+                                        'assignment_id': copy.metadata.get('coord_assignment')}
+                    if (lease.get('binding') == expected
+                            or (lease.get('binding') is None and metadata_binding == expected)):
+                        identity = lease['job_id'], None
+                    else:
+                        # A refused association must not attach an unrelated
+                        # standalone/predecessor copy merely from the CLI ID.
+                        workspace_id = None
             except workspace.WorkspaceError as error:
                 raise CoordinationError(str(error), error.code) from None
     with _lock(root):
@@ -2458,6 +2719,7 @@ def finalize_assignment(root: Path, task_id: str, assignment_id: str,
     if not isinstance(evidence, str) or not evidence.strip():
         raise CoordinationError('Final job acceptance requires evidence.', 64)
     from . import workspace, workspace_gc, workspace_lifecycle
+    root = _project_root(root)
     task = load_task(root, task_id)
     row = _assignment(task, assignment_id)
     if row.get('job_finalization'):
@@ -2472,34 +2734,44 @@ def finalize_assignment(root: Path, task_id: str, assignment_id: str,
     identifier = row.get('workspace_id')
     if not isinstance(identifier, str) or not re.fullmatch('[0-9a-f]{32}', identifier):
         raise CoordinationError('Assignment has no verified owned execution copy.', 64)
+    cancelled = bool(cancelled or disposition == 'rejected')
     try:
         copy = workspace_gc._load_record(_state_root(), identifier)
         if copy.source.resolve() != _project_root(root):
             raise CoordinationError('Assignment workspace belongs to another project.', 78)
         def attest():
-            lease = workspace_lifecycle.read(copy)
-            binding = lease.get('binding') if lease else None
-            if binding and binding != {'task_id': task_id, 'assignment_id': assignment_id}:
-                raise CoordinationError('Finalize the latest correction assignment of this logical job.', 64)
             with _lock(root):
                 current = load_task(root, task_id)
                 actual = _assignment(current, assignment_id)
-                if actual.get('job_finalization'):
-                    return
                 decision = (actual.get('disposition') or {}).get('kind')
                 if (actual.get('workspace_id') != identifier
                         or actual.get('status') not in ('succeeded', 'failed')
+                        or decision != disposition
                         or decision is None or (decision == 'needs-rework' and not cancelled)):
                     raise CoordinationError('Final review changed before acceptance; execution copy preserved.', 75)
-                actual['job_finalization_request'] = {
-                    'at': time.time(), 'evidence': evidence[:2000], 'cancelled': bool(cancelled),
-                    'workspace_id': identifier}
-                _atomic(_task_path(root, task_id), current)
+                lease, _chain, repaired = _finalization_authority(
+                    root, task_id, assignment_id, copy,
+                    cancelled=cancelled, recover_binding=True)
+                if lease['binding'] != {'task_id': task_id, 'assignment_id': assignment_id}:
+                    raise CoordinationError('Finalize the latest correction assignment of this logical job.', 64)
+                if repaired:
+                    workspace_lifecycle.write(copy, lease)
+                if actual.get('job_finalization_request') is None and not actual.get('job_finalization'):
+                    actual['job_finalization_request'] = {
+                        'at': time.time(), 'evidence': evidence[:2000], 'cancelled': cancelled,
+                        'project': str(root), 'task_id': task_id, 'assignment_id': assignment_id,
+                        'workspace_id': identifier, 'job_id': lease['job_id']}
+                    current['updated_at'] = time.time()
+                    _atomic(_task_path(root, task_id), current)
         report = workspace_gc.finalize(copy, reason=evidence[:1000],
-            cancelled=cancelled or disposition == 'rejected', before_finalize=attest)
-    except workspace.WorkspaceError as cause:
+            cancelled=cancelled, before_finalize=attest)
+    except (workspace.WorkspaceError, state_storage.StorageError) as cause:
         raise CoordinationError(str(cause), cause.code) from None
-    publication = dict(report, at=time.time(), evidence=evidence[:2000])
+    lease = workspace_lifecycle.read(copy)
+    request = _assignment(load_task(root, task_id), assignment_id).get('job_finalization_request')
+    publication = dict(report, at=request['at'] if request else time.time(),
+        evidence=request['evidence'] if request else evidence[:2000],
+        job_id=lease['job_id'], cancelled=lease['phase'] == 'cancelled')
     _publish_job_finalization(root, task_id, assignment_id, publication)
     return load_task(root, task_id)
 

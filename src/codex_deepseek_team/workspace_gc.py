@@ -419,15 +419,12 @@ def _finalize(copy, *, reason, cancelled, orphan, owner_fd, before_finalize):
                 raise lifecycle.error('A live logical job lease protects this workspace.', 75)
             if orphan and _pending_assignment(copy, lease):
                 raise lifecycle.error('A current review/retry queue protects this logical job.', 75)
-            if (lease and lease['phase'] not in lifecycle.FINAL_PHASES
-                    and lifecycle.identity_state(lease['owner']) == 'unknown'):
-                raise lifecycle.error('Job owner is in an unobservable process namespace; copy preserved.', 75)
-            if (lease and lifecycle.live(lease) and lease['owner'] != lifecycle.owner_identity()
-                    and not lifecycle.owner_authorizes_process(lease['owner'])):
-                raise lifecycle.error('Another coordinator owns this job; cannot finalize it.', 75)
-            if before_finalize is not None:
-                before_finalize()
+            lifecycle.authorize_finalization(lease)
             if lease and lease.get('cleanup', {}).get('state') == 'cleaned':
+                if lifecycle._exists(fd, 'work'):
+                    raise lifecycle.error('Cleaned job has a replacement execution tree; data preserved.', 73)
+                if before_finalize is not None:
+                    before_finalize()
                 return {'id': copy.id, 'action': 'already-cleaned', 'reason': reason,
                         'allocated_bytes': 0, 'inodes': 0}
             if lifecycle._exists(fd, 'work'):
@@ -446,6 +443,10 @@ def _finalize(copy, *, reason, cancelled, orphan, owner_fd, before_finalize):
                                        'allocated_bytes': extra_usage[0], 'inodes': extra_usage[1]})
                 if _references([copy.path, *(copy.directory / entry['source'] for entry in extras)]):
                     raise lifecycle.error('A process has open execution state; cleanup deferred.', 75)
+                if before_finalize is not None:
+                    before_finalize()
+                    # Attestation can repair association; keep its durable lease.
+                    lease = lifecycle.read(copy)
                 patch = _capture(copy)
                 lifecycle.atomic_file(fd, 'changes.patch', patch)
                 result = {'schema': 1, 'workspace_id': copy.id,
@@ -453,6 +454,8 @@ def _finalize(copy, *, reason, cancelled, orphan, owner_fd, before_finalize):
                           'base_head': copy.metadata.get('base_head') or copy.metadata.get('source_head'),
                           'patch': {'file': 'changes.patch', 'bytes': len(patch),
                                     'sha256': hashlib.sha256(patch).hexdigest()}}
+                if lease is not None:
+                    result['job_id'] = lease['job_id']
                 lifecycle.atomic_file(fd, 'result.json', (json.dumps(result) + '\n').encode())
                 lease = lease or lifecycle.initialize(copy)
                 if lease['phase'] not in lifecycle.FINAL_PHASES:
@@ -478,6 +481,9 @@ def _finalize(copy, *, reason, cancelled, orphan, owner_fd, before_finalize):
             else:
                 if lease is None or not lease.get('cleanup'):
                     raise lifecycle.error('Missing execution tree has no cleanup intent; history preserved.', 73)
+                if before_finalize is not None:
+                    before_finalize()
+                    lease = lifecycle.read(copy)
                 quarantine_fd = _quarantine(root_fd, state)
         # The global admission fence is intentionally not held during deletion.
         return _finish_cleanup(copy, lease, quarantine_fd)

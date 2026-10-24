@@ -1,7 +1,7 @@
 """One managed development job; no scheduler and no automatic writer retry."""
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack, nullcontext
 import hashlib
 import json
 import os
@@ -67,17 +67,20 @@ def _preparation_status(copy):
     try:
         yield
     except BaseException as error:
-        # Only a fresh/explicitly prepared copy is ours to mark. In particular,
-        # a failed resume probe must not replace a previous execution result.
-        if (copy.metadata.get('status') == 'ready' or
-                (copy.metadata.get('status') == 'succeeded' and
-                 copy.metadata.get('operation') == 'preparation')):
-            code = 130 if isinstance(error, KeyboardInterrupt) else getattr(error, 'code', 71)
-            try:
-                copy.failed('preparation', code)
-            except (workspace.WorkspaceError, OSError):
-                pass  # The independent coordination record is still reconciled.
+        _mark_preparation_failed(copy, error)
         raise
+
+
+def _mark_preparation_failed(copy, error):
+    # Preserve earlier execution results when an explicit resume probe fails.
+    if (copy.metadata.get('status') == 'ready' or
+            (copy.metadata.get('status') == 'succeeded' and
+             copy.metadata.get('operation') == 'preparation')):
+        code = 130 if isinstance(error, KeyboardInterrupt) else getattr(error, 'code', 71)
+        try:
+            copy.failed('preparation', code)
+        except (workspace.WorkspaceError, OSError):
+            pass  # Reconcile the independent coordination record as well.
 
 
 def run(args, policy: settings.Policy, api, copy=None) -> int:
@@ -131,7 +134,16 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
             print('Preparation guard record was not stored; the observed failure was '
                   'preserved and no automatic retry was attempted.', file=api.sys.stderr)
 
+    early_owner = ExitStack()
     try:
+        if copy is not None and coord_task and coord_assignment:
+            # Explicit and linked copies need association before guard/sandbox
+            # failures too. Keep the owner lock through the eventual execution.
+            if not copy._locked:
+                early_owner.enter_context(copy.lock(recover=bool(
+                    getattr(args, 'resume_after_failure', False) or linked_correction)))
+            coordination.assignment_preparing(
+                copy.source, coord_task, coord_assignment, copy)
         if new_job:
             try:
                 guard_conditions = preparation_guard.worker_conditions(
@@ -171,7 +183,22 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
             elif copy.id != previous_id:
                 raise api.WorkerError(64, 'Explicit continuation must reuse the job\'s original workspace.')
         if copy is None:
-            copy = workspace.create(Path.cwd(), args.state_dir)
+            def associate(allocated):
+                if coord_task and coord_assignment:
+                    # Even an admission failure during association must retain
+                    # corroborating allocation metadata for provider-free cancel.
+                    allocated.metadata.update(coord_task=coord_task,
+                        coord_assignment=coord_assignment, standalone_job=False)
+                    allocated.save()
+                    try:
+                        coordination.assignment_preparing(
+                            allocated.source, coord_task, coord_assignment, allocated)
+                    except coordination.CoordinationError as cause:
+                        raise workspace.WorkspaceError(str(cause), cause.code) from None
+            expected_head = (coordination.load_task(source, coord_task)['base_head']
+                             if coord_task else None)
+            copy = workspace.create(Path.cwd(), args.state_dir, on_created=associate,
+                                    expected_head=expected_head)
         coord_before = None
         coord_item = None
         baseline_checks = []
@@ -180,7 +207,7 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
         print(f'Workspace: {copy.id}\nWorking copy: {copy.path}\n'
               'Source: committed HEAD only; source uncommitted changes were not copied or modified.', file=api.sys.stderr)
         recover = bool(getattr(args, 'resume_after_failure', False) or linked_correction)
-        with copy.lock(recover=recover), _preparation_status(copy):
+        with (nullcontext(copy) if copy._locked else copy.lock(recover=recover)), _preparation_status(copy):
             if coord_task and coord_assignment:
                 # The owner lock excludes finalization and another start. Recheck
                 # task-local continuity before touching preparation metadata.
@@ -193,6 +220,8 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
                 if linked_correction and (linked is None or linked.id != copy.id):
                     raise api.WorkerError(
                         64, 'Correction predecessor changed before execution; no copy was prepared.')
+                coordination.assignment_preparing(
+                    copy.source, coord_task, coord_assignment, copy)
             # Retained preflight failures must remain linked to their assignment,
             # even when runtime selection never reaches the readiness probes.
             copy.metadata.update(coord_task=coord_task, coord_assignment=coord_assignment,
@@ -434,6 +463,8 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
                           'Explicit recovery is required; no automatic implementation retry.', file=api.sys.stderr)
                     raise
     except BaseException as error:
+        if copy is not None and copy._locked and not coord_started:
+            _mark_preparation_failed(copy, error)
         if coord_task and not coord_started:
             code = 130 if isinstance(error, KeyboardInterrupt) else getattr(error, 'code', 71)
             known = isinstance(error, (workspace.WorkspaceError, development.DevelopmentError,
@@ -469,4 +500,7 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
             raise api.WorkerError(error.code, str(error)) from None
         raise
     finally:
-        os.close(slot)
+        try:
+            early_owner.close()
+        finally:
+            os.close(slot)

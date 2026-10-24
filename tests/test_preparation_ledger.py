@@ -418,6 +418,8 @@ class AdmissionQueueIntegrityTests(PreparationLedgerCase):
         planned = self.plan(task)
         assignment_id = planned['assignments'][0]['id']
         copy = workspace.create(self.root, self.state)
+        with copy.lock():
+            coordination.assignment_preparing(self.root, task['id'], assignment_id, copy)
         coordination.assignment_preparation_failed(self.root, task['id'], assignment_id,
             'sandbox readiness failed', workspace_id=copy.id)
         raw = self.raw(task)

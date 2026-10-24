@@ -337,6 +337,59 @@ def owner_authorizes_process(identity):
     return False
 
 
+def authorize_finalization(row):
+    """Terminal repair has the same owner boundary as destructive cleanup."""
+    if row is None:
+        return
+    if row['owner']['uid'] != os.geteuid():
+        raise error('Foreign owner in logical job lease; data preserved.', 73)
+    state = identity_state(row['owner'])
+    if state == 'unknown':
+        raise error('Job owner is in an unobservable process namespace; data preserved.', 75)
+    if (state == 'live' and row['owner'] != owner_identity()
+            and not owner_authorizes_process(row['owner'])):
+        raise error('Another coordinator owns this job; cannot finalize it.', 75)
+
+
+def _record_binding(row, binding):
+    """Keep association history independently of execution attempt history."""
+    history = row.get('binding_history', [])
+    if (not isinstance(history, list) or any(
+            not isinstance(entry, dict) or set(entry) != {'task_id', 'assignment_id'}
+            for entry in history)):
+        raise error('Malformed logical job binding history; copy preserved.', 73)
+    history = list(history)
+    previous = row.get('binding')
+    if previous:
+        if history and history[-1] != previous:
+            raise error('Logical job binding conflicts with its history; copy preserved.', 73)
+        if not history:
+            history.append(dict(previous))
+    if not history or history[-1] != binding:
+        history.append(dict(binding))
+    row.update(binding=dict(binding), binding_history=history)
+
+
+def bind_assignment(copy, task_id, assignment_id, *, previous_binding=None):
+    """Associate preparation with an assignment without reserving execution."""
+    with fence(copy.directory.parent.parent):
+        row = read(copy) or initialize(copy)
+        if row['phase'] in FINAL_PHASES:
+            raise error('Finalized logical jobs require a new workspace.', 73)
+        binding = {'task_id': task_id, 'assignment_id': assignment_id}
+        actual = row.get('binding')
+        if actual is not None and actual != binding and actual != previous_binding:
+            raise error('Logical job belongs to another assignment; copy preserved.', 73)
+        pending = row.get('pending_attempt')
+        if pending and any(pending.get(key) != value for key, value in binding.items()):
+            raise error('Another assignment reserved an execution attempt.', 75)
+        before = dict(row)
+        _record_binding(row, binding)
+        if row != before:
+            write(copy, row)
+        return row
+
+
 def prepare_attempt(copy, task_id, assignment_id, *, replace_pending=False):
     """Reserve the same attempt identity for the ledger and workspace begin."""
     with fence(copy.directory.parent.parent):
@@ -357,7 +410,7 @@ def prepare_attempt(copy, task_id, assignment_id, *, replace_pending=False):
               or not re.fullmatch('[0-9a-f]{32}', str(pending['id']))
               or any(pending.get(key) != value for key, value in binding.items())):
             raise error('A different job start already reserved this execution copy.', 75)
-        row['binding'] = binding
+        _record_binding(row, binding)
         write(copy, row)
         return row['job_id'], pending['id']
 
