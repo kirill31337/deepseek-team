@@ -22,7 +22,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y bubblewrap apparmor
-          npm install -g @openai/codex@0.155.1 @anthropic-ai/claude-code@2.1.278
+          npm install -g @openai/codex@0.155.1 @anthropic-ai/claude-code@2.1.316
           python -m pip install .
           deepseek-team sandbox install-apparmor
           deepseek-team sandbox status
