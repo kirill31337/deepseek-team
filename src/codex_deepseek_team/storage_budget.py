@@ -18,6 +18,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import stat
 import uuid
 
@@ -25,7 +26,8 @@ from .state_storage import StorageError, open_private_directory
 
 
 __all__ = ('BudgetError', 'Reservation', 'measure', 'reserve', 'shared_pool_dir',
-           'MINIMUM_FREE_BYTES', 'MINIMUM_FREE_INODES')
+           'check_pool_readiness', 'MINIMUM_FREE_BYTES',
+           'MINIMUM_FREE_INODES')
 
 MINIMUM_FREE_BYTES = 256 * 1024 * 1024
 MINIMUM_FREE_INODES = 1024
@@ -69,6 +71,107 @@ def _unsafe(path, reason: str) -> BudgetError:
                        'Existing entries were not changed.', 78)
 
 
+_POOL_FOREIGN_REMEDY = (
+    'Configure XDG_CONFIG_HOME so the pool is current-user-owned and its '
+    'ancestry is current-user-owned or root-owned and not writable by others. '
+    'An administrator may correct a foreign-owned entry; it was not changed.')
+_POOL_SYMLINK_REMEDY = (
+    'Inspect the symbolic link and remove or replace it with an ordinary '
+    'current-user-owned directory only if that is intended, or configure '
+    'XDG_CONFIG_HOME to another current-user-owned path. The link was not '
+    'followed or changed.')
+_POOL_NONDIRECTORY_REMEDY = (
+    'Inspect the non-directory entry and move or replace it only if that is '
+    'intended, or configure XDG_CONFIG_HOME to another current-user-owned path. '
+    'The entry was not changed.')
+_POOL_INACCESSIBLE_REMEDY = (
+    'Check traversal/search access on the existing ancestors or configure '
+    'XDG_CONFIG_HOME to another current-user-owned path. No entry was changed.')
+_POOL_UNVERIFIED_REMEDY = (
+    'Inspect the existing pool path and XDG_CONFIG_HOME, or configure another '
+    'current-user-owned path. No entry was changed.')
+_POOL_CREATE_REMEDY = (
+    'Configure XDG_CONFIG_HOME to a safe, writable current-user-owned path '
+    'with search access. No entry was changed.')
+
+
+def _pool_unsafe(path, reason: str, remedy: str) -> BudgetError:
+    return BudgetError(f'Unsafe storage budget pool {reason}: {_display(path)}. '
+                       f'{remedy}', 78)
+
+
+def _pool_permission_remedy(path, *, final: bool) -> str:
+    command = 'chmod 700 ' if final else 'chmod go-w '
+    return ('Fix the current-user-owned path only after review with a '
+            f'nonrecursive command: {command}{shlex.quote(str(path))}. '
+            'Existing entries were not changed.')
+
+
+def _pool_effective_mode_bits(info) -> int:
+    """Return permission bits that apply to the effective user for a directory."""
+    mode = stat.S_IMODE(info.st_mode)
+    if info.st_uid == os.geteuid():
+        return (mode >> 6) & 0o7
+    try:
+        groups = set(os.getgroups())
+    except OSError:
+        groups = set()
+    groups.add(os.getegid())
+    if info.st_gid in groups:
+        return (mode >> 3) & 0o7
+    return mode & 0o7
+
+
+def _pool_create_error(path, pool, reason: str, *, existing: bool) -> BudgetError:
+    if existing:
+        detail = f'cannot create lock or reservation entries in {_display(path)}'
+    else:
+        detail = (f'cannot create missing pool {_display(pool)} below its nearest '
+                  f'existing ancestor {_display(path)}')
+    return BudgetError(f'Unsafe storage budget pool {detail}: {reason}. '
+                       f'{_POOL_CREATE_REMEDY}', 78)
+
+
+def _check_pool_create_ready(fd: int, path, pool, *, existing: bool) -> None:
+    """Prove a pinned directory can create entries without probing or repair."""
+    try:
+        info = os.fstat(fd)
+    except OSError:
+        raise _pool_create_error(
+            path, pool, 'directory readiness could not be verified',
+            existing=existing) from None
+    if not stat.S_ISDIR(info.st_mode):
+        raise _pool_create_error(
+            path, pool, 'the entry is not an ordinary directory',
+            existing=existing)
+    mode = _pool_effective_mode_bits(info)
+    if mode & 0o3 != 0o3:
+        raise _pool_create_error(
+            path, pool,
+            f'effective directory mode {mode:o} lacks write and search access',
+            existing=existing)
+    try:
+        flags = int(os.fstatvfs(fd).f_flag)
+    except (AttributeError, OSError, OverflowError, TypeError, ValueError):
+        raise _pool_create_error(
+            path, pool, 'filesystem write readiness could not be verified',
+            existing=existing) from None
+    if flags & getattr(os, 'ST_RDONLY', 1):
+        raise _pool_create_error(
+            path, pool, 'the filesystem is mounted read-only', existing=existing)
+    try:
+        accessible = os.access(
+            '.', os.W_OK | os.X_OK, dir_fd=fd, effective_ids=True,
+            follow_symlinks=False)
+    except (NotImplementedError, OSError, TypeError, ValueError):
+        accessible = False
+    if not accessible:
+        raise _pool_create_error(
+            path, pool,
+            'the effective user lacks actual write and search access',
+            existing=existing)
+
+
 def _identity(info) -> tuple[int, int]:
     return info.st_dev, info.st_ino
 
@@ -80,38 +183,130 @@ def _check_private_file(info, label: str) -> None:
         raise BudgetError(f'{label}: {_PRIVATE_RECORD}', 78)
 
 
-def _safe_ancestor(path: Path, info) -> None:
+def _safe_ancestor(path: Path, info, *, pool: bool = False) -> None:
     if not stat.S_ISDIR(info.st_mode):
+        if pool:
+            raise _pool_unsafe(path, 'has a non-directory ancestor',
+                               _POOL_NONDIRECTORY_REMEDY)
         raise _unsafe(path, 'has a non-directory ancestor')
     if info.st_uid not in (0, os.geteuid()):
+        if pool:
+            raise _pool_unsafe(
+                path, f'has a foreign-owned ancestor (uid {info.st_uid})',
+                _POOL_FOREIGN_REMEDY)
         raise _unsafe(path, f'has a foreign-owned ancestor (uid {info.st_uid})')
     if info.st_mode & 0o022:
         if info.st_uid == 0 and info.st_mode & stat.S_ISVTX:
             return
+        if pool:
+            if info.st_uid == os.geteuid():
+                raise _pool_unsafe(
+                    path, 'has a writable ancestor',
+                    _pool_permission_remedy(path, final=False))
+            raise _pool_unsafe(
+                path, 'has a writable ancestor',
+                'Use another current-user-owned XDG_CONFIG_HOME. An entry '
+                'owned by another user was not changed and its permissions '
+                'must not be altered here.')
         raise _unsafe(path, 'has a writable ancestor')
 
 
-def _check_pool_ancestors(path: Path) -> None:
-    """Reject an existing writable/foreign parent before creating a pool."""
+def _check_pool_ancestors(path: Path):
+    """Validate pinned pool ancestry and prove a missing tail is creatable.
+
+    Return the existing final entry's ``lstat`` result, or ``None`` after
+    proving the nearest existing ancestor can create the missing components.
+    """
     parent = os.open('/', os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-    current = Path('/')
+    parent_path = Path('/')
     try:
-        for part in path.parts[1:-1]:
-            current = current / part
+        parts = path.parts[1:]
+        if not parts:
+            return os.fstat(parent)
+        for part in parts[:-1]:
+            current = parent_path / part
             try:
                 info = os.stat(part, dir_fd=parent, follow_symlinks=False)
             except FileNotFoundError:
-                return  # Remaining components are created mode 700 below.
+                _check_pool_create_ready(
+                    parent, parent_path, path, existing=False)
+                return None
             except (OSError, ValueError):
-                raise _unsafe(current, 'has an inaccessible parent') from None
+                raise _pool_unsafe(
+                    current, 'has an inaccessible ancestor',
+                    f'Pool path: {_display(path)}. '
+                    + _POOL_INACCESSIBLE_REMEDY) from None
             if stat.S_ISLNK(info.st_mode):
-                raise _unsafe(current, 'has a symbolic link in its ancestry')
-            _safe_ancestor(current, info)
-            child, _ = _open_measured_directory(parent, part, current)
+                raise _pool_unsafe(
+                    current, 'has a symbolic link in its ancestry',
+                    f'Pool path: {_display(path)}. ' + _POOL_SYMLINK_REMEDY)
+            try:
+                _safe_ancestor(current, info, pool=True)
+            except BudgetError as error:
+                raise BudgetError(
+                    f'{error.message} Pool path: {_display(path)}.',
+                    error.code) from None
+            child, opened = _open_measured_directory(parent, part, current)
+            if _identity(opened) != _identity(info):
+                os.close(child)
+                problem = _pool_unsafe(
+                    current, 'changed during its safety check',
+                    _POOL_UNVERIFIED_REMEDY)
+                raise BudgetError(
+                    f'{problem.message} Pool path: {_display(path)}.',
+                    problem.code) from None
             os.close(parent)
             parent = child
+            parent_path = current
+
+        final = parts[-1]
+        final_path = parent_path / final
+        try:
+            return os.stat(final, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            _check_pool_create_ready(parent, parent_path, path, existing=False)
+            return None
+        except OSError as error:
+            problem = _pool_unsafe(
+                final_path, 'is missing or inaccessible',
+                f'Pool path: {_display(path)}. ' + _POOL_UNVERIFIED_REMEDY)
+            problem.errno = error.errno
+            raise problem from None
     finally:
         os.close(parent)
+
+
+def _pool_info_problem(path: Path, info) -> BudgetError | None:
+    if stat.S_ISLNK(info.st_mode):
+        return _pool_unsafe(path, 'is a symbolic link', _POOL_SYMLINK_REMEDY)
+    if not stat.S_ISDIR(info.st_mode):
+        return _pool_unsafe(path, 'is not an ordinary directory',
+                            _POOL_NONDIRECTORY_REMEDY)
+    if info.st_uid != os.geteuid():
+        return _pool_unsafe(
+            path, f'has a foreign owner (uid {info.st_uid})',
+            _POOL_FOREIGN_REMEDY)
+    if stat.S_IMODE(info.st_mode) != 0o700:
+        return _pool_unsafe(
+            path, f'has unsafe permissions ({stat.S_IMODE(info.st_mode):o}; '
+            'expected 700)', _pool_permission_remedy(path, final=True))
+    return None
+
+
+def _pool_existing_error(path: Path) -> BudgetError:
+    try:
+        info = os.stat(path, follow_symlinks=False)
+    except FileNotFoundError:
+        return _pool_unsafe(path, 'is missing or inaccessible',
+                            _POOL_UNVERIFIED_REMEDY)
+    except OSError as error:
+        problem = _pool_unsafe(path, 'is missing or inaccessible',
+                               _POOL_INACCESSIBLE_REMEDY)
+        problem.errno = error.errno
+        return problem
+    problem = _pool_info_problem(path, info)
+    return problem or _pool_unsafe(path, 'could not be validated safely',
+                                   _POOL_UNVERIFIED_REMEDY)
 
 
 def _mountpoint_below(target: Path) -> bool:
@@ -305,18 +500,33 @@ def _absolute_path(name: str, value) -> Path:
 
 
 def _open_private_path(path: Path, *, create: bool, label: str,
-                       check_ancestors: bool = False) -> int:
+                       check_ancestors: bool = False,
+                       pool: bool = False) -> int:
+    expected = None
     if check_ancestors:
-        _check_pool_ancestors(path)
+        expected = _check_pool_ancestors(path)
     try:
-        return open_private_directory(path, create=create, label=label)
+        fd = open_private_directory(path, create=create, label=label)
     except StorageError as error:
+        if pool:
+            raise _pool_existing_error(path) from None
         raise BudgetError(str(error), error.code or 78) from None
     except (TypeError, ValueError) as error:
         raise BudgetError(f'Invalid {label.lower()} path {_display(path)}.', 64) from None
     except OSError as error:
         raise BudgetError(f'Cannot safely open {label.lower()} {_display(path)}.',
                           78, errno=error.errno) from None
+    if pool:
+        try:
+            opened = os.fstat(fd)
+            if expected is not None and _identity(opened) != _identity(expected):
+                raise _pool_unsafe(path, 'changed during its readiness check',
+                                   _POOL_UNVERIFIED_REMEDY)
+            _check_pool_create_ready(fd, path, path, existing=True)
+        except BaseException:
+            os.close(fd)
+            raise
+    return fd
 
 
 def _open_state(state: Path) -> int:
@@ -329,7 +539,7 @@ def _open_allocation_target(path: Path) -> int:
 
 def _open_pool(path: Path) -> int:
     return _open_private_path(path, create=True, label='Storage budget pool',
-                              check_ancestors=True)
+                              check_ancestors=True, pool=True)
 
 
 def _open_budget_lock(state_fd: int, *, create: bool) -> int:
@@ -858,3 +1068,52 @@ def shared_pool_dir(allocation_path: Path) -> Path:
     if device < 0:
         raise BudgetError('Storage allocation target reports an invalid device.', 78)
     return _user_config_base().joinpath(*_POOL_PARTS, f'dev-{device}')
+
+
+def check_pool_readiness(allocation_path: Path, *,
+                         pool_dir: Path | None = None) -> dict:
+    """Check the shared budget pool without reserving, creating or repairing it.
+
+    The returned mapping names the effective ``path`` and whether it already
+    ``exists``.  A missing pool is ``safe_to_create`` only after every existing
+    ancestor has passed the same descriptor-relative ownership, mode and
+    symbolic-link checks used by reservation, and the nearest existing ancestor
+    is proven to have effective and actual write/search access on a writable
+    filesystem.  An existing final pool is also validated as an ordinary
+    current-user-owned mode-700 directory that can create its lock and
+    reservation records.  This provider-free check never creates the pool, a
+    lock, a probe or a reservation record, and ``reserve`` remains authoritative
+    at allocation time.
+
+    Raises :class:`BudgetError` with code 78 for an unsafe path.  The message
+    names the precise offending entry and avoids suggesting that changing the
+    worker state root repairs an XDG-backed pool.
+    """
+    target = _absolute_path('allocation_path', allocation_path)
+    if pool_dir is None:
+        pool = shared_pool_dir(target)
+    else:
+        allocation_fd = _open_allocation_target(target)
+        os.close(allocation_fd)
+        pool = _absolute_path('pool_dir', pool_dir)
+
+    info = _check_pool_ancestors(pool)
+    if info is None:
+        return {'path': pool, 'exists': False, 'safe_to_create': True}
+
+    problem = _pool_info_problem(pool, info)
+    if problem is not None:
+        raise problem
+    try:
+        fd = open_private_directory(pool, create=False,
+                                    label='Storage budget pool')
+    except StorageError:
+        raise _pool_existing_error(pool) from None
+    try:
+        if _identity(os.fstat(fd)) != _identity(info):
+            raise _pool_unsafe(pool, 'changed during its readiness check',
+                               _POOL_UNVERIFIED_REMEDY)
+        _check_pool_create_ready(fd, pool, pool, existing=True)
+    finally:
+        os.close(fd)
+    return {'path': pool, 'exists': True, 'safe_to_create': False}

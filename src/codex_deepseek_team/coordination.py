@@ -27,7 +27,8 @@ from .config import sync_directory
 from .effort import DEFAULT_EFFORT, normalize_effort, normalize_policy_effort
 from .native_delegation import validate_native_exception
 from .routing import RoutingService
-from .routing_models import (RoutingError, fingerprint, number, validate_features,
+from .routing_models import (REQUIRED_SEMANTIC_FIELDS, RoutingError, fingerprint,
+                            missing_semantic_fields, number, validate_features,
                             validate_quality)
 
 WORKER_WRITE_KINDS = {"implementation", "test", "fixture", "documentation", "metadata"}
@@ -60,7 +61,11 @@ ROUTING_NEXT_STEPS = {
     "ineligible_kind": "use a supported deliverable kind or keep this slice with the coordinator",
     "write_requires_full_access": "explicitly opt into full access before delegating a writing "
                                   "slice, or keep it with the coordinator",
-    "ineligible_risk": "keep this risky slice with the coordinator or reduce its uncertainty",
+    "undeclared_risk": "declare risk in the features card; use unknown only when the risk is "
+                       "honestly undeclared",
+    "ineligible_risk": "keep this high-risk slice with the coordinator; use a bounded diagnostic "
+                       "before delegating if its uncertainty can be reduced",
+    "protected_risk": "keep this protected-risk slice with the coordinator",
     "ineligible_scope_size": "split this large deliverable into bounded slices before delegating",
     "ineligible_coupling": "split this cross-component deliverable into locally coupled slices "
                            "before delegating",
@@ -524,9 +529,16 @@ def routing_diagnostics(task: dict) -> list[dict]:
         requested = _requested_executor(item)
         resolved = item.get('executor')
         codes = [str(code) for code in (routing.get('reason_codes') or [])]
+        # Older decisions used one risk code for unknown, high and protected.
+        # Keep the recorded history intact while giving truthful recovery advice.
+        features = item.get('features')
+        risk = features.get('risk', 'unknown') if isinstance(features, dict) else 'unknown'
+        legacy_risk = {'unknown': 'undeclared_risk', 'protected': 'protected_risk'}.get(risk)
+        advice_codes = [legacy_risk if code == 'ineligible_risk' and legacy_risk else code
+                        for code in codes]
         rows.append({'id': item.get('id'), 'requested_executor': requested,
                      'resolved_executor': resolved, 'reason_codes': codes,
-                     'next_step': _routing_next_step(requested, resolved, codes)})
+                     'next_step': _routing_next_step(requested, resolved, advice_codes)})
     return rows
 
 
@@ -602,6 +614,41 @@ def _task_belongs_to(task, root: Path) -> bool:
     except (OSError, ValueError):
         return False
     return project == Path(os.path.realpath(str(root)))
+
+
+def _authoritative_successful_execution(copy, lease, attempt_id):
+    """Keep execution identity authoritative across terminal preparation attempts.
+
+    ``workspace.prepare`` is a provider-free operation on the same logical job and
+    updates ``record.json`` to its own attempt. It must not make a succeeded
+    execution look stale. Accept only a succeeded execution with no later
+    execution, followed by a nonempty chain of completed successful preparations
+    whose final attempt is exactly the persisted latest operation. Any pending,
+    running, failed or unknown operation in that chain remains invalid.
+    """
+    attempts = lease.get('attempts', [])
+    matches = [index for index, entry in enumerate(attempts)
+               if entry.get('id') == attempt_id]
+    if len(matches) != 1:
+        return False
+    execution_index = matches[0]
+    execution = attempts[execution_index]
+    if execution.get('operation') != 'execution' or execution.get('status') != 'succeeded':
+        return False
+    if lease.get('pending_attempt'):
+        return False
+    later = attempts[execution_index + 1:]
+    if not later:
+        return copy.metadata.get('attempt_id') in (None, attempt_id)
+    if any(entry.get('operation') != 'preparation' or entry.get('status') != 'succeeded'
+           for entry in later):
+        return False
+    count = copy.metadata.get('attempt')
+    if type(count) is not int or count != len(attempts):
+        return False
+    return (copy.metadata.get('attempt_id') == later[-1].get('id')
+            and copy.metadata.get('operation') == 'preparation'
+            and copy.metadata.get('status') == 'succeeded')
 
 
 def _correction_workspace(root: Path, task: dict, reference: dict, *,
@@ -773,8 +820,8 @@ def _correction_workspace(root: Path, task: dict, reference: dict, *,
     if attempt_id:
         if attempt_id not in known:
             raise CoordinationError('Correction predecessor attempt is not the current lease attempt.', 64)
-        if (not bound_to_current and copy.metadata.get('attempt_id')
-                and copy.metadata['attempt_id'] != attempt_id):
+        if (not bound_to_current
+                and not _authoritative_successful_execution(copy, lease, attempt_id)):
             raise CoordinationError('Correction predecessor execution record is stale.', 64)
     if continuation_assignment is not None:
         current_row = continuation_row or _assignment(task, continuation_assignment)
@@ -1337,6 +1384,44 @@ def _canonical_features(item, task):
     return features
 
 
+def _new_auto_feature_card_issues(task, deliverables):
+    """Validate new ordinary substantial Auto cards before any routing side effect.
+
+    Only cards that still request ``executor:auto`` are required to declare the
+    complete semantic contract. Protected responsibilities, native exceptions,
+    started deliverables and historical replay retain their existing behavior.
+    Explicit ``unknown`` values satisfy presence and remain honest declarations.
+    """
+    started = _started_deliverable_ids(task)
+    issues = []
+    for item in deliverables:
+        if (item.get('executor') != 'auto' or item.get('id') in started
+                or item.get('kind') in PROTECTED_COORDINATOR_KINDS):
+            continue
+        raw = item.get('features')
+        if raw is None:
+            missing = list(REQUIRED_SEMANTIC_FIELDS)
+        elif not isinstance(raw, dict):
+            issues.append(f"{item['id']}: features must be a structured feature card")
+            continue
+        else:
+            missing = missing_semantic_fields(raw)
+        if missing:
+            issues.append(
+                f"{item['id']}: missing semantic feature fields: {', '.join(missing)}")
+            continue
+        defaults = {'kind': item['kind'], 'runtime': task.get('runtime', 'codex'),
+                    'effort': normalize_effort(task['policy'].get('effort')) or DEFAULT_EFFORT}
+        try:
+            card = validate_features({**defaults, **raw})
+        except RoutingError as error:
+            issues.append(f"{item['id']}: {error.message}")
+            continue
+        if card['kind'] != item['kind']:
+            issues.append(f"{item['id']}: feature kind must match deliverable kind")
+    return issues
+
+
 def _logical_definition(item, task):
     definition = {key: item[key] for key in ('id', 'kind', 'scope', 'acceptance',
                                              'dependencies', 'checks')}
@@ -1469,11 +1554,23 @@ def plan_task(root: Path, task_id: str, plan: dict) -> dict:
             raise CoordinationError(
                 'Unsupported coordination plan format; existing records are preserved. '
                 'Open a new task with the current package.', 78)
-        if (_same_logical_plan(task, deliverables, classification, plan.get("small_evidence"))
-                and _plan_is_durable(task)):
+        replay = _same_logical_plan(task, deliverables, classification,
+                                    plan.get("small_evidence"))
+        if replay and _plan_is_durable(task):
             # An identical logical distribution is already durable. Do not open
             # the routing store, rewrite the ledger, reset phase or replace IDs.
             return task
+        if (not replay and classification == "substantial"
+                and task['policy'].get('delegation_level') == 'auto'):
+            # A legacy/replayed plan may carry only the old canonical defaults, so
+            # strict semantic completeness applies only to genuinely new work.
+            issues = _new_auto_feature_card_issues(task, deliverables)
+            if issues:
+                raise CoordinationError(
+                    'New substantial Auto plans require complete semantic feature cards: '
+                    + '; '.join(issues)
+                    + '. Declare the named fields in the features card; explicit unknown '
+                      'is allowed when a value is honestly unknown.', 64)
         _validate_correction_plan(root, task, deliverables)
         with _routing_batch(root) as service:
             if classification == "substantial" and task['policy'].get('delegation_level') == 'auto':

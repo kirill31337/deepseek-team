@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import urllib.error
 import urllib.request
 
-from . import activation, settings, state_storage, worker
+from . import activation, settings, state_storage, storage_budget, worker
 
 PACKAGE_ROOT = Path(__file__).resolve().parent.parent
 
@@ -284,7 +284,18 @@ def main(argv=None):
             print('Live check disabled by DeepSeek delegation switch.')
             return 69
         selected_state = state_storage.prepare_storage(args.state_dir)
+        try:
+            pool = storage_budget.check_pool_readiness(selected_state)
+        except storage_budget.BudgetError as error:
+            print(f'Storage budget pool: FAIL — {error.message}', file=sys.stderr)
+            return 78
         print(f'Worker storage: PASS ({selected_state}; private allocation checked).')
+        if pool['exists']:
+            pool_detail = 'existing private pool validated'
+        else:
+            pool_detail = 'missing; safe to create when reserving'
+        print(f'Storage budget pool: PASS ({pool["path"]}; {pool_detail}; '
+              'no reservation created).')
         sandbox, backend = worker.resolve_os_sandbox('required')
         print(f'OS sandbox: PASS ({backend.source}, {backend.bwrap})')
         restriction = sandbox.apparmor_restriction()
@@ -315,6 +326,9 @@ def main(argv=None):
     except (worker.WorkerError, state_storage.StorageError) as error:
         print(error.message, file=sys.stderr)
         return error.code
+    except storage_budget.BudgetError as error:
+        print(error.message, file=sys.stderr)
+        return 78
     except (OSError, subprocess.SubprocessError):
         print('Diagnostics could not complete; check selected CLI, Git and local configuration.', file=sys.stderr)
         return 78

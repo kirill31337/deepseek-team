@@ -26,7 +26,7 @@ WRITE_KINDS = frozenset(('implementation', 'test', 'fixture', 'documentation', '
 READ_KINDS = frozenset(('review', 'research', 'diagnostic', 'test_plan'))
 FEATURE_VALUES = {
     'kind': WRITE_KINDS | READ_KINDS | PROTECTED_KINDS,
-    'domain': ('python', 'javascript', 'typescript', 'java', 'go', 'rust', 'shell', 'documentation', 'other', 'unknown'),
+    'domain': ('python', 'javascript', 'typescript', 'java', 'kotlin', 'go', 'rust', 'shell', 'documentation', 'other', 'unknown'),
     'operation': ('diagnose', 'fix', 'extend', 'refactor', 'test', 'document', 'review', 'unknown'),
     'localization': ('known', 'partial', 'unknown'),
     'coupling': ('local', 'component', 'cross-component', 'unknown'),
@@ -37,6 +37,9 @@ FEATURE_VALUES = {
     'runtime': ('codex', 'claude'),
     'effort': CANONICAL_EFFORTS + tuple(LEGACY_EFFORT_ALIASES),
 }
+REQUIRED_SEMANTIC_FIELDS = ('domain', 'operation', 'localization', 'coupling',
+                            'verification', 'clarity', 'risk', 'scope_size')
+FEATURE_SCHEMA_VERSION = 1
 FEATURE_DEFAULTS = dict.fromkeys(FEATURE_VALUES, 'unknown')
 FEATURE_DEFAULTS.update(kind='implementation', runtime='codex', effort=DEFAULT_EFFORT,
                         model='deepseek-flash', context_version='default')
@@ -65,13 +68,40 @@ def number(value, name, minimum=0., maximum=1e12) -> float:
     return float(value)
 
 
+def missing_semantic_fields(value) -> list[str]:
+    """Return the required semantic fields absent from a raw feature card.
+
+    Presence, not the value, is checked here: an explicit ``unknown`` is an
+    honest declaration and remains valid. This helper does not alter or
+    canonicalize stored cards.
+    """
+    if not isinstance(value, dict):
+        return list(REQUIRED_SEMANTIC_FIELDS)
+    return [field for field in REQUIRED_SEMANTIC_FIELDS if field not in value]
+
+
+def feature_schema() -> dict:
+    """Return the read-only machine-readable feature-card contract."""
+    return {
+        'schema_version': FEATURE_SCHEMA_VERSION,
+        'required_semantic_fields': list(REQUIRED_SEMANTIC_FIELDS),
+        'values': {key: sorted(allowed) for key, allowed in FEATURE_VALUES.items()},
+        'defaults': dict(FEATURE_DEFAULTS),
+        'legacy_effort_aliases': dict(LEGACY_EFFORT_ALIASES),
+        'protected_kinds': sorted(PROTECTED_KINDS),
+        'write_kinds': sorted(WRITE_KINDS),
+        'read_kinds': sorted(READ_KINDS),
+    }
+
+
 def validate_features(value: dict) -> dict:
     if not isinstance(value, dict) or set(value) - set(FEATURE_DEFAULTS):
         raise RoutingError('Feature card contains unsupported fields; never include prompts, code or paths.')
     result = dict(FEATURE_DEFAULTS, **value)
     for key, allowed in FEATURE_VALUES.items():
         if not isinstance(result[key], str) or result[key] not in allowed:
-            raise RoutingError(f'Invalid feature {key}.')
+            raise RoutingError(
+                f'Invalid feature {key}; allowed values: {", ".join(sorted(allowed))}.')
     # A stored card may still carry the legacy 'medium' spelling; normalize it so
     # medium and high compare equal in identities, families and evidence keys.
     result['effort'] = normalize_effort(result['effort'])

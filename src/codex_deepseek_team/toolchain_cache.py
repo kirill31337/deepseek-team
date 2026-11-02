@@ -33,8 +33,11 @@ _DIGEST = re.compile(r'[0-9a-f]{64}\Z')
 _STAGE_NAME = re.compile(r'\.stage-[0-9a-f]{32}(?:\.json)?\Z')
 _PURGE_NAME = re.compile(r'\.purge-[0-9a-f]{32}\Z')
 _MAX_MANIFEST_BYTES = 64 << 20
-_DEFAULT_MAX_BYTES = 2147483648
-_DEFAULT_MAX_INODES = 200000
+DEFAULT_MAX_BYTES = 2147483648
+DEFAULT_MAX_INODES = 200000
+_DEFAULT_MAX_BYTES = DEFAULT_MAX_BYTES
+_DEFAULT_MAX_INODES = DEFAULT_MAX_INODES
+_MAX_CAP = 2 ** 63 - 1
 _O_NOATIME = getattr(os, 'O_NOATIME', 0)
 _O_PATH = getattr(os, 'O_PATH', os.O_RDONLY)
 _DIRECTORY_FLAGS = (os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -398,6 +401,15 @@ def _validate_caps(max_bytes, max_inodes) -> tuple[int, int]:
     for label, value in (('max_bytes', max_bytes), ('max_inodes', max_inodes)):
         if not isinstance(value, int) or isinstance(value, bool) or value < 0:
             raise toolchains.ToolchainError(f'{label} must be a non-negative integer.')
+    return max_bytes, max_inodes
+
+
+def _validate_snapshot_caps(max_bytes, max_inodes) -> tuple[int, int]:
+    for label, value in (('cache max bytes', max_bytes), ('cache max inodes', max_inodes)):
+        if (not isinstance(value, int) or isinstance(value, bool)
+                or value < 1 or value > _MAX_CAP):
+            raise toolchains.ToolchainError(
+                f'{label} must be a positive decimal integer no greater than {_MAX_CAP}.', 64)
     return max_bytes, max_inodes
 
 
@@ -1221,8 +1233,10 @@ def _measure_if_present(path: Path) -> tuple[int, int]:
 
 
 def _make_room(layout: _CacheLayout, *, required_bytes: int, required_inodes: int,
-               max_bytes: int, max_inodes: int, exclude_paths=()) -> None:
+               max_bytes: int, max_inodes: int, exclude_paths=(),
+               protected_digests=()) -> None:
     valid, _ = _valid_entries(layout)
+    protected = set(protected_digests)
     total_bytes, total_inodes = _usage(layout)
     excluded_bytes = excluded_inodes = 0
     for path in exclude_paths:
@@ -1235,15 +1249,16 @@ def _make_room(layout: _CacheLayout, *, required_bytes: int, required_inodes: in
         raise toolchains.ToolchainError(
             'The shared toolchain cache cannot store this source within its finite byte/inode budget. '
             'Choose a smaller declared source or raise the explicit cache limit.')
-    removable_bytes = sum(item['bytes'] for item in valid)
-    removable_inodes = sum(item['inodes'] for item in valid)
+    removable = [item for item in valid if item['digest'] not in protected]
+    removable_bytes = sum(item['bytes'] for item in removable)
+    removable_inodes = sum(item['inodes'] for item in removable)
     floor_bytes = max(0, total_bytes - removable_bytes)
     floor_inodes = max(0, total_inodes - removable_inodes)
     if floor_bytes + required_bytes > max_bytes or floor_inodes + required_inodes > max_inodes:
         raise toolchains.ToolchainError(
-            'The shared toolchain cache is full and its invalid or foreign entries were preserved for '
-            'inspection. Remove stale cache data explicitly or raise the cache limit.')
-    for item in sorted(valid, key=lambda row: (row['last_used'], row['created_at'], row['digest'])):
+            'The shared toolchain cache is full and its protected, invalid or foreign entries were '
+            'preserved for inspection. Remove stale cache data explicitly or raise the cache limit.')
+    for item in sorted(removable, key=lambda row: (row['last_used'], row['created_at'], row['digest'])):
         if total_bytes + required_bytes <= max_bytes and total_inodes + required_inodes <= max_inodes:
             return
         _remove_entry(layout, item)
@@ -1251,8 +1266,8 @@ def _make_room(layout: _CacheLayout, *, required_bytes: int, required_inodes: in
         total_inodes -= item['inodes']
     if total_bytes + required_bytes > max_bytes or total_inodes + required_inodes > max_inodes:
         raise toolchains.ToolchainError(
-            'The shared toolchain cache is full and its invalid or foreign entries were preserved for '
-            'inspection. Remove stale cache data explicitly or raise the cache limit.')
+            'The shared toolchain cache is full and its protected, invalid or foreign entries were '
+            'preserved for inspection. Remove stale cache data explicitly or raise the cache limit.')
 
 
 def _touch(layout: _CacheLayout, digest: str) -> None:
@@ -1367,6 +1382,264 @@ def _snapshot_locked_source(state, source, *, max_bytes, max_inodes):
                     except (OSError, toolchains.ToolchainError):
                         pass
                 raise
+
+
+@dataclass
+class _StagedCacheSource:
+    digest: str
+    entry: Path
+    manifest_path: Path
+    manifest: dict | None
+    stage: Path | None
+    manifest_temporary: Path | None
+    payload_bytes: int = 0
+    payload_inodes: int = 0
+    manifest_bytes: int = 0
+    manifest_inodes: int = 0
+    existing: bool = False
+    published: bool = False
+
+
+def _cleanup_staged(layout: _CacheLayout, item: _StagedCacheSource | None = None,
+                    *, paths=()) -> None:
+    selected = list(paths)
+    if item is not None:
+        selected.extend(path for path in (item.stage, item.manifest_temporary) if path is not None)
+    for path in selected:
+        try:
+            _remove_cache_path(path, layout=layout, kind='staging')
+        except (OSError, toolchains.ToolchainError):
+            pass
+
+
+def _stage_cache_source(state, layout: _CacheLayout, source, *,
+                        max_bytes: int, max_inodes: int,
+                        require_directory: bool = False) -> _StagedCacheSource:
+    _, resolved = _validate_source(state, source)
+    if require_directory and not resolved.is_dir():
+        raise toolchains.ToolchainError('A prepared tool source must be an ordinary directory.')
+    java = toolchains._java_tool(resolved)
+    requirement = toolchains._materialization_requirement(
+        resolved, java=java, label='cache source')
+    requirement['disk_bytes'] += max(toolchains._ALLOCATION_BLOCK,
+                                     requirement['inodes'] * 512)
+    requirement['inodes'] += 1
+    source_bytes, source_inodes = _measure(resolved)
+    if (source_bytes > max_bytes or source_inodes + 1 > max_inodes):
+        raise toolchains.ToolchainError(
+            'The shared toolchain cache cannot store this source within its finite byte/inode budget. '
+            'Choose a smaller declared source or raise the explicit cache limit.')
+    with toolchains._reserve_materialization(layout.staging, requirement):
+        stage = layout.staging / ('.stage-' + uuid.uuid4().hex)
+        manifest_temporary = layout.staging / (stage.name + '.json')
+        item = None
+        try:
+            if resolved.is_dir():
+                kind = 'dir'
+                toolchains._copy_tree(resolved, stage, java=java, label='cache source')
+            else:
+                kind = 'file'
+                toolchains._copy_file(resolved, stage, {'files': 0, 'bytes': 0})
+            manifest = _stage_manifest(stage, kind)
+            digest = manifest['digest']
+            entry = layout.entries / digest
+            manifest_path = _manifest_path(layout.manifests, digest)
+            item = _StagedCacheSource(digest, entry, manifest_path, manifest, stage,
+                                      manifest_temporary)
+            if os.path.lexists(entry) or os.path.lexists(manifest_path):
+                if not (os.path.lexists(entry) and os.path.lexists(manifest_path)):
+                    raise toolchains.ToolchainError(
+                        'A cache entry is incomplete and cannot be reused safely.')
+                existing_manifest = _read_manifest(layout.manifests, digest)
+                _validate_manifest_tree(layout.entries, digest, existing_manifest)
+                _measure(entry, owned=True, ordinary=True)
+                if existing_manifest['type'] != kind:
+                    raise toolchains.ToolchainError(
+                        'A cache entry has a different payload type than its manifest.')
+                if require_directory and kind != 'dir':
+                    raise toolchains.ToolchainError(
+                        'A prepared tool source must be an ordinary cached directory.')
+                _cleanup_staged(layout, item)
+                item.stage = None
+                item.manifest_temporary = None
+                item.existing = True
+                return item
+            _chmod_immutable(stage, include_root=False)
+            payload_bytes, payload_inodes = _measure(stage)
+            manifest_content = (json.dumps(manifest, indent=2, ensure_ascii=True,
+                                           sort_keys=True) + '\n').encode()
+            toolchains._atomic_private_write(manifest_temporary, manifest_content)
+            manifest_bytes, manifest_inodes = _measure(manifest_temporary)
+            item.payload_bytes = payload_bytes
+            item.payload_inodes = payload_inodes
+            item.manifest_bytes = manifest_bytes
+            item.manifest_inodes = manifest_inodes
+            return item
+        except BaseException:
+            _cleanup_staged(layout, item, paths=(stage, manifest_temporary))
+            raise
+
+
+class _SnapshotBatch:
+    def __init__(self, state: Path, layout: _CacheLayout, *,
+                 max_bytes: int, max_inodes: int):
+        self.state = Path(state)
+        self.layout = layout
+        self.max_bytes = max_bytes
+        self.max_inodes = max_inodes
+        self.items: dict[str, _StagedCacheSource] = {}
+        self.protected: set[str] = set()
+        self.selected: set[str] = set()
+        self.published = False
+        self.closed = False
+
+    def protect_paths(self, values) -> None:
+        if self.closed or self.published:
+            raise toolchains.ToolchainError('A closed cache snapshot batch cannot be changed.')
+        for value in values:
+            try:
+                located = _entry_for_path(self.state, Path(value))
+            except (TypeError, ValueError):
+                continue
+            if located is None:
+                continue
+            digest = located[2]
+            try:
+                manifest = _read_manifest(self.layout.manifests, digest)
+                _validate_manifest_tree(self.layout.entries, digest, manifest)
+                _measure(self.layout.entries / digest, owned=True, ordinary=True)
+            except toolchains.ToolchainError:
+                continue
+            self.protected.add(digest)
+
+    def snapshot(self, source, *, require_directory: bool = False) -> Path:
+        if self.closed or self.published:
+            raise toolchains.ToolchainError('A closed cache snapshot batch cannot be changed.')
+        item = _stage_cache_source(
+            self.state, self.layout, source, max_bytes=self.max_bytes,
+            max_inodes=self.max_inodes, require_directory=require_directory)
+        self.selected.add(item.digest)
+        self.protected.add(item.digest)
+        previous = self.items.get(item.digest)
+        if previous is not None:
+            _cleanup_staged(self.layout, item)
+            return previous.entry
+        self.items[item.digest] = item
+        return item.entry
+
+    def _rollback_published(self) -> None:
+        for item in reversed(list(self.items.values())):
+            if not item.published:
+                continue
+            manifest_identity = (_identity(os.lstat(item.manifest_path))
+                                 if os.path.lexists(item.manifest_path) else None)
+            try:
+                _remove_entry(self.layout, {
+                    'digest': item.digest,
+                    'manifest': item.manifest,
+                    'manifest_identity': manifest_identity,
+                })
+            except (OSError, toolchains.ToolchainError):
+                pass
+            item.published = False
+
+    def publish(self) -> dict[str, Path]:
+        if self.closed or self.published:
+            raise toolchains.ToolchainError('A closed cache snapshot batch cannot be published.')
+        new_items = [item for item in self.items.values() if not item.existing]
+        if new_items:
+            required_bytes = sum(item.payload_bytes + item.manifest_bytes for item in new_items)
+            required_inodes = sum(item.payload_inodes + item.manifest_inodes
+                                  for item in new_items)
+            exclude_paths = []
+            for item in new_items:
+                exclude_paths.extend(path for path in (item.stage, item.manifest_temporary)
+                                     if path is not None)
+            _make_room(
+                self.layout, required_bytes=required_bytes, required_inodes=required_inodes,
+                max_bytes=self.max_bytes, max_inodes=self.max_inodes,
+                exclude_paths=tuple(exclude_paths), protected_digests=self.protected)
+            try:
+                for item in new_items:
+                    os.replace(item.stage, item.entry)
+                    item.stage = None
+                    item.published = True
+                    root_entry = next(entry for entry in item.manifest['entries']
+                                      if entry['path'] == '.')
+                    root_mode = (0o500 if item.manifest['type'] == 'dir'
+                                 else root_entry['cached_mode'])
+                    os.chmod(item.entry, root_mode, follow_symlinks=False)
+                    directory = os.open(self.layout.entries, os.O_RDONLY | os.O_DIRECTORY)
+                    try:
+                        os.fsync(directory)
+                    finally:
+                        os.close(directory)
+                    os.replace(item.manifest_temporary, item.manifest_path)
+                    item.manifest_temporary = None
+                    directory = os.open(self.layout.manifests, os.O_RDONLY | os.O_DIRECTORY)
+                    try:
+                        os.fsync(directory)
+                    finally:
+                        os.close(directory)
+                    actual_bytes, actual_inodes = _entry_usage(item.entry, item.manifest_path)
+                    if actual_bytes > self.max_bytes or actual_inodes > self.max_inodes:
+                        raise toolchains.ToolchainError(
+                            'The shared toolchain cache rejected a source that exceeded its finite '
+                            'byte/inode budget; no entry was retained.')
+                for digest in sorted(self.selected):
+                    if self.items[digest].existing:
+                        _touch(self.layout, digest)
+                total_bytes, total_inodes = _usage(self.layout)
+                if total_bytes > self.max_bytes or total_inodes > self.max_inodes:
+                    raise toolchains.ToolchainError(
+                        'The shared toolchain cache exceeded its finite byte/inode budget; the '
+                        'new snapshot batch was not retained.')
+            except BaseException:
+                self._rollback_published()
+                raise
+        else:
+            _make_room(
+                self.layout, required_bytes=0, required_inodes=0,
+                max_bytes=self.max_bytes, max_inodes=self.max_inodes,
+                protected_digests=self.protected)
+            for digest in sorted(self.selected):
+                _touch(self.layout, digest)
+            total_bytes, total_inodes = _usage(self.layout)
+            if total_bytes > self.max_bytes or total_inodes > self.max_inodes:
+                raise toolchains.ToolchainError(
+                    'The shared toolchain cache exceeded its finite byte/inode budget; the '
+                    'existing snapshot batch was not retained.')
+        self.published = True
+        return {digest: item.entry for digest, item in self.items.items()}
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        for item in self.items.values():
+            if not item.published:
+                _cleanup_staged(self.layout, item)
+        self.closed = True
+
+
+@contextmanager
+def snapshot_batch(state, *, max_bytes: int = DEFAULT_MAX_BYTES,
+                   max_inodes: int = DEFAULT_MAX_INODES):
+    """Stage one or more sources and publish them atomically under one cache lock."""
+    max_bytes, max_inodes = _validate_snapshot_caps(max_bytes, max_inodes)
+    with locked(state) as layout:
+        _recover_quarantines(layout, remove=True)
+        _clean_staging(layout, remove=True)
+        batch = _SnapshotBatch(Path(state), layout, max_bytes=max_bytes, max_inodes=max_inodes)
+        try:
+            yield batch
+        except BaseException:
+            batch.close()
+            raise
+        if not batch.published:
+            batch.close()
+            raise toolchains.ToolchainError(
+                'A cache snapshot batch must be published before its lock is released.')
+        batch.close()
 
 
 def _entry_for_path(state: Path, value: Path) -> tuple[Path, Path, str] | None:

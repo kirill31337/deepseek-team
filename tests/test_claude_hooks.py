@@ -2,13 +2,14 @@
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 import tempfile
 import unittest
 from unittest import mock
 
-from codex_deepseek_team import activation, coordination, project
+from codex_deepseek_team import activation, claude_config, coordination, project
 
 
 COMMAND = 'deepseek-team coordinator-hook --runtime claude'
@@ -28,6 +29,12 @@ class ClaudeHooksTests(unittest.TestCase):
                         'user.email=test@example.test', 'commit', '-qm', 'base'], check=True)
         self.home = self.root / 'home'
         self.home.mkdir()
+        self.bin = self.root / 'bin'
+        self.bin.mkdir()
+        self.entrypoint = self.bin / 'deepseek-team'
+        self.entrypoint.write_text('#!/bin/sh\nexec ' + shlex.quote(sys.executable) +
+                                   ' -m codex_deepseek_team "$@"\n', encoding='utf-8')
+        self.entrypoint.chmod(0o700)
         self.claude = self.root / 'custom-claude'
         self.settings = self.claude / 'settings.json'
         self.state = self.root / 'state'
@@ -35,8 +42,10 @@ class ClaudeHooksTests(unittest.TestCase):
             'HOME': str(self.home), 'CLAUDE_CONFIG_DIR': str(self.claude),
             'CODEX_HOME': str(self.home / '.codex'),
             'XDG_CONFIG_HOME': str(self.root / 'config'),
+            'XDG_STATE_HOME': str(self.root / 'xdg-state'),
             'DEEPSEEK_TEAM_STATE_DIR': str(self.state),
             'DEEPSEEK_TEAM_DISABLED': '',
+            'PATH': str(self.bin) + os.pathsep + os.environ.get('PATH', '/usr/bin:/bin'),
             'PYTHONPATH': str(Path(__file__).resolve().parents[1] / 'src'),
         })
         environment.start()
@@ -320,6 +329,77 @@ class ClaudeHooksTests(unittest.TestCase):
             self.assertEqual(coordination.load_task(self.repo, task['id'])['status'], 'planning')
         os.environ['DEEPSEEK_TEAM_DISABLED'] = ''
         self.assert_denied(self.hook('PreToolUse', tool_name='Write', tool_input={'file_path': 'a.py'}), 'distribution')
+
+    def test_hooks_install_uses_an_absolute_fixture_entrypoint_and_blocks_pretooluse_failure(self):
+        self.assertEqual(self.cli('hooks', 'install', '--runtime', 'claude').returncode, 0)
+        data = json.loads(self.settings.read_text())
+        expected = claude_config.hook_command(self.entrypoint)
+        self.assertTrue(expected.startswith(str(self.entrypoint.resolve())))
+        for event, groups in data['hooks'].items():
+            handlers = [handler for group in groups for handler in group['hooks']]
+            owned = [handler for handler in handlers if handler.get('command') == expected]
+            self.assertEqual(len(owned), 1, event)
+            self.assertEqual(owned[0].get('onFailure'),
+                             'block' if event == 'PreToolUse' else None)
+
+    def test_hooks_install_fails_before_writing_when_entrypoint_is_unresolvable(self):
+        self.claude.mkdir()
+        original = b'{"model":"user-model","hooks":{"Stop":[]}}\n'
+        self.settings.write_bytes(original)
+        self.settings.chmod(0o640)
+        auth = self.claude / '.credentials.json'
+        auth.write_bytes(b'private authentication fixture')
+        empty = self.root / 'empty-bin'
+        empty.mkdir()
+        with mock.patch.dict(os.environ, {'PATH': str(empty)}):
+            result = self.cli('hooks', 'install', '--runtime', 'claude')
+        self.assertEqual(result.returncode, 78, result.stdout + result.stderr)
+        diagnostic = (result.stdout + result.stderr).lower()
+        self.assertIn('deepseek-team', diagnostic)
+        self.assertIn('path', diagnostic)
+        self.assertIn('no settings were changed', diagnostic)
+        self.assertEqual(self.settings.read_bytes(), original)
+        self.assertEqual(self.settings.stat().st_mode & 0o777, 0o640)
+        self.assertEqual(auth.read_bytes(), b'private authentication fixture')
+
+    def test_plan_mode_accepts_qualified_native_names_only_for_direct_markdown_plans(self):
+        self.start()
+        plan = self.claude / 'plans' / 'feature.md'
+        plan.parent.mkdir(parents=True)
+        for tool in ('Write', 'Edit', 'functions.Write', 'mcp/tools/Edit'):
+            with self.subTest(tool=tool):
+                self.assertEqual(self.hook('PreToolUse', permission_mode='plan',
+                                           tool_name=tool,
+                                           tool_input={'file_path': str(plan)}), {})
+        for tool in ('functions.Write', 'mcp/tools/Edit'):
+            with self.subTest(tool=tool, target='source'):
+                self.assert_denied(self.hook('PreToolUse', permission_mode='plan',
+                                             tool_name=tool,
+                                             tool_input={'file_path': str(self.repo / 'a.py')}),
+                                   'distribution')
+        for path in (plan.parent / 'nested' / 'feature.md', plan.parent / 'notes.txt'):
+            with self.subTest(path=path):
+                self.assert_denied(self.hook('PreToolUse', permission_mode='plan',
+                                             tool_name='functions.Write',
+                                             tool_input={'file_path': str(path)}),
+                                   'distribution')
+        linked = plan.parent / 'linked.md'
+        linked.symlink_to(self.repo / 'a.py')
+        self.assert_denied(self.hook('PreToolUse', permission_mode='plan',
+                                    tool_name='mcp/tools/Edit',
+                                    tool_input={'file_path': str(linked)}),
+                           'distribution')
+
+    def test_plan_mode_does_not_bypass_pending_worker_scope(self):
+        task = self.start()
+        (self.repo / 'plans').mkdir()
+        self.claude.mkdir()
+        self.settings.write_text(json.dumps({'plansDirectory': './plans'}))
+        self.plan(task, executor='auto', scope='plans/feature.md')
+        self.assert_denied(self.hook('PreToolUse', permission_mode='plan',
+                                    tool_name='mcp/tools/Write',
+                                    tool_input={'file_path': str(self.repo / 'plans' / 'feature.md')}),
+                           'pending worker')
 
 
 if __name__ == '__main__':

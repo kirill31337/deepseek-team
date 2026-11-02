@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 from pathlib import Path
 import unittest
@@ -147,19 +148,40 @@ class PrepareReservationTests(MaterializationFixture):
         source = self.copy.path / 'inputs' / 'local.properties'
         source.parent.mkdir(parents=True)
         source.write_text('sdk.dir=prepared\n')
-        calls = []
-        real_snapshot = toolchain_cache.snapshot
+        prepared = self.copy.path / 'build/local.properties'
+        real_save = toolchains._save_recipe
 
-        def snapshot(state, value, **kwargs):
-            calls.append(Path(value))
-            return real_snapshot(state, value, **kwargs)
+        def mutate_source_at_save_seam(copy, metadata, **kwargs):
+            source.write_text('sdk.dir=source-mutated-at-save\n')
+            return real_save(copy, metadata, **kwargs)
 
-        with mock.patch.object(toolchain_cache, 'snapshot', side_effect=snapshot):
+        with mock.patch.object(toolchains, '_save_recipe',
+                               side_effect=mutate_source_at_save_seam):
             toolchains.prepare(self.copy, copies=[(source, 'build/local.properties')],
                                save_project=True)
-        prepared = self.copy.path / 'build/local.properties'
-        self.assertIn(prepared, calls)
-        self.assertNotIn(source, calls)
+        self.assertEqual(source.read_text(), 'sdk.dir=source-mutated-at-save\n')
+        self.assertEqual(prepared.read_text(), 'sdk.dir=prepared\n')
+
+        recipe_file = self.recipe_path(self.copy)
+        before = recipe_file.read_bytes()
+        payload = json.loads(before)
+        self.assertEqual(payload['copies'][0]['destination'], 'build/local.properties')
+        cached = Path(payload['copies'][0]['source'])
+        self.assertEqual(cached.parent, self.cache_entries())
+        self.assertEqual(cached.read_text(), 'sdk.dir=prepared\n')
+        self.assertNotIn(str(source), before.decode())
+        self.assertNotIn(str(self.copy.path), before.decode())
+
+        prepared.write_text('sdk.dir=prepared-later-mutated\n')
+        self.assertEqual(recipe_file.read_bytes(), before)
+        self.assertEqual(cached.read_text(), 'sdk.dir=prepared\n')
+
+        fresh = self.fresh_copy()
+        with fresh.lock():
+            result = toolchains.apply_saved_recipe(fresh)
+        self.assertTrue(result['applied'])
+        self.assertEqual((fresh.path / 'build/local.properties').read_text(),
+                         'sdk.dir=prepared\n')
 
 
 class SnapshotReservationTests(MaterializationFixture):

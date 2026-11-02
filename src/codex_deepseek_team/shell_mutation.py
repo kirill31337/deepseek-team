@@ -31,6 +31,7 @@ import re
 _OPERATORS = ('&>>', '<<-', '<<<', '>>', '>|', '>&', '&>', '<>', '<<', '<&',
               '&&', '||', ';;', ';', '&', '|', '(', ')', '>', '<', '\n')
 _OUTPUT = {'>', '>>', '>|', '&>', '&>>', '<>', '>&'}
+_STANDARD_SINKS = frozenset(('/dev/null', '/dev/stdout', '/dev/stderr'))
 _REDIRECT = _OUTPUT | {'<', '<<', '<<-', '<<<', '<&'}
 _ASSIGNMENT = re.compile(r'[A-Za-z_][A-Za-z_0-9]*=')
 _COMMAND_PREFIXES = {'if', 'then', 'else', 'elif', 'while', 'until', 'for',
@@ -462,6 +463,9 @@ def _classify(tokens: list[_Token]) -> _Result:
             index += 1
         if token.value in _OUTPUT:
             if token.value == '>&' and target and not target.dynamic and re.fullmatch(r'(?:[0-9]+-?|-)', target.value):
+                continue
+            if (target is not None and not target.dynamic
+                    and target.value in _STANDARD_SINKS):
                 continue
             result.write([target] if target is not None else [])
     result.merge(_command(words))

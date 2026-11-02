@@ -68,7 +68,9 @@ class IneligibleReasonTests(unittest.TestCase):
 
     def test_unknown_and_weak_fields_are_rejected(self):
         cases = [
+            (features(risk='unknown'), 'undeclared_risk'),
             (features(risk='high'), 'ineligible_risk'),
+            (features(risk='protected'), 'protected_risk'),
             (features(scope_size='large'), 'ineligible_scope_size'),
             (features(coupling='cross-component'), 'ineligible_coupling'),
             (features(localization='unknown'), 'ineligible_localization'),

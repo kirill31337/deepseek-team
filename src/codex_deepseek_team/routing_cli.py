@@ -12,8 +12,8 @@ import tempfile
 
 from . import routing_stats
 from .routing import RoutingService
-from .routing_models import (DEFAULT_CONFIG, MAX_JSON_BYTES, RoutingError, identifier, number,
-                             read_json)
+from .routing_models import (DEFAULT_CONFIG, MAX_JSON_BYTES, RoutingError, feature_schema,
+                             identifier, number, read_json)
 from .routing_sources import fetch_snapshot
 
 
@@ -39,7 +39,8 @@ def _add_source_options(parser: argparse.ArgumentParser, *, include_url: bool) -
 def _parser() -> argparse.ArgumentParser:
     parser = _RoutingArgumentParser(
         prog='deepseek-team routing',
-        description='Use bounded public evidence and local outcomes to advise delegation.',
+        description='Use bounded public evidence and local outcomes to advise delegation. '
+                    'Use `routing schema` for the read-only feature-card contract.',
     )
     commands = parser.add_subparsers(dest='command', required=True)
 
@@ -48,6 +49,12 @@ def _parser() -> argparse.ArgumentParser:
         _add_path(command)
         command.add_argument('--json', action='store_true',
                              help='Emit machine-readable JSON (the default output format).')
+
+    schema = commands.add_parser(
+        'schema', help='Print the read-only machine-readable feature-card schema.')
+    _add_path(schema)
+    schema.add_argument('--json', action='store_true',
+                        help='Emit machine-readable JSON (the only output format).')
 
     configure = commands.add_parser('configure')
     _add_path(configure)
@@ -199,6 +206,10 @@ def main(argv) -> int:
             payload = fetch_snapshot(args.url)
         else:
             payload = None
+
+        if args.command == 'schema':
+            _emit(feature_schema())
+            return 0
 
         service = RoutingService(args.path)
         if args.command == 'status':

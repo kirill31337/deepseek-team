@@ -249,13 +249,14 @@ Recorded outcomes - clean successes included - go into a private, per-project, a
 Inspect the local state without changing it:
 
 ```bash
+deepseek-team routing schema --json                 # feature-card values, requirements and defaults
 deepseek-team routing status --path PROJECT --json
 deepseek-team routing stats --path PROJECT           # quality by category; --json for full counts
 deepseek-team lessons status --path PROJECT --json
 deepseek-team lessons review --path PROJECT --json  # review bundle only; nothing is applied
 ```
 
-`routing stats` groups the coordinator's recorded worker outcomes by task category and is read-only; `lessons review --json` only prints the review bundle for the coordinator to act on. The [routing guide](https://github.com/kirill31337/deepseek-team/blob/main/docs/ROUTING.md) and the [delegation lessons guide](https://github.com/kirill31337/deepseek-team/blob/main/docs/DELEGATION_LESSONS.md) cover the full evidence rules and payloads.
+`routing schema --json` prints the machine-readable feature-card contract to use when planning. Auto requires the structured semantic feature card to be registered before execution; unspecified attributes stay `unknown` rather than being invented. `routing stats` groups the coordinator's recorded worker outcomes by task category and is read-only; `lessons review --json` only prints the review bundle for the coordinator to act on. The [routing guide](https://github.com/kirill31337/deepseek-team/blob/main/docs/ROUTING.md) and the [delegation lessons guide](https://github.com/kirill31337/deepseek-team/blob/main/docs/DELEGATION_LESSONS.md) cover the full evidence rules and payloads.
 
 Access is independent of effort and history:
 
@@ -328,17 +329,33 @@ deepseek-team workspace verify WORKSPACE_ID --check 'java -version' --timeout 12
 
 - `--tool NAME=HOST_DIR` copies a selected software directory into `.deepseek-tools/NAME`, bound read-only inside the namespace. `--copy SOURCE=REL_DEST` copies explicit non-secret files or caches; caches stay writable in the copy. `--env NAME=VALUE` accepts only `JAVA_HOME`, `ANDROID_HOME`, `ANDROID_SDK_ROOT`, `GRADLE_USER_HOME`, `M2_HOME`, `KOTLIN_HOME` and `PATH`, each rooted in the workspace with the literal `{workspace}` placeholder.
 - `--probe COMMAND` runs only inside the worker namespace, before any model key; a failed probe stops the job. `--save-project` records a private recipe that replays these declarations into a later copy and never executes or replays host commands. The legacy `workspace prepare ID -- COMMAND ARG ...` form is unchanged and still runs on the coordinator host.
+- `--save-project --cache-max-bytes BYTES --cache-max-inodes COUNT` sets the aggregate shared-cache ceiling for the save operation (defaults `2147483648`/`200000`, positive decimal values only). Limits are not persisted in the recipe; replay reads cached entries without reapplying the old limit.
 - `workspace verify ID [--check COMMAND] [--timeout SECONDS] [--json]` rebuilds the prepared environment, reruns the declared or supplied checks and appends evidence. It never loads the provider key, starts a relay or starts a model, and it preserves the original worker result. Output is capped at 65,536 bytes per stream, redacted, and kept owner-only under the workspace's private `diagnostics/` directory.
 - Checks are captured as a baseline before the model runs, so an already-red suite does not block a bugfix assignment. A failed project check stays neutral `unknown` until the coordinator reviews the actual diff and evidence.
 
 Saved recipes refer to a finite immutable content cache rather than one execution
-tree. Each active workspace still materializes its declared tools independently
-inside the existing sandbox mapping, and mutable files are never hardlinked. A
-missing or stale cache entry invalidates the recipe with actionable re-preparation
-guidance. Allocation reserves aggregate bytes and inodes with free margins under
-the configured storage root and `TMPDIR`; `/mnt/data` is not a portable default.
+tree. Every saved tool and copy is snapshotted from its prepared destination; the
+recipe cannot fall back to a mutable host copy. Each active workspace still
+materializes its declared tools independently inside the existing sandbox mapping,
+and mutable files are never hardlinked. Saved and prepared copies both consume
+storage, while identical cache content is deduplicated. A missing or stale cache
+entry stops replay with actionable re-preparation guidance. A known missing
+payload invalidates the stale recipe under its lock; incomplete or corrupt cache
+entries and their recipe are preserved for inspection. Legacy
+version-1 recipes that name mutable host sources are preserved but refused on
+fresh replay; re-run preparation with the matching `--tool` and/or `--copy`
+declarations and `--save-project` to snapshot them.
+Allocation reserves aggregate bytes and inodes with free margins under the
+configured storage root and `TMPDIR`; `/mnt/data` is not a portable default.
 
-Realistic Java, Android and Gradle recipes, the Java/security materialization rules and the evidence causes are in the [toolchain guide](https://github.com/kirill31337/deepseek-team/blob/main/docs/TOOLCHAINS.md).
+For an offline JDK/Gradle/Kotlin build, prepare the selected JDK and optional
+standalone `KOTLIN_HOME`, copy only Gradle wrapper distributions and dependency
+caches into a workspace-rooted `GRADLE_USER_HOME` (never all of `~/.gradle`, global
+`gradle.properties`, `init.d`, daemon, signing or credentials), probe
+`java`/`javac`/`./gradlew --offline --version`, and verify with the real
+`./gradlew --offline --no-daemon` build. Kotlin Gradle plugin dependencies must
+already be in those caches. Realistic Java, Android, Gradle and Kotlin recipes, the
+Java/security materialization rules and the evidence causes are in the [toolchain guide](https://github.com/kirill31337/deepseek-team/blob/main/docs/TOOLCHAINS.md).
 
 ## Diagnostics
 

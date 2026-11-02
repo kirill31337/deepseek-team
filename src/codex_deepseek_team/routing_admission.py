@@ -66,6 +66,10 @@ def ineligible_reason(features, access):
         return 'ineligible_kind'
     if kind in WRITE_KINDS and access != 'full-access':
         return 'write_requires_full_access'
+    if card['risk'] == 'unknown':
+        return 'undeclared_risk'
+    if card['risk'] == 'protected':
+        return 'protected_risk'
     if card['risk'] not in ('low', 'medium'):
         return 'ineligible_risk'
     if card['scope_size'] not in ('small', 'medium'):

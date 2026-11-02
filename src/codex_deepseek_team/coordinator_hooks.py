@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import sys
 import time
 import uuid
 
@@ -92,6 +93,26 @@ def _declared_scopes(root: Path, deliverable: dict) -> list[str]:
         if canonical is not None:
             found.append(canonical)
     return found
+
+
+def _pending_worker_denial(path, assignment):
+    return _deny(
+        f"Path {path} belongs to pending worker assignment {assignment['id']}; "
+        "wait for/review that result before duplicating implementation.")
+
+
+def _pending_worker_for_path(root, scope_tasks, path):
+    """Return a pending worker assignment that owns this canonical path."""
+    for owner in scope_tasks:
+        for deliverable in owner.get("deliverables", []):
+            if not any(scope_matching.mutation_overlaps(root, path, scope)
+                       for scope in _declared_scopes(root, deliverable)):
+                continue
+            assignment = next((row for row in owner.get("assignments", [])
+                               if row.get("deliverable_id") == deliverable.get("id")), None)
+            if assignment and assignment.get("status") in ("planned", "running"):
+                return assignment
+    return None
 
 
 _CWD_UNCERTAIN = (
@@ -460,7 +481,8 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
         # Do not exempt source edits merely because Claude is in plan mode.
         if event == 'Stop':
             return {}
-        if event == 'PreToolUse' and payload.get('tool_name') in ('Edit', 'Write'):
+        tool_name = coordinator_activity.normalize_tool_name(payload.get('tool_name'))
+        if event == 'PreToolUse' and tool_name in ('Edit', 'Write'):
             from . import claude_config
             data = payload.get('tool_input') or {}
             path = data.get('file_path') if isinstance(data, dict) else None
@@ -469,6 +491,12 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
                 candidate = Path(path)
                 candidate = (candidate if candidate.is_absolute() else cwd / candidate).resolve()
                 if candidate.parent == directory and candidate.suffix == '.md':
+                    planned_path = scope_matching.canonical(root, str(candidate), cwd=cwd)
+                    if planned_path is not None:
+                        scope_tasks = coordination.unfinished_tasks(root, session) or [task]
+                        pending = _pending_worker_for_path(root, scope_tasks, planned_path)
+                        if pending:
+                            return _pending_worker_denial(planned_path, pending)
                     return {}
     if event == "PreToolUse":
         is_mutation, paths, cwd_uncertain = _mutation(payload)
@@ -507,17 +535,9 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
             normalized_paths.append(path)
             # A pending worker owns its registered scope across every unfinished
             # task, so precedence beats coordinator authority for that path.
-            for owner in scope_tasks:
-                for deliverable in owner.get("deliverables", []):
-                    if not any(scope_matching.mutation_overlaps(root, path, scope)
-                               for scope in _declared_scopes(root, deliverable)):
-                        continue
-                    assignment = next((row for row in owner.get("assignments", [])
-                                       if row.get("deliverable_id") == deliverable.get("id")), None)
-                    if assignment and assignment.get("status") in ("planned", "running"):
-                        return _deny(
-                            f"Path {path} belongs to pending worker assignment {assignment['id']}; "
-                            "wait for/review that result before duplicating implementation.")
+            pending = _pending_worker_for_path(root, scope_tasks, path)
+            if pending:
+                return _pending_worker_denial(path, pending)
             allowed, problem = coordinator_activity.mutation_authorizers(
                 root, task, path, protected_kinds=protected_kinds,
                 worker_write_kinds=coordination.WORKER_WRITE_KINDS)
@@ -587,17 +607,95 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
     return {}
 
 
+_CLAUDE_EVENTS = frozenset({
+    'SessionStart', 'UserPromptSubmit', 'PreToolUse', 'Stop', 'SubagentStop',
+})
+_CLAUDE_NONBLOCKING_ERROR_EVENTS = frozenset({
+    'SessionStart', 'Stop', 'SubagentStop',
+})
+
+
+def _error_detail(error) -> str:
+    """Bounded, single-line diagnostic without a traceback or payload dump."""
+    detail = ' '.join(str(error).split())
+    if len(detail) > 400:
+        detail = detail[:397] + '...'
+    name = type(error).__name__
+    return f'{name}: {detail}' if detail else name
+
+
+def _codex_hook_error(error) -> int:
+    print(json.dumps({"systemMessage": f"DeepSeek Team hook error: {type(error).__name__}"}))
+    return 1
+
+
+def _claude_input_error(error) -> int:
+    print('DeepSeek Team Claude hook rejected its JSON input because it could not parse '
+          'one JSON object: ' + _error_detail(error)
+          + '. No Claude action was approved; repair the hook installation and retry.',
+          file=sys.stderr)
+    return 2
+
+
+def _claude_processing_error(error, payload) -> int:
+    """Emit an explicit PreToolUse denial or block an unparsed lifecycle action."""
+    detail = _error_detail(error)
+    event = payload.get('hook_event_name') if isinstance(payload, dict) else None
+    if not isinstance(event, str):
+        event = None
+    if event == 'PreToolUse':
+        reason = (
+            'DeepSeek Team blocked this tool call because the PreToolUse hook failed '
+            'closed: ' + detail + '. The requested operation was not approved. Check '
+            'local DeepSeek Team settings and state, then retry; report this diagnostic '
+            'if it persists with the native hook definition installed.')
+        print(json.dumps(_deny(reason)))
+        return 0
+    if event in _CLAUDE_NONBLOCKING_ERROR_EVENTS:
+        print(json.dumps({
+            'continue': True,
+            'systemMessage': 'DeepSeek Team hook error (nonblocking for ' + event + '): '
+                             + detail + '. The session may continue; this event did not '
+                             'update the coordination ledger.',
+        }))
+        return 0
+    if event == 'UserPromptSubmit':
+        print('DeepSeek Team blocked UserPromptSubmit because the coordination ledger '
+              'could not be initialized: ' + detail + '. No model or tool work was '
+              'started. Check local DeepSeek Team settings and state, repair this error, '
+              'then submit the prompt again; report this diagnostic if it persists.',
+              file=sys.stderr)
+        return 2
+    print('DeepSeek Team blocked a Claude lifecycle event because the hook input '
+          'identified no supported safe action: ' + detail + '. No action was approved. '
+          'Check the native hook definition and local DeepSeek Team settings, then retry.',
+          file=sys.stderr)
+    return 2
+
+
 def main(argv=None) -> int:
-    import sys
     parser = argparse.ArgumentParser(prog='deepseek-team coordinator-hook')
     parser.add_argument('--runtime', choices=['codex', 'claude'], default='codex')
     args = parser.parse_args(argv)
     try:
         payload = json.load(sys.stdin)
+    except Exception as error:
+        return (_claude_input_error(error) if args.runtime == 'claude'
+                else _codex_hook_error(error))
+    if not isinstance(payload, dict):
+        error = ValueError('hook input must be a JSON object')
+        return (_claude_input_error(error) if args.runtime == 'claude'
+                else _codex_hook_error(error))
+    try:
+        if args.runtime == 'claude':
+            event = payload.get('hook_event_name')
+            if not isinstance(event, str) or event not in _CLAUDE_EVENTS:
+                return _claude_processing_error(
+                    ValueError('unsupported or missing hook event'), payload)
         result = handle(payload, runtime=args.runtime)
         if result:
             print(json.dumps(result))
         return 0
     except Exception as error:
-        print(json.dumps({"systemMessage": f"DeepSeek Team hook error: {type(error).__name__}"}))
-        return 1
+        return (_claude_processing_error(error, payload) if args.runtime == 'claude'
+                else _codex_hook_error(error))

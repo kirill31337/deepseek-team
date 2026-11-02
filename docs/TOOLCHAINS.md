@@ -21,6 +21,7 @@ for the live help.
 ```text
 deepseek-team workspace prepare ID [--tool NAME=HOST_DIR] [--copy SOURCE=REL_DEST]
   [--env NAME=VALUE] [--probe COMMAND] [--save-project]
+  [--cache-max-bytes BYTES] [--cache-max-inodes COUNT]
   [--resume-after-failure] [-- COMMAND ARG ...]
 ```
 
@@ -57,9 +58,16 @@ recorded in the private workspace metadata.
   copy of the same project. The recipe contains only declarations and **never
   executes or automatically replays a host command**. A malformed, unsafe,
   incompatible or failed recipe fails closed; a missing recipe preserves the old
-  behavior. The recipe refers to immutable cached content rather than a checkout
-  or runtime tree. Recipes, diagnostics and hashes stay in private state outside
-  the source patch.
+  behavior. Every tool and copy source recorded by the recipe is an immutable
+  `toolchain-cache/entries/<sha256>` entry snapshotted from the actual prepared
+  destination, not a mutable host path. Recipes, diagnostics and hashes stay in
+  private state outside the source patch.
+- **`--cache-max-bytes BYTES` / `--cache-max-inodes COUNT`** set the finite
+  aggregate saved-cache ceiling for one save operation. Both accept only positive
+  decimal integers from `1` through `2**63 - 1`; zero, negative, boolean,
+  fractional and oversized values are rejected with exit code `64` before any
+  materialization or provider action. They are valid only together with
+  `--save-project`. Defaults are `2147483648` bytes and `200000` inodes.
 - **Legacy `-- COMMAND ARG ...`** is unchanged: it still runs on the coordinator
   host with the existing safe environment, and the prepared workspace variables and
   `PATH` are supplied to it. Keep artifacts and caches inside the copy rather than
@@ -76,13 +84,50 @@ do not appear in the worker diff.
 The content cache is finite and immutable: entries have stable content identity,
 saved tool recipes remain independent of execution trees, and removing a finalized
 workspace does not invalidate a still-present entry. Each active workspace still
-materializes its declared tools independently inside the existing sandbox mapping;
-mutable workspace files are never hardlinked from the cache.
+materializes every declared tool and copy independently inside the existing sandbox
+mapping. Cache content is copied again into the workspace; mutable workspace files
+are never hardlinked from the cache.
 
-A missing or stale cache entry invalidates the saved recipe with actionable
-guidance to run preparation again. Before allocation, aggregate byte and inode
-requirements are reserved together with free-space margins. Reservations honor the
-configured private storage root and `TMPDIR`; `/mnt/data` is not a portable default.
+`--cache-max-bytes` and `--cache-max-inodes` apply to the whole save batch and the
+shared cache, not to each declaration separately. A save that cannot fit every
+new source and every still-referenced prior recipe entry fails before publishing the
+new recipe. The current recipe stays byte-identical and its usable cache entries
+remain protected. Valid entries selected earlier in the same batch are protected
+from eviction too, so one declaration cannot evict another or the previous recipe's
+references. The limits are operation options: they are not written into version-1
+metadata or the recipe and do not change its key. Replay reads already cached
+entries and does not impose the old save limit again.
+
+Capacity accounting is aggregate. A prepared save temporarily needs staging room,
+then retains both the workspace copy and the shared cache entry; those are separate
+copies and both consume the configured storage budget. Identical cached content is
+deduplicated by digest, while each active workspace still gets its own independent
+copy. Ordinary idle entries may be evicted when a later operation needs room;
+invalid, foreign, protected and currently selected entries are never deleted for
+capacity.
+
+A missing or unusable cache source blocks replay with actionable guidance to run
+preparation again. A known missing payload invalidates the stale recipe under its
+lock. Incomplete or corrupt entries and their recipe are preserved for inspection;
+no uncertain cache data is deleted to recover automatically. Legacy version-1
+recipes that still name mutable
+host sources are parsed but cannot prove the bytes that were originally prepared.
+Fresh replay is refused with explicit `workspace prepare` guidance for the matching
+`--tool NAME=HOST_DIR` and/or `--copy SOURCE=REL_DEST` declarations plus
+`--save-project`, and the old recipe is preserved rather than silently
+migrated, deleted or replayed from the current host path. An already prepared live
+workspace remains usable under its existing metadata; an explicit re-preparation
+may replace the legacy recipe normally.
+
+Before allocation, aggregate byte and inode requirements are reserved together
+with free-space margins. Reservations honor the configured private storage root and
+`TMPDIR`; `/mnt/data` is not a portable default.
+
+Preparation-failure memory and `--reuse-checks` are deliberately conservative for
+large inputs. Bounded hashing that cannot represent every file may become
+`unknown`; in that case the preparation guard does not suppress the attempt and
+declared checks execute again. An unrepresented mutation is never promoted to a
+confirmed identity merely to make reuse cheaper.
 
 ## Debian/OpenJDK materialization
 
@@ -148,31 +193,68 @@ any required workspace-specific file explicitly. A signing keystore (`.jks`,
 `.keystore`) is credential-like and is deliberately rejected — never prepare
 signing material.
 
-**Gradle build cache (`GRADLE_USER_HOME` stays writable in the copy):**
+**Complete offline JDK, Gradle wrapper and Kotlin workflow:**
+
+This is one complete declaration set for a project with a committed Gradle
+wrapper. First build a temporary input containing only the required wrapper
+distributions and dependency artifacts. Copy that input as one destination so
+`GRADLE_USER_HOME` resolves to a prepared directory during validation:
 
 ```bash
+gradle_snapshot=$(mktemp -d)
+mkdir -p "$gradle_snapshot/wrapper" "$gradle_snapshot/caches"
+cp -a /path/to/.gradle/wrapper/dists "$gradle_snapshot/wrapper/"
+cp -a /path/to/.gradle/caches/modules-2 "$gradle_snapshot/caches/"
+
 deepseek-team workspace prepare WORKSPACE_ID \
   --tool JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64 \
-  --tool GRADLE=/opt/gradle \
-  --copy /path/to/.gradle/caches=gradle-home/caches \
+  --copy "$gradle_snapshot=gradle-home" \
   --env 'JAVA_HOME={workspace}/.deepseek-tools/JAVA_HOME' \
-  --env 'PATH={workspace}/.deepseek-tools/JAVA_HOME/bin:{workspace}/.deepseek-tools/GRADLE/bin' \
   --env 'GRADLE_USER_HOME={workspace}/gradle-home' \
-  --probe 'gradle --version' \
+  --env 'PATH={workspace}/.deepseek-tools/JAVA_HOME/bin' \
+  --probe 'java -version' \
+  --probe 'javac -version' \
+  --probe './gradlew --offline --version' \
+  --cache-max-bytes 8589934592 \
+  --cache-max-inodes 400000 \
   --save-project
 ```
 
-Then verify inside the worker namespace before spending a model call. The offline
-doctor still checks only local readiness and the namespace; the smoke probes and
-`workspace verify` run the real commands:
+Choose ceilings that fit the selected inputs and available storage; the example
+allows an 8 GiB shared cache. The ordinary free-space and inode reservations still
+apply. After a successful saved preparation, the temporary input is no longer
+needed for replay. Projects without a wrapper instead need an explicitly prepared
+Gradle installation, with its `bin` directory added to the workspace-rooted PATH.
+
+If the project needs a standalone Kotlin compiler in addition to the Kotlin Gradle
+plugin, add `--tool KOTLIN_HOME=/opt/kotlin`,
+`--env 'KOTLIN_HOME={workspace}/.deepseek-tools/KOTLIN_HOME'`, the
+`{workspace}/.deepseek-tools/KOTLIN_HOME/bin` PATH element and
+`--probe 'kotlinc -version'` to the same complete command. This compiler is optional:
+Kotlin Gradle plugin artifacts must already be present in the copied Gradle
+dependency caches, or the offline build will fail even when `kotlinc` exists.
+
+Do **not** copy a whole `~/.gradle` directory. In particular, do not copy host
+`gradle.properties`, `init.d`, `daemon`, signing configuration or credentials. Copy
+only the selected wrapper distributions and dependency caches into the workspace,
+and keep all resulting paths rooted at `{workspace}` through `JAVA_HOME`,
+`KOTLIN_HOME`, `GRADLE_USER_HOME` and `PATH`. The saved recipe snapshots these
+prepared destinations into the cache under the declared aggregate byte/inode
+limits, so a later workspace can replay them without a host Gradle home.
+
+Then verify the real build inside the worker namespace before spending a model call:
 
 ```bash
-deepseek-team workspace verify WORKSPACE_ID --check './gradlew --offline :app:assembleDebug'
+deepseek-team workspace verify WORKSPACE_ID \
+  --check './gradlew --offline --no-daemon :app:assembleDebug' \
+  --timeout 600
 ```
 
-An explicit `--copy` of `gradle-wrapper`-downloaded distributions or a real
-`gradle` binary on the prepared `PATH` is required for an offline build; the cache
-alone is not a promise that Gradle is present.
+The probes catch a missing JDK, wrapper distribution or offline dependency before
+the provider key is read. They do not promise that every project dependency is in
+the copied caches; the real `--offline` build is the acceptance check. A cache-only
+recipe without a wrapper distribution or a real Gradle binary on the prepared PATH
+cannot build offline.
 
 ## Re-verify without another model call
 
@@ -205,12 +287,14 @@ rejected. It **never loads the provider key, starts a relay or starts a model**.
 
 ## Baseline and evidence causes
 
-Before the model runs, the declared checks are captured as a **baseline**. A nonzero
-baseline is evidence, not a blanket rejection, so a bugfix assignment may proceed
-against an already-red suite. After the worker, failures stay operational:
-`kind` is `environment` for timeout/launch/probe evidence and `verification` for
-ordinary project-check failures, and a matching exit code alone is not proof of a
-matching root cause.
+Before the model runs, the declared checks are captured as a **baseline**. An
+ordinary nonzero project baseline is evidence, not a blanket rejection, so a
+bugfix assignment may proceed against an already-red suite. A missing offline
+dependency, an unavailable tool, a failed readiness probe or a timed-out launch is
+an environment failure and stops the run before provider work. After the worker,
+failures stay operational: `kind` is `environment` for timeout/launch/probe evidence
+and `verification` for ordinary project-check failures, and a matching exit code
+alone is not proof of a matching root cause.
 
 | Cause | Meaning |
 | --- | --- |

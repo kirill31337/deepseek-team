@@ -44,7 +44,7 @@ KIND_VALUES = frozenset((
     "commit_push", "production", "secret_signing",
 ))
 DOMAIN_VALUES = frozenset((
-    "python", "javascript", "typescript", "java", "go", "rust", "shell",
+    "python", "javascript", "typescript", "java", "kotlin", "go", "rust", "shell",
     "documentation", "other", "unknown",
 ))
 OPERATION_VALUES = frozenset((
@@ -739,14 +739,10 @@ def _validate_when(value):
     for key, item in value.items():
         if not isinstance(item, str) or not item or len(item) > MAX_IDENTIFIER:
             raise LessonError(f"Rule 'when' {key} must be a bounded string.")
-        if key == "kind" and item not in KIND_VALUES:
-            raise LessonError("Rule 'when' kind is not a known deliverable kind.")
-        if key == "domain" and item not in DOMAIN_VALUES:
-            raise LessonError("Rule 'when' domain is not a known domain.")
-        if key == "operation" and item not in OPERATION_VALUES:
-            raise LessonError("Rule 'when' operation is not a known operation.")
-        if key == "runtime" and item not in RUNTIME_VALUES:
-            raise LessonError("Rule 'when' runtime must be codex or claude.")
+        if key in _FEATURE_VALUES and item not in _FEATURE_VALUES[key]:
+            allowed = ", ".join(sorted(_FEATURE_VALUES[key]))
+            raise LessonError(
+                f"Rule 'when' {key} must be one of: {allowed}.")
         if key == "effort":
             normalized = _normalize_effort(item)
             if normalized is None:

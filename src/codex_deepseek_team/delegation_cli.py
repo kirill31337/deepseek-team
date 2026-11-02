@@ -40,6 +40,22 @@ def _record(copy):
     return dict(copy.metadata, id=copy.id, path=str(copy.path))
 
 
+def _cache_limit(value, flag):
+    if not isinstance(value, str) or re.fullmatch(r'[0-9]+', value) is None:
+        raise toolchains.ToolchainError(
+            f'{flag} must be a positive decimal integer between 1 and 9223372036854775807.', 64)
+    try:
+        number = int(value)
+    except ValueError:
+        raise toolchains.ToolchainError(
+            f'{flag} must be a positive decimal integer between 1 and 9223372036854775807.',
+            64) from None
+    if number < 1 or number > 2 ** 63 - 1:
+        raise toolchains.ToolchainError(
+            f'{flag} must be a positive decimal integer between 1 and 9223372036854775807.', 64)
+    return number
+
+
 def _state_root(value):
     try:
         return state_storage.state_root(value)
@@ -209,6 +225,12 @@ def main(argv):
                     sub.add_argument('--' + option, action='append', default=[], metavar='NAME=VALUE')
                 sub.add_argument('--probe', action='append', default=[], metavar='COMMAND')
                 sub.add_argument('--save-project', action='store_true')
+                sub.add_argument('--cache-max-bytes', metavar='BYTES',
+                                 help='Aggregate saved-cache byte ceiling; requires --save-project '
+                                      '(default 2147483648).')
+                sub.add_argument('--cache-max-inodes', metavar='COUNT',
+                                 help='Aggregate saved-cache inode ceiling; requires --save-project '
+                                      '(default 200000).')
             if name == 'verify':
                 sub.add_argument('--check', action='append', metavar='COMMAND')
                 sub.add_argument('--timeout', type=float, default=120,
@@ -229,6 +251,16 @@ def main(argv):
         inputs, command = inputs[:split], inputs[split + 1:]
     args = parser.parse_args(inputs)
     try:
+        cache_max_bytes = cache_max_inodes = None
+        if argv[0] == 'workspace' and args.command == 'prepare':
+            if ((args.cache_max_bytes is not None or args.cache_max_inodes is not None)
+                    and not args.save_project):
+                raise toolchains.ToolchainError(
+                    '--cache-max-bytes and --cache-max-inodes are valid only with --save-project.', 64)
+            if args.cache_max_bytes is not None:
+                cache_max_bytes = _cache_limit(args.cache_max_bytes, '--cache-max-bytes')
+            if args.cache_max_inodes is not None:
+                cache_max_inodes = _cache_limit(args.cache_max_inodes, '--cache-max-inodes')
         if argv[0] == 'config':
             explicit_path = args.path is not None
             location = Path.cwd() if args.path is None else args.path
@@ -359,7 +391,9 @@ def main(argv):
                     toolchains.prepare(copy, tools=tools, copies=copies, environment=environment,
                         probes=args.probe, save_project=args.save_project,
                         recover=args.resume_after_failure,
-                        recheck_environment=args.recheck_environment)
+                        recheck_environment=args.recheck_environment,
+                        cache_max_bytes=cache_max_bytes,
+                        cache_max_inodes=cache_max_inodes)
                 if command:
                     if args.recheck_environment:
                         raise workspace.WorkspaceError(

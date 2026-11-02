@@ -531,7 +531,7 @@ class StableRecipeTests(CacheFixture):
         self.assertNotEqual((fresh.path / '.deepseek-tools/sdk/bin/tool').stat().st_ino,
                             (cached_tool / 'bin' / 'tool').stat().st_ino)
 
-    def test_missing_permanent_source_invalidates_the_recipe_once(self):
+    def test_saved_external_copy_survives_deleting_the_host_source(self):
         permanent = self.root / 'permanent' / 'local.properties'
         permanent.parent.mkdir(parents=True)
         permanent.write_text('sdk.dir=host\n')
@@ -539,24 +539,20 @@ class StableRecipeTests(CacheFixture):
                            save_project=True)
         recipe = self.recipe_path(self.copy)
         payload = json.loads(recipe.read_text())
-        self.assertEqual(payload['copies'][0]['source'], str(permanent))
+        cached = Path(payload['copies'][0]['source'])
+        self.assertTrue(cached.is_relative_to(self.state / 'toolchain-cache' / 'entries'))
+        self.assertNotEqual(payload['copies'][0]['source'], str(permanent))
 
         permanent.unlink()
         fresh = self.fresh_copy()
-        with self.assertRaises(toolchains.ToolchainError) as caught:
-            with fresh.lock():
-                toolchains.apply_saved_recipe(fresh)
-        message = str(caught.exception).lower()
-        self.assertIn('missing', message)
-        self.assertIn('removed', message)
-        self.assertFalse(recipe.exists())
+        with fresh.lock():
+            result = toolchains.apply_saved_recipe(fresh)
+        self.assertTrue(result['applied'])
+        self.assertEqual((fresh.path / 'build/local.properties').read_text(), 'sdk.dir=host\n')
+        self.assertTrue(recipe.exists())
+        self.assertTrue(cached.is_file())
         self.assertEqual((self.source / 'sample.txt').read_text(), 'committed\n')
         self.assertEqual((fresh.path / 'sample.txt').read_text(), 'committed\n')
-
-        second = self.fresh_copy()
-        with second.lock():
-            self.assertEqual(toolchains.apply_saved_recipe(second),
-                             {'applied': False, 'reason': 'no-recipe', 'toolchain': None})
 
     def test_evicted_cached_source_invalidates_the_recipe_clearly(self):
         root = self.software()

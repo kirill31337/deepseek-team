@@ -1,6 +1,9 @@
 import unittest
 
-from codex_deepseek_team.shell_mutation import classify_shell_mutation
+from codex_deepseek_team.shell_mutation import (
+    classify_shell_mutation,
+    classify_shell_mutation_scoped,
+)
 
 
 class ShellMutationTests(unittest.TestCase):
@@ -46,6 +49,83 @@ class ShellMutationTests(unittest.TestCase):
         for command, paths in commands.items():
             with self.subTest(command=command):
                 self.assertEqual(classify_shell_mutation(command), (True, paths))
+
+    def test_exact_standard_sink_redirections_are_not_mutations(self):
+        commands = [
+            'echo x >/dev/null',
+            'echo x >> /dev/null',
+            'echo x 2>/dev/null',
+            'echo x 2>>/dev/null',
+            'echo x &>/dev/null',
+            'echo x &>>/dev/null',
+            'echo x >|/dev/null',
+            'echo x <>/dev/null',
+            'printf x 1>/dev/stdout',
+            'printf x 2>/dev/stderr',
+            'echo x >"/dev/null"',
+            "printf x >'/dev/stdout'",
+            'echo x >/dev/null 2>&1',
+            'echo x >/dev/null 2>&-',
+            'cat < /dev/null',
+            "cat <<'EOF' >/dev/null\nbody\nEOF\n",
+            'if true; then printf x >/dev/null; fi',
+            'echo safe # touch hidden >/dev/null',
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertEqual(classify_shell_mutation(command), (False, []))
+
+    def test_standard_sink_exemption_preserves_every_other_write(self):
+        commands = {
+            'touch real.py >/dev/null': ["real.py"],
+            'echo x >out.txt 2>/dev/null': ["out.txt"],
+            'touch a.py >/dev/null; rm b.py 2>/dev/stderr': ["a.py", "b.py"],
+            'printf x | tee produced.txt >/dev/null': ["produced.txt"],
+            "cat <<'EOF' >/dev/null\nrm ignored.py\nEOF\ntouch visible.py":
+                ["visible.py"],
+            "cat <<EOF >/dev/null\n$(touch nested.py)\nEOF\n": ["nested.py"],
+            'touch quoted.py >"/dev/stdout"': ["quoted.py"],
+        }
+        for command, paths in commands.items():
+            with self.subTest(command=command):
+                self.assertEqual(classify_shell_mutation(command), (True, paths))
+
+    def test_non_exact_and_dynamic_sink_lookalikes_stay_conservative(self):
+        literal = {
+            'echo x >/dev/null.py': ["/dev/null.py"],
+            'echo x >/dev/null/child': ["/dev/null/child"],
+            'echo x >/dev/full': ["/dev/full"],
+            'echo x >support/dev/null': ["support/dev/null"],
+            'echo x >dev/null': ["dev/null"],
+            'echo x >/proc/self/fd/1': ["/proc/self/fd/1"],
+            'echo x 2>/dev/fd/1': ["/dev/fd/1"],
+        }
+        for command, paths in literal.items():
+            with self.subTest(command=command):
+                self.assertEqual(classify_shell_mutation(command), (True, paths))
+        for command in ('echo x >$DEST', 'echo x >"$DEST"',
+                        'echo x >/dev/${NAME}',
+                        'echo x >"$(printf /dev/null)"'):
+            with self.subTest(command=command):
+                self.assertEqual(classify_shell_mutation(command), (True, []))
+
+    def test_fd_duplication_and_close_next_to_standard_sinks_stay_non_mutating(self):
+        commands = [
+            'echo x 2>&1', 'echo x 1>&2', 'echo x >&2', 'echo x 2>&-',
+            'echo x >&-', 'echo x 2>/dev/null 2>&1',
+            'echo x >/dev/null 2>&-',
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertEqual(classify_shell_mutation(command), (False, []))
+
+    def test_cwd_uncertainty_is_preserved_when_a_real_write_uses_a_standard_sink(self):
+        self.assertEqual(
+            classify_shell_mutation_scoped('cd nested && touch relative.py >/dev/null'),
+            (True, [], True))
+        self.assertEqual(
+            classify_shell_mutation_scoped('cd /tmp && touch relative.py >/dev/null'),
+            (True, ['/tmp/relative.py'], False))
 
     def test_descriptor_duplication_and_input_are_not_writes(self):
         for command in ("echo x 1>&2", "echo x 2>&-", "cat <input.txt", "cat <<< 'x > y'"):

@@ -885,45 +885,116 @@ def _recipe_lock(copy):
         os.close(fd)
 
 
-def _stable_recipe_sources(copy, metadata: dict) -> tuple[dict, list[dict]]:
-    """Replace tool and execution-copy sources with verified shared cache paths."""
-    from . import toolchain_cache
-    state = _state_root(copy)
-    stable_tools = {}
-    for name, entry in metadata['tools'].items():
-        prepared = copy.path / TOOLS_DIRNAME / name
-        cached = toolchain_cache.snapshot(state, prepared, _owned_copy=copy)
-        stable = dict(entry)
-        stable['source'] = str(cached)
-        stable_tools[name] = stable
-    workspaces = Path(os.path.realpath(state / 'workspaces'))
-    stable_copies = []
-    for entry in metadata['copies']:
-        stable = dict(entry)
-        source = Path(entry['source'])
+def _prepared_recipe_source(copy, relative: str, *, require_directory: bool) -> Path:
+    parts = PurePosixPath(relative).parts
+    current = copy.path
+    for index, part in enumerate(parts):
+        current = current / part
+        final = index == len(parts) - 1
         try:
-            canonical = source.resolve(strict=True)
-        except (OSError, RuntimeError):
-            canonical = source
-        if canonical.is_relative_to(workspaces):
-            prepared = copy.path / entry['destination']
-            if not os.path.lexists(prepared):
-                raise ToolchainError('A prepared execution-copy input disappeared before its '
-                                     'recipe snapshot could be stored.')
-            stable['source'] = str(toolchain_cache.snapshot(state, prepared, _owned_copy=copy))
-        stable_copies.append(stable)
-    return stable_tools, stable_copies
+            info = os.lstat(current)
+        except OSError:
+            raise ToolchainError('A prepared source disappeared before its recipe snapshot could be '
+                                 f'stored: {_display(relative)}.') from None
+        if info.st_uid != os.geteuid():
+            raise ToolchainError(
+                f'A prepared source is not an ordinary owned path: {_display(relative)}.')
+        if stat.S_ISLNK(info.st_mode):
+            if final:
+                raise ToolchainError(
+                    f'A prepared source is not an ordinary owned path: {_display(relative)}.')
+            raise ToolchainError(
+                f'A prepared source has an unsafe ancestor: {_display(relative)}.')
+        if not final and not stat.S_ISDIR(info.st_mode):
+            raise ToolchainError(
+                f'A prepared source has an unsafe ancestor: {_display(relative)}.')
+    if require_directory and not stat.S_ISDIR(info.st_mode):
+        raise ToolchainError(f'A prepared tool destination is not a directory: {_display(relative)}.')
+    if not require_directory and not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+        raise ToolchainError(f'A prepared copy destination is not an ordinary file or directory: '
+                             f'{_display(relative)}.')
+    return current
 
 
-def _save_recipe(copy, metadata: dict) -> None:
-    tools, copies = _stable_recipe_sources(copy, metadata)
-    payload = {'version': TOOLCHAIN_VERSION, 'kind': RECIPE_KIND,
-               'source_project': metadata['source_project'], 'saved_at': time.time(),
-               'tools': tools, 'copies': copies,
-               'environment': metadata['environment'], 'probes': metadata['probes']}
-    with _recipe_lock(copy) as (directory, key):
-        _atomic_private_write(directory / (key + '.json'),
-                              (json.dumps(payload, indent=2, ensure_ascii=True) + '\n').encode())
+def _recipe_snapshot_sources(copy, metadata: dict) -> list[dict]:
+    """Describe every saved source by its actual, prepared destination."""
+    sources = []
+    for name, entry in metadata['tools'].items():
+        relative = f'{TOOLS_DIRNAME}/{name}'
+        sources.append({
+            'kind': 'tool',
+            'name': name,
+            'path': _prepared_recipe_source(copy, relative, require_directory=True),
+            'require_directory': True,
+        })
+    for index, entry in enumerate(metadata['copies']):
+        sources.append({
+            'kind': 'copy',
+            'index': index,
+            'path': _prepared_recipe_source(copy, entry['destination'],
+                                            require_directory=False),
+            'require_directory': False,
+        })
+    return sources
+
+
+def _recipe_source_paths(payload) -> list[str]:
+    if not isinstance(payload, dict):
+        return []
+    values = []
+    tools = payload.get('tools')
+    if isinstance(tools, dict):
+        for entry in tools.values():
+            if isinstance(entry, dict) and isinstance(entry.get('source'), str):
+                values.append(entry['source'])
+    copies = payload.get('copies')
+    if isinstance(copies, list):
+        for entry in copies:
+            if isinstance(entry, dict) and isinstance(entry.get('source'), str):
+                values.append(entry['source'])
+    return values
+
+
+def _save_recipe(copy, metadata: dict, *, cache_max_bytes: int, cache_max_inodes: int) -> None:
+    from . import toolchain_cache
+    sources = _recipe_snapshot_sources(copy, metadata)
+    saved_at = time.time()
+    if not sources:
+        payload = {'version': TOOLCHAIN_VERSION, 'kind': RECIPE_KIND,
+                   'source_project': metadata['source_project'], 'saved_at': saved_at,
+                   'tools': {}, 'copies': [],
+                   'environment': metadata['environment'], 'probes': metadata['probes']}
+        with _recipe_lock(copy) as (directory, key):
+            _atomic_private_write(directory / (key + '.json'),
+                                  (json.dumps(payload, indent=2, ensure_ascii=True) + '\n').encode())
+        return
+    with toolchain_cache.snapshot_batch(
+            _state_root(copy), max_bytes=cache_max_bytes,
+            max_inodes=cache_max_inodes) as batch:
+        with _recipe_lock(copy) as (directory, key):
+            previous = _read_recipe(copy)
+            if previous is not None:
+                batch.protect_paths(_recipe_source_paths(previous))
+            cached = [batch.snapshot(item['path'], require_directory=item['require_directory'])
+                      for item in sources]
+            stable_tools = {}
+            stable_copies = list(metadata['copies'])
+            for item, source in zip(sources, cached):
+                if item['kind'] == 'tool':
+                    stable = dict(metadata['tools'][item['name']])
+                    stable['source'] = str(source)
+                    stable_tools[item['name']] = stable
+                else:
+                    stable = dict(metadata['copies'][item['index']])
+                    stable['source'] = str(source)
+                    stable_copies[item['index']] = stable
+            payload = {'version': TOOLCHAIN_VERSION, 'kind': RECIPE_KIND,
+                       'source_project': metadata['source_project'], 'saved_at': saved_at,
+                       'tools': stable_tools, 'copies': stable_copies,
+                       'environment': metadata['environment'], 'probes': metadata['probes']}
+            batch.publish()
+            _atomic_private_write(directory / (key + '.json'),
+                                  (json.dumps(payload, indent=2, ensure_ascii=True) + '\n').encode())
 
 
 def _source_missing(value) -> Path | None:
@@ -1278,10 +1349,41 @@ def _result(copy, metadata: dict, *, recipe_saved: bool) -> dict:
             'recipe_saved': recipe_saved}
 
 
+def _prepare_cache_limits(save_project: bool, cache_max_bytes, cache_max_inodes):
+    from . import toolchain_cache
+    supplied = cache_max_bytes is not None or cache_max_inodes is not None
+    if supplied and not save_project:
+        raise ToolchainError('--cache-max-bytes and --cache-max-inodes are valid only with '
+                             '--save-project.', 64)
+    if not save_project:
+        return None, None
+    if cache_max_bytes is None:
+        cache_max_bytes = toolchain_cache.DEFAULT_MAX_BYTES
+    if cache_max_inodes is None:
+        cache_max_inodes = toolchain_cache.DEFAULT_MAX_INODES
+    return toolchain_cache._validate_snapshot_caps(cache_max_bytes, cache_max_inodes)
+
+
+def _unattested_recipe_source(copy, declarations: dict) -> str | None:
+    from . import toolchain_cache
+    state = _state_root(copy)
+    for source in declarations['tools'].values():
+        if not toolchain_cache.is_entry_path(state, source):
+            return source
+    for source, _ in declarations['copies']:
+        if not toolchain_cache.is_entry_path(state, source):
+            return source
+    return None
+
+
 def prepare(copy, *, tools=None, copies=None, environment=None, probes=None,
             save_project: bool = False, recover: bool = False,
-            recheck_environment: bool = False) -> dict:
+            recheck_environment: bool = False,
+            cache_max_bytes: int | None = None,
+            cache_max_inodes: int | None = None) -> dict:
     """Own the copy lock, publish declared preparation and record version-1 metadata."""
+    cache_max_bytes, cache_max_inodes = _prepare_cache_limits(
+        save_project, cache_max_bytes, cache_max_inodes)
     with copy.lock(recover=recover):
         try:
             declarations = {'tools': _normalize_tools(tools), 'copies': _normalize_copies(copies),
@@ -1317,7 +1419,8 @@ def prepare(copy, *, tools=None, copies=None, environment=None, probes=None,
             copy.save()
             recipe_saved = False
             if save_project:
-                _save_recipe(copy, metadata)
+                _save_recipe(copy, metadata, cache_max_bytes=cache_max_bytes,
+                             cache_max_inodes=cache_max_inodes)
                 recipe_saved = True
         except MissingSourceError as error:
             _remember_failure(copy, conditions, error)
@@ -1379,6 +1482,14 @@ def apply_saved_recipe(copy) -> dict:
     if payload is None:
         return {'applied': False, 'reason': 'no-recipe', 'toolchain': None}
     declarations = _validate_recipe(copy, payload)
+    unattested = _unattested_recipe_source(copy, declarations)
+    if unattested is not None:
+        raise ToolchainError(
+            'This version-1 toolchain recipe references a mutable host source that cannot attest '
+            f'the original prepared contents: {_display(unattested)}. The recipe was preserved. '
+            'Run workspace prepare again with the applicable --tool NAME=HOST_DIR and/or '
+            '--copy SOURCE=REL_DEST declarations and --save-project to snapshot every prepared '
+            'source into the immutable cache.')
     missing = _missing_recipe_source(declarations)
     if missing is not None:
         _validate_safe_before_invalidation(copy, declarations)
@@ -1391,8 +1502,13 @@ def apply_saved_recipe(copy) -> dict:
             'prepare this copy again with available sources and --save-project to refresh it.', 78)
     try:
         metadata = _materialize(copy, declarations, recover=False)
-    except ToolchainError:
-        raise
+    except ToolchainError as error:
+        raise type(error)(
+            f'{error.message} The saved recipe was preserved and the owned copy was retained '
+            'for inspection. Re-run workspace prepare with the applicable --tool NAME=HOST_DIR '
+            'and/or --copy SOURCE=REL_DEST declarations and --save-project to snapshot fresh '
+            'sources into the immutable cache, then retry the replay. Resolve any reported '
+            'capacity or security condition first.', error.code) from error
     except (OSError, ValueError, shutil.Error, workspace.WorkspaceError) as error:
         raise ToolchainError('Toolchain recipe replay failed; the owned copy is retained for '
                              'inspection.') from error
