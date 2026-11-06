@@ -121,6 +121,7 @@ def main(argv=None):
     sandbox_commands.add_parser('install-apparmor', help='Install/reload only the package-owned named AppArmor profile.')
     sandbox_commands.add_parser('remove-apparmor', help='Remove only an unchanged package-owned AppArmor profile.')
     commands.add_parser('config', help='Manage delegation profiles; use config --help.')
+    commands.add_parser('coordination', help='Persistent coordination task state; use coordination --help.')
     commands.add_parser('lessons', help='Inspect the private rework journal and apply reviewed delegation lessons.')
     commands.add_parser('gc', help='Explain or apply safe cleanup of owned workspace copies; use gc --help.')
     commands.add_parser('workspace', help='Prepare and inspect owned development copies; use workspace --help.')

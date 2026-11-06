@@ -368,6 +368,130 @@ class StateAndDistributionTests(CoordinationCase):
                                             prepared_changes=[], effort="xhigh")
 
 
+class CancelledRetentionTests(CoordinationCase):
+    FEATURES = {
+        "domain": "python", "operation": "fix", "localization": "known",
+        "coupling": "local", "verification": "none", "clarity": "clear",
+        "risk": "low", "scope_size": "small",
+    }
+
+    def plan_cancelled_work(self, *, level=75, access="full-access",
+                            with_worker=True, sequence=0):
+        task = coordination.open_task(
+            self.repo, session_id=f"sess-cancel-{sequence}", turn_id=f"turn-{sequence}",
+            prompt="implement substantial feature", policy=self.policy(level, access),
+        )
+        deliverables = [{
+            "id": "cancelled-impl", "kind": "implementation",
+            "scope": ["src/cancelled.py"], "executor": "auto",
+            "features": dict(self.FEATURES), "acceptance": ["behavior verified"],
+            "dependencies": [], "checks": [],
+        }]
+        if with_worker:
+            deliverables.insert(0, {
+                "id": "worker-review", "kind": "review", "scope": ["tests/test_worker.py"],
+                "executor": "worker", "acceptance": ["findings reviewed"],
+                "dependencies": [], "checks": [],
+            })
+        planned = coordination.plan_task(self.repo, task["id"], {
+            "classification": "substantial", "deliverables": deliverables,
+        })
+        return task, planned
+
+    def save(self, task):
+        coordination._atomic(coordination._task_path(self.repo, task["id"]), task)
+
+    def test_current_cancelled_outcome_is_not_retained_active_work(self):
+        task, planned = self.plan_cancelled_work()
+        item = next(row for row in planned["deliverables"] if row["id"] == "cancelled-impl")
+        self.assertEqual(item["executor"], "coordinator")
+        self.assertIn("ineligible_verification", item["routing"]["reason_codes"])
+        self.assertTrue(any("cancelled-impl" in issue and "retained by coordinator" in issue
+                            for issue in coordination.validate_task(self.repo, task["id"])))
+
+        coordination.observe_coordinator_result(
+            self.repo, task["id"], "cancelled-impl", "cancelled",
+            "superseded before retaining this worker-eligible implementation")
+
+        self.assertEqual(coordination.validate_task(self.repo, task["id"]), [])
+        changed = {
+            "id": "cancelled-impl", "kind": "implementation",
+            "scope": ["src/replacement.py"], "executor": "auto",
+            "features": dict(self.FEATURES), "acceptance": ["behavior verified"],
+            "dependencies": [], "checks": [],
+        }
+        with self.assertRaisesRegex(coordination.CoordinationError, "immutable"):
+            coordination.plan_task(self.repo, task["id"], {
+                "classification": "substantial", "deliverables": [changed],
+            })
+        with self.assertRaisesRegex(coordination.CoordinationError, "cannot remove"):
+            coordination.plan_task(self.repo, task["id"], {
+                "classification": "substantial",
+                "deliverables": [{
+                    "id": "worker-review", "kind": "review",
+                    "scope": ["tests/test_worker.py"], "executor": "worker",
+                    "acceptance": ["findings reviewed"],
+                    "dependencies": [], "checks": [],
+                }],
+            })
+
+    def test_only_a_current_evidenced_cancellation_bypasses_retention(self):
+        cases = (
+            ("pending", None),
+            ("accepted", ("observe", "accepted")),
+            ("rework", ("observe", "rework")),
+            ("rejected", ("observe", "rejected")),
+            ("infrastructure", ("observe", "infrastructure")),
+            ("unknown", ("observe", "unknown")),
+            ("unsupported", ("result", {"outcome": "unsupported", "evidence": "recorded"})),
+            ("missing-evidence", ("result", {"outcome": "cancelled"})),
+            ("stale-cancelled", ("stale", None)),
+        )
+        for index, (label, action) in enumerate(cases):
+            with self.subTest(outcome=label):
+                task, _ = self.plan_cancelled_work(sequence=index + 1)
+                if action is not None:
+                    kind, value = action
+                    if kind == "observe":
+                        coordination.observe_coordinator_result(
+                            self.repo, task["id"], "cancelled-impl", value, "recorded outcome")
+                    elif kind == "result":
+                        changed = coordination.load_task(self.repo, task["id"])
+                        next(row for row in changed["deliverables"]
+                             if row["id"] == "cancelled-impl")["result"] = value
+                        self.save(changed)
+                    else:
+                        coordination.observe_coordinator_result(
+                            self.repo, task["id"], "cancelled-impl", "cancelled",
+                            "cancelled before a later mutation")
+                        coordination.record_coordinator_event(
+                            self.repo, task["id"], "mutation_requested", ["src/cancelled.py"])
+                issues = coordination.validate_task(self.repo, task["id"])
+                self.assertTrue(
+                    any("cancelled-impl" in issue and "retained by coordinator" in issue
+                        for issue in issues),
+                    (label, issues),
+                )
+
+    def test_cancellation_does_not_waive_worker_assignment_requirements(self):
+        task, _ = self.plan_cancelled_work(with_worker=False)
+        coordination.observe_coordinator_result(
+            self.repo, task["id"], "cancelled-impl", "cancelled",
+            "the only worker-eligible implementation was withdrawn")
+        issues = coordination.validate_task(self.repo, task["id"])
+        self.assertTrue(any("75/full-access requires worker assignment" in issue
+                            for issue in issues), issues)
+        self.assertFalse(any("retained by coordinator" in issue for issue in issues), issues)
+
+        task, _ = self.plan_cancelled_work(level=50, with_worker=False, sequence=2)
+        coordination.observe_coordinator_result(
+            self.repo, task["id"], "cancelled-impl", "cancelled",
+            "the only implementation was withdrawn")
+        issues = coordination.validate_task(self.repo, task["id"])
+        self.assertTrue(any("50/full-access requires at least one worker implementation" in issue
+                            for issue in issues), issues)
+
+
 class ReadinessAndAttributionTests(CoordinationCase):
     def test_missing_declared_command_fails_readiness_before_worker(self):
         task = self.start()

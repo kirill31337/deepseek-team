@@ -301,6 +301,21 @@ def _deliverable_outcome(task, item):
     return result.get('outcome') or 'pending'
 
 
+def _current_cancellation(task, item):
+    """A current cancellation is historical, not retained active work.
+
+    Outcome freshness still comes from ``_deliverable_outcome`` so a later
+    mutation invalidates it. Requiring the same nonempty evidence as the result
+    recorder prevents a bare ledger outcome from bypassing distribution checks.
+    """
+    if _deliverable_outcome(task, item) != 'cancelled':
+        return False
+    result = item.get('result')
+    return (isinstance(result, dict)
+            and isinstance(result.get('evidence'), str)
+            and bool(result['evidence'].strip()))
+
+
 def completion_issues(task):
     """Require terminal outcomes for work not tracked by worker assignments."""
     issues = []
@@ -1742,7 +1757,8 @@ def validate_task(root: Path, task_id: str) -> list[str]:
         if executor == "coordinator" and eligible:
             if access == "read-only" and kind in WORKER_WRITE_KINDS:
                 continue
-            if level == 75 and not _retention_ok(task, item):
+            if (level == 75 and not _retention_ok(task, item)
+                    and not _current_cancellation(task, item)):
                 issues.append(f"{item['id']}: worker-eligible {kind} retained by coordinator without a supported constraint")
     if level == 75 and access == "full-access" and eligible_count and worker_count == 0:
         issues.append("75/full-access requires worker assignment for separable worker-eligible deliverables")

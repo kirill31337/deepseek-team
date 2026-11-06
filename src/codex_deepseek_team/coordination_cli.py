@@ -8,6 +8,12 @@ from . import coordination
 
 
 MAX_FEEDBACK_BYTES = 64 * 1024
+_INVALID_TASK_ID = (
+    "Invalid coordination task id. Expected 'task-' followed by exactly 20 lowercase "
+    "hexadecimal characters. Task IDs are created by session/turn hooks; run "
+    "`deepseek-team coordination status --session SESSION` with the session id from "
+    "the hook context to find the current task."
+)
 
 
 def _read_feedback(source, label):
@@ -198,5 +204,8 @@ def main(argv):
                     print('- ' + issue)
         return 0
     except coordination.CoordinationError as error:
-        print(error.message, file=sys.stderr)
+        message = (_INVALID_TASK_ID
+                   if error.message == "Invalid coordination task id."
+                   else error.message)
+        print(message, file=sys.stderr)
         return error.code
