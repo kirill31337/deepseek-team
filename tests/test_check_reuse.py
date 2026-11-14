@@ -714,12 +714,18 @@ class IneligibleInputTests(CheckReuseCase):
         self.assertEqual(len(self.cache_entries()), 1)
 
     def test_root_owned_system_executable_is_hashable_for_nonroot_workspace(self):
-        executable = Path(shutil.which('env') or LAUNCHER)
+        executable = Path(shutil.which('env') or LAUNCHER).resolve()
         if os.stat(executable).st_uid != 0:
             self.skipTest('the local env executable is not root-owned')
         with mock.patch.object(check_reuse.os, 'geteuid', return_value=1000):
             identity = check_reuse._hash_executable(executable)
         self.assertEqual(identity['size'], executable.stat().st_size)
+        link = self.root / 'system-executable-link'
+        link.symlink_to(executable)
+        with mock.patch.object(check_reuse.os, 'geteuid', return_value=1000):
+            linked_identity = check_reuse._hash_executable(link)
+        self.assertEqual(linked_identity['link'], str(executable))
+        self.assertEqual(linked_identity['target'], identity)
 
 
 class WorkspaceVerifyCallPathTests(CheckReuseCase):

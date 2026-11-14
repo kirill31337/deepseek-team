@@ -464,3 +464,11 @@ T1–T6 принимаются отдельно по reproducer, negative contro
   и установленный native-hook protocol canary прошли с сохранением внешнего config.
   Коммит, supported CI matrix, tag и проверка опубликованных registry artifacts
   выполняются после этих локальных gates.
+- Первый main CI на d60f0cb прошёл Release verification и Delegation verification.
+  Tests выявил старое предположение fixture об обычном системном env executable.
+  На runner выбран symlink, для которого штатная identity содержит link/target.
+  Контролируемый symlink локально воспроизвёл точный KeyError. Координатор уточнил
+  существующий контроль root-owned target и добавил проверку symlink identity.
+  Production hashing сохраняет действующий формат. Host check-reuse65 и
+  Python3.14 ineligible13 прошли. Исправление относится к minor fixture rework
+  внутри зарегистрированного T4 scope. Новый main CI выполняет полную матрицу.
