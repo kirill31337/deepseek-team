@@ -26,6 +26,7 @@ from __future__ import annotations
 import fcntl
 from contextlib import contextmanager
 import errno
+import json
 import math
 import os
 from pathlib import Path
@@ -46,7 +47,9 @@ ALLOCATOR_LOCK = 'allocator.lock'
 # platforms, invalidated watches and missed or coalesced hints.
 _REVALIDATE_INTERVAL = 1.0
 _SLOT_NAME = 'worker-{number}.lock'
+_SLOT_BINDING = 'slot-owner-{number:02d}.json'
 _TICKET_RE = re.compile(r'^ticket-(\d+)$')
+_BINDING_KEYS = frozenset(('task_id', 'assignment_id', 'token', 'generation'))
 _UNSAFE = ('Worker state requires a private user-owned directory (700) and '
            'regular lock files (600), without symlinks or hard links.')
 _BAD_LIMIT = f'limit must be an integer between 1 and {MAX_MAX_WORKERS}.'
@@ -64,7 +67,8 @@ class SlotError(Exception):
 
 def acquire(state: Path, *, limit: int = DEFAULT_MAX_WORKERS, timeout: float = 0,
             wait: bool = True, on_wait: Optional[Callable[[], object]] = None,
-            validate: Optional[Callable[[], object]] = None) -> int:
+            validate: Optional[Callable[[], object]] = None,
+            binding: Optional[dict] = None) -> int:
     """Acquire a flock-held worker slot and return its file descriptor.
 
     ``limit`` caps how many of the 64 slots may run concurrently for this caller.
@@ -82,6 +86,8 @@ def acquire(state: Path, *, limit: int = DEFAULT_MAX_WORKERS, timeout: float = 0
         raise SlotError(64, 'on_wait must be callable or None.')
     if validate is not None and not callable(validate):
         raise SlotError(64, 'validate must be callable or None.')
+    if binding is not None and not _valid_binding(binding):
+        raise SlotError(64, 'binding must identify one launch reservation.')
     state = Path(state)
 
     directory = _open_state(state)
@@ -104,8 +110,9 @@ def acquire(state: Path, *, limit: int = DEFAULT_MAX_WORKERS, timeout: float = 0
             _call(validate)
             try:
                 if wait and ticket_fd is None:
-                    ticket_fd, ticket_name, sequence = _enqueue(directory, validate)
-                slot = _attempt(directory, limit, sequence, validate)
+                    ticket_fd, ticket_name, sequence = _enqueue(
+                        directory, validate, binding)
+                slot = _attempt(directory, limit, sequence, validate, binding)
             except BlockingIOError:
                 # Contention on the allocator is queue wait too: it must obey
                 # the same cancellation/deadline/no-wait policy as busy slots.
@@ -179,6 +186,59 @@ def _check_timeout(timeout: object) -> float:
 def _call(callback: Optional[Callable[[], object]]) -> None:
     if callback is not None:
         callback()
+
+
+def _valid_binding(value) -> bool:
+    return (isinstance(value, dict) and set(value) >= _BINDING_KEYS
+            and isinstance(value['task_id'], str) and value['task_id']
+            and isinstance(value['assignment_id'], str) and value['assignment_id']
+            and isinstance(value['token'], str) and 0 < len(value['token']) <= 128
+            and type(value['generation']) is int and value['generation'] > 0)
+
+
+def _binding_bytes(binding) -> bytes:
+    if binding is None:
+        return b''
+    payload = {key: binding[key] for key in _BINDING_KEYS}
+    return (json.dumps(payload, sort_keys=True, separators=(',', ':')) + '\n').encode()
+
+
+def _read_fd(fd: int) -> bytes:
+    os.lseek(fd, 0, os.SEEK_SET)
+    return os.read(fd, 16385)
+
+
+def _write_fd(fd: int, raw: bytes) -> None:
+    os.ftruncate(fd, 0)
+    os.lseek(fd, 0, os.SEEK_SET)
+    view = memoryview(raw)
+    while view:
+        written = os.write(fd, view)
+        view = view[written:]
+    os.fsync(fd)
+
+
+def _decode_binding(raw: bytes):
+    if not raw:
+        return None
+    try:
+        value = json.loads(raw.decode('utf-8'))
+    except (ValueError, UnicodeError):
+        return None
+    return dict(value) if _valid_binding(value) else None
+
+
+def _read_binding_fd(fd: int):
+    raw = _read_fd(fd)
+    return _decode_binding(raw) if len(raw) <= 16384 else None
+
+
+def _write_binding_name(directory: int, name: str, binding) -> None:
+    fd = _open_file(directory, name, create=True)
+    try:
+        _write_fd(fd, _binding_bytes(binding))
+    finally:
+        os.close(fd)
 
 
 def _open_state(state: Path) -> int:
@@ -266,7 +326,7 @@ def _pending_before(directory: int, sequence: Optional[int]) -> int:
                if sequence is None or number < sequence)
 
 
-def _enqueue(directory: int, validate=None) -> tuple[int, str, int]:
+def _enqueue(directory: int, validate=None, binding=None) -> tuple[int, str, int]:
     allocator = _allocator(directory)
     try:
         _call(validate)
@@ -280,6 +340,15 @@ def _enqueue(directory: int, validate=None) -> tuple[int, str, int]:
         except OSError:
             os.close(fd)
             raise SlotError(78, _UNSAFE) from None
+        try:
+            _write_fd(fd, _binding_bytes(binding))
+        except BaseException:
+            try:
+                os.unlink(name, dir_fd=directory)
+            except OSError:
+                pass
+            os.close(fd)
+            raise
         return fd, name, sequence
     finally:
         os.close(allocator)
@@ -312,7 +381,7 @@ def _probe_slots(directory: int) -> tuple[int, list[int]]:
     return occupied, free
 
 
-def _allocate_slot(directory: int, free: list[int]) -> int:
+def _allocate_slot(directory: int, free: list[int], binding=None) -> int:
     for number in free:
         fd = _open_file(directory, _SLOT_NAME.format(number=number), create=True)
         try:
@@ -323,12 +392,17 @@ def _allocate_slot(directory: int, free: list[int]) -> int:
         except OSError:
             os.close(fd)
             raise SlotError(78, _UNSAFE) from None
+        try:
+            _write_binding_name(directory, _SLOT_BINDING.format(number=number), binding)
+        except BaseException:
+            os.close(fd)
+            raise
         return fd
     raise SlotError(75, 'No worker slot could be allocated.')
 
 
 def _attempt(directory: int, limit: int, sequence: Optional[int],
-             validate: Optional[Callable[[], object]]) -> Optional[int]:
+             validate: Optional[Callable[[], object]], binding=None) -> Optional[int]:
     """Admit at most one caller while holding the private allocator lock."""
     allocator = _allocator(directory)
     try:
@@ -340,9 +414,82 @@ def _attempt(directory: int, limit: int, sequence: Optional[int],
         if _pending_before(directory, sequence):
             return None
         _call(validate)
-        return _allocate_slot(directory, free)
+        return _allocate_slot(directory, free, binding)
     finally:
         os.close(allocator)
+
+
+def inspect_bindings(state: Path) -> list[dict]:
+    """Return live queue artifacts and their launch bindings without waiting.
+
+    A legacy artifact with no parseable binding is reported as ``ambiguous`` so
+    callers can fail closed. Dead tickets are reclaimed under the allocator lock;
+    dead slots and stale sidecars are ignored because the descriptor flock is the
+    authority for a running owner.
+    """
+    state = Path(state)
+    if not os.path.lexists(state):
+        return []
+    from .state_storage import open_owned_directory_for_inspection, StorageError
+    try:
+        directory = open_owned_directory_for_inspection(state)
+    except StorageError as error:
+        raise SlotError(error.code, str(error)) from None
+    try:
+        try:
+            allocator = _allocator(directory)
+        except OSError as error:
+            raise SlotError(75, 'Cannot inspect queued worker processes safely.') from error
+        try:
+            _reclaim_stale_tickets(directory)
+            found = []
+            for _, name in _tickets(directory):
+                try:
+                    fd = _open_file(directory, name, create=False, read_only=True)
+                except FileNotFoundError:
+                    continue
+                try:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        binding = _read_binding_fd(fd)
+                        found.append({'kind': 'ticket', 'name': name,
+                                      'binding': binding, 'ambiguous': binding is None})
+                finally:
+                    os.close(fd)
+            names = set(os.listdir(directory))
+            for number in range(MAX_MAX_WORKERS):
+                name = _SLOT_NAME.format(number=number)
+                if name not in names:
+                    continue
+                try:
+                    fd = _open_file(directory, name, create=False, read_only=True)
+                except FileNotFoundError:
+                    continue
+                try:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        sidecar = _SLOT_BINDING.format(number=number)
+                        binding = None
+                        try:
+                            side_fd = _open_file(directory, sidecar, create=False, read_only=True)
+                        except (FileNotFoundError, SlotError):
+                            side_fd = None
+                        if side_fd is not None:
+                            try:
+                                binding = _read_binding_fd(side_fd)
+                            finally:
+                                os.close(side_fd)
+                        found.append({'kind': 'slot', 'name': name,
+                                      'binding': binding, 'ambiguous': binding is None})
+                finally:
+                    os.close(fd)
+            return found
+        finally:
+            os.close(allocator)
+    finally:
+        os.close(directory)
 
 
 @contextmanager

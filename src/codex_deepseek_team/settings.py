@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+import errno
 import fcntl
 import json
 import os
@@ -89,6 +90,50 @@ class Policy:
         }
 
 
+def access_explanation(policy: Policy) -> str:
+    """Causal, content-free explanation of the effective write access.
+
+    Only setting names and source labels are included. File contents, raw TOML
+    and credentials never enter diagnostics.
+    """
+    sources = policy.sources
+    access_source = sources.get('access', 'default')
+    level_source = sources.get('delegation_level', 'default')
+    source_text = (f'access source={access_source}; '
+                   f'delegation_level source={level_source}')
+    if policy.access == 'read-only':
+        return ('Current effective access is read-only because access is explicitly '
+                f'read-only ({source_text}).')
+    if policy.access == 'auto':
+        if access_source == 'default':
+            return (f'Current effective access is {policy.effective_access} because no saved '
+                    'access layer is present; default access=auto with delegation_level='
+                    f'{policy.delegation_level} ({source_text}) yields '
+                    f'{policy.effective_access}.')
+        if policy.effective_access == 'read-only':
+            return ('Current effective access is read-only because access=auto follows '
+                    f'delegation_level={policy.delegation_level} ({source_text}); '
+                    'only an explicit 50/75 profile widens writes.')
+        return (f'Current effective access is {policy.effective_access} because '
+                'access=auto follows the explicit 50/75 profile '
+                f'delegation_level={policy.delegation_level} ({source_text}).')
+    return f'Current effective access is {policy.effective_access} ({source_text}).'
+
+
+def write_access_revoked_message(policy: Policy) -> str:
+    """Actionable queue/plan error for a revoked writing assignment."""
+    return ('Current effective access no longer permits writes. '
+            + access_explanation(policy)
+            + ' Restore explicit full-access for this project, revise the plan, '
+              'or keep this slice with the coordinator.')
+
+
+def access_read_failure_message(error: BaseException) -> str:
+    """Fail-closed message when the current access layer cannot be read."""
+    return ('Current effective access could not be read safely; writes are not '
+            f'permitted. {error}')
+
+
 def global_file() -> Path:
     root = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config')
     if not root.is_absolute():
@@ -143,19 +188,70 @@ def _canonicalize_effort(values: dict) -> dict:
     return values
 
 
+def _open_settings(path: Path) -> int:
+    """Open one settings candidate without following links or blocking on FIFOs."""
+    return os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+
+
+def _settings_read_error(path: Path, error: OSError) -> SettingsError:
+    """Controlled read failure that names only the path and OS cause."""
+    return SettingsError(
+        f'Cannot safely read settings {path}: '
+        f'{error.strerror or "read failed"}; no settings fallback was used.')
+
+
 def read_bytes(path: Path) -> bytes | None:
-    """Raw settings bytes; symlinks and hardlinks are refused."""
+    """Raw settings bytes; unsafe and non-file layers fail closed.
+
+    A genuinely absent settings file keeps the documented fallback to lower
+    layers. Every other read failure is a controlled ``SettingsError`` that
+    names the path and cause without reading or replacing the file.
+    """
+    path = Path(path)
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        fd = _open_settings(path)
     except FileNotFoundError:
         return None
-    except OSError:
-        raise SettingsError(f'Cannot safely read settings: {path}. Symlinks are refused.') from None
-    with os.fdopen(fd, 'rb') as stream:
-        info = os.fstat(stream.fileno())
-        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
-            raise SettingsError(f'Settings must be an ordinary non-hardlinked file: {path}.')
-        raw = stream.read(65537)
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise SettingsError(
+                f'Settings must be an ordinary file, not a symbolic link: {path}.') from None
+        if error.errno in (errno.EACCES, errno.EPERM):
+            raise SettingsError(
+                f'Cannot read settings {path}: permission denied; '
+                'no settings fallback was used.') from None
+        if error.errno == errno.EISDIR:
+            raise SettingsError(
+                f'Settings path must be an ordinary file, not a directory: {path}.') from None
+        raise _settings_read_error(path, error) from None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            reason = 'a directory' if stat.S_ISDIR(info.st_mode) else 'a special file'
+            raise SettingsError(
+                f'Settings must be an ordinary file, not {reason}: {path}.')
+        if info.st_nlink != 1:
+            raise SettingsError(
+                f'Settings must be an ordinary file with exactly one hard link: {path}.')
+    except OSError as error:
+        os.close(fd)
+        raise _settings_read_error(path, error) from None
+    except BaseException:
+        os.close(fd)
+        raise
+    try:
+        stream = os.fdopen(fd, 'rb')
+    except OSError as error:
+        os.close(fd)
+        raise _settings_read_error(path, error) from None
+    except BaseException:
+        os.close(fd)
+        raise
+    try:
+        with stream:
+            raw = stream.read(65537)
+    except OSError as error:
+        raise _settings_read_error(path, error) from None
     if len(raw) > 65536:
         raise SettingsError(f'Settings file is too large: {path}.')
     return raw

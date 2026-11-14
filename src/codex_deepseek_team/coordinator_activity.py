@@ -401,6 +401,17 @@ def _reference_problem(root, task, item, reference, worker_write_kinds):
         if assignment.get('status') not in ('succeeded', 'failed'):
             return (f"{identity}: integration_of {reference!r} is still pending; review its "
                     "terminal result first")
+        for field, flag in (('job_finalization', 'discarded'),
+                            ('job_finalization_request', 'discard_result')):
+            state = assignment.get(field)
+            if state is None:
+                continue
+            if (not isinstance(state, dict)
+                    or (flag in state and type(state[flag]) is not bool)):
+                return f"{identity}: integration_of {reference!r} has malformed finalization evidence"
+            if state.get(flag) is True:
+                return (f"{identity}: integration_of {reference!r} has a discarded result "
+                        "or a pending discard intent and cannot provide integration provenance")
         if (not isinstance(assignment.get('worker_changes'), list)
                 or not assignment['worker_changes']):
             return (f"{identity}: integration_of {reference!r} recorded no actual "

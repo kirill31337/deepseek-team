@@ -7,9 +7,11 @@ runs as root: result capture uses a sparse, private-network user namespace.
 from __future__ import annotations
 
 from contextlib import contextmanager, ExitStack, nullcontext
+import errno
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -20,8 +22,29 @@ import uuid
 
 from . import state_storage, workspace_lifecycle as lifecycle
 from .atomic_rename import move
+from .workspace import WorkspaceError
 
 MAX_PATCH_BYTES = 64 * 1024 * 1024
+MAX_RESULT_BYTES = 2 * 1024 * 1024
+MAX_CONTROL_BYTES = 4096
+DISCARD_REASONS = frozenset((
+    'git_integrity_mismatch', 'capture_too_large',
+    'capture_unavailable', 'capture_failed'))
+
+
+class CaptureFailure(WorkspaceError):
+    """A capture refusal in one of the closed, verified failure branches.
+
+    Only this typed exception authorizes the destructive ``discard_result``
+    path.  Unknown exceptions, signals, malformed protocol responses and
+    publication failures deliberately do not become ``CaptureFailure``.
+    """
+
+    def __init__(self, reason_code, message, *, code=None):
+        if reason_code not in DISCARD_REASONS:
+            raise ValueError('Unsupported capture failure code.')
+        super().__init__(message, 73 if reason_code == 'git_integrity_mismatch' else 78)
+        self.reason_code = reason_code
 
 
 def _identity(info):
@@ -181,77 +204,244 @@ def _references(paths):
 
 
 _CAPTURE = r'''
-import os, subprocess, sys
-if os.geteuid() == 0:
-    raise SystemExit(78)
-limit = 64 * 1024 * 1024
+import errno, hashlib, json, os, subprocess, sys
+
+LIMIT = 64 * 1024 * 1024
+CONTROL_MAX = 4096
+
+class Failure(Exception):
+    def __init__(self, code, step):
+        self.code = code
+        self.step = step
+
+def report(payload):
+    raw = json.dumps(payload, separators=(',', ':'), sort_keys=True).encode('ascii')
+    if len(raw) > CONTROL_MAX:
+        raise RuntimeError('control response exceeds its bound')
+    os.write(2, raw)
+
 base = ['git', '--no-pager', '--git-dir=/work/.git', '--work-tree=/work',
         '-c', 'safe.directory=/work', '-c', 'core.fsmonitor=false',
         '-c', 'core.hooksPath=/dev/null', '-c', 'core.attributesFile=/dev/null',
         '-c', 'core.filemode=true', '-c', 'core.ignoreStat=false',
         '-c', 'diff.autoRefreshIndex=false']
-def run(args, ok=(0,)):
-    p = subprocess.Popen(base + args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+def run(args, ok=(0,), env=None, step='git'):
+    try:
+        process = subprocess.Popen(base + args, env=env, stdout=subprocess.PIPE,
+                                   stderr=subprocess.DEVNULL)
+    except OSError as error:
+        if error.errno in (errno.ENOENT, errno.EACCES, errno.EPERM):
+            raise Failure('capture_unavailable', step)
+        raise
     chunks, length = [], 0
     try:
         while True:
-            block = p.stdout.read(65536)
-            if not block: break
+            block = process.stdout.read(65536)
+            if not block:
+                break
             length += len(block)
-            if length > limit: raise RuntimeError('result patch exceeds compact artifact bound')
+            if length > LIMIT:
+                raise Failure('capture_too_large', step)
             chunks.append(block)
-        if p.wait() not in ok: raise RuntimeError('cannot capture verified result')
-        return b''.join(chunks)
+        code = process.wait()
     finally:
-        p.stdout.close()
-        if p.poll() is None: p.kill()
-        p.wait()
-head = run(['rev-parse', '--verify', 'HEAD']).strip().decode('ascii')
-if head != sys.argv[1]: raise SystemExit(73)
-patch = run(['diff', '--binary', '--full-index', '--no-ext-diff', '--no-textconv',
-             '--no-renames', 'HEAD', '--'])
-for raw in run(['ls-files', '--others', '--exclude-standard', '-z']).split(b'\0'):
-    if raw:
-        patch += run(['diff', '--no-index', '--binary', '--full-index', '--no-ext-diff',
-                      '--no-textconv', '--', '/dev/null', os.fsdecode(raw)], (0, 1))
-        if len(patch) > limit: raise RuntimeError('result patch exceeds compact artifact bound')
-sys.stdout.buffer.write(patch)
+        process.stdout.close()
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+    if code < 0:
+        raise RuntimeError('capture command ended by signal')
+    if code not in ok:
+        raise Failure('capture_failed', step)
+    return b''.join(chunks)
+
+def capture():
+    head = run(['rev-parse', '--verify', 'HEAD'], step='head').strip().decode('ascii')
+    if head != sys.argv[1]:
+        raise Failure('git_integrity_mismatch', 'head')
+    patch = run(['diff', '--binary', '--full-index', '--no-ext-diff', '--no-textconv',
+                 '--no-renames', sys.argv[1], '--'], step='diff')
+    for raw in run(['ls-files', '--others', '--exclude-standard', '-z'],
+                   step='ls-files').split(b'\0'):
+        if raw:
+            patch += run(['diff', '--no-index', '--binary', '--full-index',
+                          '--no-ext-diff', '--no-textconv', '--', '/dev/null',
+                          os.fsdecode(raw)], (0, 1), step='untracked')
+            if len(patch) > LIMIT:
+                raise Failure('capture_too_large', 'patch')
+    sys.stdout.buffer.write(patch)
+    sys.stdout.buffer.flush()
+    report({'status': 'ok', 'bytes': len(patch),
+            'sha256': hashlib.sha256(patch).hexdigest()})
+
+try:
+    capture()
+except Failure as failure:
+    report({'status': 'error', 'code': failure.code, 'step': failure.step})
+    raise SystemExit(1)
+except BaseException:
+    report({'status': 'error', 'code': 'internal'})
+    raise SystemExit(1)
 '''
 
-
 def _capture(copy):
-    from . import sandbox, workspace
+    """Run the bounded capture protocol and return patch bytes.
+
+    Only a verified structural mismatch, the encoded-size bound, a diagnosed
+    mandatory-sandbox/launch refusal, or a controlled capture failure raises
+    ``CaptureFailure``.  Every unknown signal, protocol, exception or output
+    state leaves the copy untouched by remaining an ordinary error.
+    """
+    from . import git_integrity, sandbox
+
     if not copy.metadata.get('base_head'):
         # An interrupted allocation before fetching any source has no trusted
         # baseline. Preserve only an empty/non-project tree automatically.
         if {entry.name for entry in copy.path.iterdir()} - {'.git'}:
-            raise lifecycle.error('Incomplete source baseline needs explicit recovery before cleanup.', 73)
+            raise CaptureFailure(
+                'capture_unavailable',
+                'Incomplete source baseline needs explicit recovery before cleanup.')
         return b''
-    if workspace._git_digest(copy.path) != copy.metadata.get('git_digest'):
-        raise lifecycle.error('Git administrative state changed; result capture refused.', 73)
+    evidence = copy.metadata.get('git_integrity')
+    try:
+        if evidence is not None:
+            git_integrity.verify(copy.path, evidence)
+        elif copy.metadata.get('git_digest'):
+            if not git_integrity.legacy_matches(
+                    copy.path, copy.metadata['git_digest']):
+                raise git_integrity.GitIntegrityError(
+                    'Git administrative state changed; result capture refused.')
+        else:
+            raise CaptureFailure(
+                'capture_unavailable',
+                'Git integrity evidence is unavailable; result capture refused.')
+    except git_integrity.GitIntegrityError as error:
+        if getattr(error, 'kind', None) == 'unsupported':
+            raise CaptureFailure('capture_unavailable', str(error)) from None
+        if getattr(error, 'kind', None) == 'integrity_mismatch':
+            raise CaptureFailure('git_integrity_mismatch', str(error)) from None
+        raise lifecycle.error('Git integrity could not be inspected; copy preserved.', 78) from None
+
     try:
         backend = sandbox.probe_backend()
-        uid = os.geteuid() or 65534
-        gid = os.getegid() if os.geteuid() else 65534
-        args = [*backend.prefix, '--die-with-parent', '--new-session', '--unshare-user',
-                '--uid', str(uid), '--gid', str(gid), '--unshare-pid', '--unshare-ipc',
-                '--unshare-uts', '--unshare-net', '--disable-userns', '--cap-drop', 'ALL']
-        for path in ('/usr', '/bin', '/lib', '/lib64'):
-            if Path(path).exists():
-                args += ['--ro-bind', path, path]
-        args += ['--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp',
-                 '--ro-bind', str(copy.path), '/work', '--chdir', '/work', '--',
-                 '/usr/bin/python3', '-c', _CAPTURE, copy.metadata['base_head']]
-        env = {'PATH': '/usr/bin:/bin', 'HOME': '/tmp', 'LC_ALL': 'C',
-               'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null',
-               'GIT_OPTIONAL_LOCKS': '0', 'GIT_TERMINAL_PROMPT': '0'}
-        result = subprocess.run(args, env=env, capture_output=True, timeout=120, check=False)
-    except (OSError, subprocess.SubprocessError, sandbox.SandboxError):
-        raise lifecycle.error('Cannot capture result in the required unprivileged namespace; copy preserved.') from None
-    if result.returncode or len(result.stdout) > MAX_PATCH_BYTES:
-        raise lifecycle.error('Unprivileged result capture failed; execution data was preserved.',
-                              73 if result.returncode == 73 else 78)
-    return result.stdout
+    except sandbox.SandboxError as error:
+        raise CaptureFailure('capture_unavailable', error.message) from None
+    uid = os.geteuid() or 65534
+    gid = os.getegid() if os.geteuid() else 65534
+    object_format = (evidence.get('object_format')
+                     if isinstance(evidence, dict) else None)
+    try:
+        # C1 owns private-index creation and seeding. The verified index is
+        # mounted read-only; Git never reads the worker-controlled index.
+        with git_integrity.temporary_index(
+                copy.path, copy.metadata['base_head'],
+                object_format=object_format) as index_env:
+            index_file = Path(index_env.get('GIT_INDEX_FILE', ''))
+            if not index_file.is_absolute() or not index_file.name:
+                raise lifecycle.error('Private capture index is unavailable; copy preserved.', 78)
+            try:
+                index_fd = os.open(index_file.parent,
+                                   os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            except OSError as error:
+                if error.errno in (errno.ENOENT, errno.EACCES, errno.EPERM):
+                    raise CaptureFailure(
+                        'capture_unavailable',
+                        'The verified capture index is unavailable; copy preserved.') from None
+                raise
+            try:
+                args = [*backend.prefix, '--die-with-parent', '--new-session', '--unshare-user',
+                        '--uid', str(uid), '--gid', str(gid), '--unshare-pid', '--unshare-ipc',
+                        '--unshare-uts', '--unshare-net', '--disable-userns', '--cap-drop', 'ALL']
+                for path in ('/usr', '/bin', '/lib', '/lib64'):
+                    if Path(path).exists():
+                        args += ['--ro-bind', path, path]
+                args += ['--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp',
+                         '--ro-bind-fd', str(index_fd), '/capture-index',
+                         '--ro-bind', str(copy.path), '/work', '--chdir', '/work', '--',
+                         '/usr/bin/python3', '-c', _CAPTURE, copy.metadata['base_head']]
+                env = {'PATH': '/usr/bin:/bin', 'HOME': '/tmp', 'LC_ALL': 'C',
+                       'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null',
+                       'GIT_OPTIONAL_LOCKS': '0', 'GIT_TERMINAL_PROMPT': '0',
+                       'GIT_INDEX_FILE': '/capture-index/' + index_file.name}
+                try:
+                    result = subprocess.run(args, env=env, capture_output=True, timeout=120,
+                                            check=False, pass_fds=(index_fd,))
+                except subprocess.TimeoutExpired:
+                    raise CaptureFailure(
+                        'capture_failed',
+                        'Result capture exceeded its controlled time limit; copy preserved.') from None
+                except OSError as error:
+                    if error.errno in (errno.ENOENT, errno.EACCES, errno.EPERM):
+                        raise CaptureFailure(
+                            'capture_unavailable',
+                            'Cannot launch the required unprivileged capture; copy preserved.') from None
+                    raise
+                except sandbox.SandboxError as error:
+                    raise CaptureFailure('capture_unavailable', error.message) from None
+            finally:
+                os.close(index_fd)
+    except git_integrity.GitIntegrityError as error:
+        if getattr(error, 'kind', None) == 'unsupported':
+            raise CaptureFailure('capture_unavailable', str(error)) from None
+        if getattr(error, 'kind', None) == 'integrity_mismatch':
+            raise CaptureFailure('git_integrity_mismatch', str(error)) from None
+        raise lifecycle.error('Git integrity could not be inspected; copy preserved.', 78) from None
+
+    stdout = getattr(result, 'stdout', None)
+    stderr = getattr(result, 'stderr', None)
+    if (type(result.returncode) is not int or not isinstance(stdout, bytes)
+            or not isinstance(stderr, bytes)):
+        raise lifecycle.error('Result capture returned an unknown output shape; copy preserved.', 78)
+    # A signal is not a structured capture refusal. The same is true for a
+    # missing, oversized or malformed response; neither may authorize deletion.
+    if result.returncode < 0:
+        raise lifecycle.error('Result capture ended by an unknown signal; copy preserved.', 78)
+    control = _capture_control(stderr)
+    status = control.get('status')
+    if status == 'ok':
+        if (result.returncode != 0 or set(control) != {'status', 'bytes', 'sha256'}
+                or type(control.get('bytes')) is not int or control['bytes'] != len(stdout)
+                or not isinstance(control.get('sha256'), str)
+                or control['sha256'] != hashlib.sha256(stdout).hexdigest()):
+            raise lifecycle.error('Result capture protocol response is inconsistent; copy preserved.', 78)
+        if len(stdout) > MAX_PATCH_BYTES:
+            raise CaptureFailure(
+                'capture_too_large', 'Result patch exceeds the compact artifact bound.')
+        return stdout
+    if status == 'error':
+        code = control.get('code')
+        step = control.get('step')
+        steps = {
+            'git_integrity_mismatch': ('head',),
+            'capture_too_large': ('head', 'diff', 'ls-files', 'untracked', 'patch'),
+            'capture_unavailable': ('head', 'diff', 'ls-files', 'untracked'),
+            'capture_failed': ('head', 'diff', 'ls-files', 'untracked'),
+        }
+        if (result.returncode != 1 or not isinstance(code, str)
+                or code not in DISCARD_REASONS
+                or set(control) != {'status', 'code', 'step'}
+                or not isinstance(step, str) or step not in steps[code]):
+            raise lifecycle.error('Result capture protocol response is unknown; copy preserved.', 78)
+        messages = {
+            'git_integrity_mismatch': 'Verified Git baseline mismatch; result capture refused.',
+            'capture_too_large': 'Result patch exceeds the compact artifact bound; copy preserved.',
+            'capture_unavailable': 'The required capture boundary is unavailable; copy preserved.',
+            'capture_failed': 'A structured capture command failed; copy preserved.',
+        }
+        raise CaptureFailure(code, messages[code])
+    raise lifecycle.error('Result capture protocol response is missing or malformed; copy preserved.', 78)
+
+
+def _capture_control(raw):
+    if not raw or len(raw) > MAX_CONTROL_BYTES:
+        raise lifecycle.error('Result capture protocol response is missing or oversized; copy preserved.', 78)
+    try:
+        value = json.loads(raw)
+    except (ValueError, TypeError, UnicodeError):
+        raise lifecycle.error('Result capture protocol response is malformed; copy preserved.', 78) from None
+    if not isinstance(value, dict) or not isinstance(value.get('status'), str):
+        raise lifecycle.error('Result capture protocol response is malformed; copy preserved.', 78)
+    return value
 
 
 def _load_record(state, identifier):
@@ -272,20 +462,262 @@ def _load_record(state, identifier):
         raise lifecycle.error('Malformed workspace history; execution data preserved.') from None
 
 
+
+def _artifact_digest(fd, name):
+    """Stream one owned historical artifact without loading it into memory."""
+    if name != 'changes.patch':
+        raise lifecycle.error('Unknown historical result artifact; history preserved.', 73)
+    try:
+        source = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                         dir_fd=fd)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise lifecycle.error('Cannot read historical result artifact; history preserved.', 73) from None
+    try:
+        info = os.fstat(source)
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                or info.st_uid != os.geteuid()):
+            raise lifecycle.error('Historical result artifact is unsafe; history preserved.', 73)
+        digest, size = hashlib.sha256(), 0
+        while True:
+            chunk = os.read(source, 1024 * 1024)
+            if not chunk:
+                break
+            size += len(chunk)
+            digest.update(chunk)
+        return size, digest.hexdigest()
+    except OSError:
+        raise lifecycle.error('Cannot read historical result artifact; history preserved.', 73) from None
+    finally:
+        os.close(source)
+
+
+def _valid_attempt_id(value):
+    return value is None or (isinstance(value, str)
+                             and re.fullmatch('[0-9a-f]{32}', value) is not None)
+
+
+def _validate_finalization_block(value):
+    if value is None:
+        return
+    if (not isinstance(value, dict) or set(value) != {
+            'request_id', 'at', 'cancelled', 'discard_result', 'reason'}
+            or not re.fullmatch('[0-9a-f]{32}', str(value.get('request_id', '')))
+            or type(value.get('at')) not in (int, float) or not math.isfinite(value['at'])
+            or type(value.get('cancelled')) is not bool
+            or type(value.get('discard_result')) is not bool
+            or value['discard_result'] and not value['cancelled']
+            or not isinstance(value.get('reason'), str)
+            or not value['reason'].strip() or len(value['reason']) > 1000):
+        raise lifecycle.error('Result finalization identity is malformed; history preserved.', 73)
+
+
+def _validate_result_document(copy, result, fd, lease=None):
+    """Validate one closed result schema and its retained bytes."""
+    if not isinstance(result, dict) or type(result.get('schema')) is not int:
+        raise lifecycle.error('Unknown or malformed durable result schema; history preserved.', 73)
+    if result.get('workspace_id') != copy.id or result.get('source') != str(copy.source):
+        raise lifecycle.error('Durable result belongs to another workspace/source.', 73)
+    if lease is not None and 'job_id' in result and result['job_id'] != lease['job_id']:
+        raise lifecycle.error('Durable result belongs to another logical job.', 73)
+    if 'job_id' in result and not re.fullmatch('[0-9a-f]{32}', str(result['job_id'])):
+        raise lifecycle.error('Durable result job identity is malformed.', 73)
+    if 'attempt_id' in result and not _valid_attempt_id(result['attempt_id']):
+        raise lifecycle.error('Durable result attempt identity is malformed.', 73)
+    _validate_finalization_block(result.get('finalization'))
+    finalization = result.get('finalization')
+    lease_finalization = (lease or {}).get('finalization')
+    if lease is not None:
+        if isinstance(lease_finalization, dict):
+            if finalization is None:
+                if ('result_schema' in lease_finalization
+                        or (lease.get('cleanup') or {}).get('state') == 'cleaned'):
+                    raise lifecycle.error(
+                        'Retained result has no matching finalization identity.', 73)
+            elif not _result_matches_request(result, lease_finalization):
+                raise lifecycle.error(
+                    'Retained result does not match its finalization request.', 73)
+            if ('result_schema' in lease_finalization
+                    and lease_finalization['result_schema'] != result['schema']):
+                raise lifecycle.error(
+                    'Retained result schema conflicts with its finalization request.', 73)
+        elif finalization is not None:
+            raise lifecycle.error(
+                'Retained result claims finalization without a durable request.', 73)
+    schema = result['schema']
+    if schema == 1:
+        allowed = {'schema', 'workspace_id', 'source', 'base_head', 'patch',
+                   'job_id', 'attempt_id', 'finalization'}
+        expected_head = (copy.metadata.get('base_head')
+                         or copy.metadata.get('source_head'))
+        patch = result.get('patch')
+        if (set(result) - allowed or result.get('base_head') != expected_head
+                or not isinstance(patch, dict)
+                or set(patch) != {'file', 'bytes', 'sha256'}
+                or patch.get('file') != 'changes.patch'
+                or type(patch.get('bytes')) is not int or patch['bytes'] < 0
+                or patch['bytes'] > MAX_PATCH_BYTES
+                or not isinstance(patch.get('sha256'), str)
+                or re.fullmatch('[0-9a-f]{64}', patch['sha256']) is None):
+            raise lifecycle.error('Result schema 1 is malformed or mismatched; history preserved.', 73)
+        artifact = _artifact_digest(fd, 'changes.patch')
+        if (artifact is None or artifact[0] != patch['bytes']
+                or artifact[1] != patch['sha256']):
+            raise lifecycle.error('Result schema 1 patch failed its integrity check.', 73)
+        if isinstance(lease_finalization, dict) and 'capture' in lease_finalization:
+            capture = lease_finalization['capture']
+            if (capture['bytes'] != patch['bytes']
+                    or capture['sha256'] != patch['sha256']
+                    or capture.get('attempt_id') != result.get('attempt_id')):
+                raise lifecycle.error(
+                    'Retained capture evidence does not match the result patch.', 73)
+        return result
+    if schema == 2:
+        history = lease if lease is not None else lifecycle.read(copy)
+        if not history or result.get('job_id') != history['job_id']:
+            raise lifecycle.error('Discarded result has no matching durable job history.', 73)
+        attempt_ids = {attempt['id'] for attempt in history.get('attempts', [])}
+        if result.get('attempt_id') is not None and result['attempt_id'] not in attempt_ids:
+            raise lifecycle.error('Discarded result attempt is absent from durable job history.', 73)
+        allowed = {'schema', 'workspace_id', 'source', 'base_head', 'patch',
+                   'job_id', 'attempt_id', 'capture', 'historical_artifacts',
+                   'finalization'}
+        capture = result.get('capture')
+        artifacts = result.get('historical_artifacts')
+        if (set(result) - allowed or result.get('base_head') != copy.metadata.get('base_head')
+                or 'patch' not in result or result.get('patch') is not None
+                or not isinstance(capture, dict)
+                or set(capture) != {'status', 'reason_code', 'reason', 'baseline_status'}
+                or capture.get('status') != 'discarded'
+                or capture.get('reason_code') not in DISCARD_REASONS
+                or not isinstance(capture.get('reason'), str)
+                or not capture['reason'].strip() or len(capture['reason']) > 1000
+                or capture.get('baseline_status') != (
+                    'recorded' if result.get('base_head') else 'unavailable')
+                or not isinstance(finalization, dict)
+                or finalization.get('discard_result') is not True
+                or finalization.get('cancelled') is not True
+                or capture.get('reason') != finalization.get('reason')
+                or not isinstance(artifacts, list) or len(artifacts) > 16):
+            raise lifecycle.error('Result schema 2 is malformed or mismatched; history preserved.', 73)
+        if (isinstance(lease_finalization, dict)
+                and lease_finalization.get('reason_code') != capture['reason_code']):
+            raise lifecycle.error(
+                'Retained discard reason conflicts with its finalization request.', 73)
+        seen = set()
+        for artifact in artifacts:
+            if (not isinstance(artifact, dict)
+                    or set(artifact) != {'file', 'bytes', 'sha256', 'attempt_id', 'provenance'}
+                    or artifact.get('file') != 'changes.patch'
+                    or artifact['file'] in seen
+                    or type(artifact.get('bytes')) is not int or artifact['bytes'] < 0
+                    or not isinstance(artifact.get('sha256'), str)
+                    or re.fullmatch('[0-9a-f]{64}', artifact['sha256']) is None
+                    or artifact.get('provenance') not in
+                       ('verified_attempt', 'legacy_unattributed')
+                    or not _valid_attempt_id(artifact.get('attempt_id'))
+                    or (artifact['provenance'] == 'verified_attempt')
+                       != (artifact.get('attempt_id') is not None)):
+                raise lifecycle.error('Historical result artifact is malformed; history preserved.', 73)
+            actual = _artifact_digest(fd, artifact['file'])
+            if (actual is None or actual[0] != artifact['bytes']
+                    or actual[1] != artifact['sha256']):
+                raise lifecycle.error('Historical result artifact failed its integrity check.', 73)
+            if (artifact['provenance'] == 'verified_attempt'
+                    and artifact['attempt_id'] not in attempt_ids):
+                raise lifecycle.error('Historical artifact attempt is absent from durable job history.', 73)
+            seen.add(artifact['file'])
+        if _artifact_digest(fd, 'changes.patch') is not None and 'changes.patch' not in seen:
+            raise lifecycle.error('Retained historical patch is missing from the result manifest.', 73)
+        return result
+    raise lifecycle.error('Unknown durable result schema; history preserved.', 73)
+
+
+def _read_result_document(fd):
+    raw = lifecycle.read_file(fd, 'result.json', maximum=MAX_RESULT_BYTES)
+    if raw is None:
+        return None
+    try:
+        result = json.loads(raw)
+    except (ValueError, TypeError, UnicodeError):
+        raise lifecycle.error('Malformed durable result manifest; history preserved.', 73) from None
+    if not isinstance(result, dict):
+        raise lifecycle.error('Malformed durable result manifest; history preserved.', 73)
+    return result
+
+
+def _stale_uncommitted_result(copy, result, *, fingerprint, lease):
+    """Recognize a schema-1 historical manifest already superseded on disk.
+
+    A crash may publish new ``changes.patch`` bytes after capture but before
+    the terminal lease and manifest. The old manifest then describes bytes that
+    no longer exist. Only that exact state is recognized here: every identity,
+    baseline and patch field must still be valid, no finalization identity may
+    be present, and the retained artifact must be present but provably
+    different. The caller recaptures from the owned work tree or resumes from
+    committed capture evidence; it never adopts this manifest.
+    """
+    if (not isinstance(result, dict) or type(result.get('schema')) is not int
+            or result['schema'] != 1 or result.get('finalization') is not None):
+        return False
+    if set(result) - {'schema', 'workspace_id', 'source', 'base_head', 'patch',
+                      'job_id', 'attempt_id', 'finalization'}:
+        return False
+    expected_head = (copy.metadata.get('base_head')
+                     or copy.metadata.get('source_head'))
+    patch = result.get('patch')
+    if (result.get('workspace_id') != copy.id
+            or result.get('source') != str(copy.source)
+            or result.get('base_head') != expected_head
+            or not isinstance(patch, dict)
+            or set(patch) != {'file', 'bytes', 'sha256'}
+            or patch.get('file') != 'changes.patch'
+            or type(patch.get('bytes')) is not int or patch['bytes'] < 0
+            or patch['bytes'] > MAX_PATCH_BYTES
+            or not isinstance(patch.get('sha256'), str)
+            or re.fullmatch('[0-9a-f]{64}', patch['sha256']) is None):
+        return False
+    if 'attempt_id' in result and not _valid_attempt_id(result['attempt_id']):
+        return False
+    if 'job_id' in result:
+        if re.fullmatch('[0-9a-f]{32}', str(result['job_id'])) is None:
+            return False
+        if lease is not None and result['job_id'] != lease['job_id']:
+            return False
+    # Missing bytes are a different lost-artifact state and stay fail-closed.
+    # The content digest must differ; a wrong length with the current digest is
+    # malformed evidence, not an interrupted capture, and also stays closed.
+    return fingerprint is not None and fingerprint[1] != patch['sha256']
+
+
+def read_result(copy, *, fd=None, lease=None):
+    """Read and validate schema 1/2, or return ``None`` when absent.
+
+    A new reader must never reinterpret an unknown schema.  Older binaries are
+    not required to understand schema 2; this release fails closed instead of
+    guessing from a filename or a stray ``changes.patch``.
+    """
+    if fd is None:
+        with lifecycle.directory(copy) as directory_fd:
+            return read_result(copy, fd=directory_fd, lease=lease)
+    result = _read_result_document(fd)
+    if result is None:
+        return None
+    if lease is None and isinstance(result, dict) and result.get('schema') == 2:
+        lease = lifecycle.read(copy)
+    return _validate_result_document(copy, result, fd, lease=lease)
+
 def inspect_workspace(state, identifier):
     """History/result inspection works after the disposable checkout is gone."""
     state = state_storage.state_root(state)
     copy = _load_record(state, identifier)
+    lease = lifecycle.read(copy)
     with lifecycle.directory(copy) as fd:
-        raw = lifecycle.read_file(fd, 'result.json')
         present = lifecycle._exists(fd, 'work')
-    try:
-        result = None if raw is None else json.loads(raw)
-    except (ValueError, TypeError):
-        raise lifecycle.error('Malformed durable result manifest; history preserved.') from None
+        result = read_result(copy, fd=fd, lease=lease)
     return {'id': copy.id, 'path': str(copy.path), 'metadata': copy.metadata,
-            'lease': lifecycle.read(copy), 'result': result, 'execution_present': present}
-
+            'lease': lease, 'result': result, 'execution_present': present}
 
 @contextmanager
 def _owner(copy):
@@ -372,10 +804,21 @@ def _finish_cleanup(copy, lease, quarantine_fd):
         if not any(event.get('event') == 'cleaned' for event in lease['events']):
             lease['events'].append({'event': 'cleaned', 'at': time.time()})
         lifecycle.write(copy, lease)
-    return {'id': copy.id, 'job_id': lease['job_id'], 'action': 'cleaned',
-            'reason': lease.get('final_reason', 'finalized'),
-            'allocated_bytes': pending.get('allocated_bytes', 0),
-            'inodes': pending.get('inodes', 0)}
+    report = {'id': copy.id, 'job_id': lease['job_id'], 'action': 'cleaned',
+              'reason': lease.get('final_reason', 'finalized'),
+              'allocated_bytes': pending.get('allocated_bytes', 0),
+              'inodes': pending.get('inodes', 0)}
+    report.update(_finalization_report(lease))
+    return report
+
+
+def _finalization_report(lease):
+    finalization = (lease or {}).get('finalization')
+    if not isinstance(finalization, dict):
+        return {}
+    return {'discarded': bool(finalization.get('discarded')),
+            'reason_code': finalization.get('reason_code'),
+            'result_schema': finalization.get('result_schema')}
 
 
 def _extra_name(name):
@@ -389,25 +832,220 @@ def _valid_extra(entry):
             and type(entry.get('device')) is int and type(entry.get('inode')) is int)
 
 
-def finalize(copy, *, reason='accepted', cancelled=False, orphan=False, before_finalize=None):
+def _historical_artifacts(fd, copy, prior):
+    """List retained pre-discard bytes without claiming a missing current patch."""
+    artifact = _artifact_digest(fd, 'changes.patch')
+    if artifact is None:
+        return []
+    size, digest = artifact
+    attempt_id, provenance = None, 'legacy_unattributed'
+    if isinstance(prior, dict) and prior.get('schema') == 1:
+        patch = prior.get('patch')
+        candidate = prior.get('attempt_id')
+        if (prior.get('workspace_id') == copy.id
+                and isinstance(patch, dict) and patch.get('file') == 'changes.patch'
+                and patch.get('bytes') == size and patch.get('sha256') == digest
+                and isinstance(candidate, str)
+                and re.fullmatch('[0-9a-f]{32}', candidate) is not None
+                and candidate in {attempt['id'] for attempt in
+                                  (lifecycle.read(copy) or {}).get('attempts', [])}):
+            attempt_id, provenance = candidate, 'verified_attempt'
+    return [{'file': 'changes.patch', 'bytes': size, 'sha256': digest,
+             'attempt_id': attempt_id, 'provenance': provenance}]
+
+
+def _validate_capture_evidence(value):
+    if not isinstance(value, dict) or set(value) - {'bytes', 'sha256', 'attempt_id'}:
+        return False
+    if (type(value.get('bytes')) is not int or value['bytes'] < 0
+            or value['bytes'] > MAX_PATCH_BYTES
+            or not isinstance(value.get('sha256'), str)
+            or re.fullmatch('[0-9a-f]{64}', value['sha256']) is None
+            or not _valid_attempt_id(value.get('attempt_id'))):
+        return False
+    return True
+
+
+def _result_from_lease(copy, lease, fd, prior, request):
+    """Rebuild a manifest committed to the terminal lease before publication.
+
+    The capture identity is written before ``result.json``. A process crash in
+    that narrow gap therefore resumes publication without running capture or a
+    model again. Any byte mismatch fails closed; this never guesses a patch.
+    """
+    finalization = lease.get('finalization')
+    if not isinstance(finalization, dict) or 'result_schema' not in finalization:
+        return None
+    schema = finalization['result_schema']
+    common = {'workspace_id': copy.id, 'source': str(copy.source),
+              'finalization': dict((key, request[key]) for key in (
+                  'request_id', 'at', 'cancelled', 'discard_result', 'reason'))}
+    if 'job_id' in lease:
+        common['job_id'] = lease['job_id']
+    if schema == 1:
+        capture = finalization.get('capture')
+        if not _validate_capture_evidence(capture):
+            raise lifecycle.error(
+                'Durable capture evidence is malformed; history preserved.', 73)
+        actual = _artifact_digest(fd, 'changes.patch')
+        if (actual is None or actual[0] != capture['bytes']
+                or actual[1] != capture['sha256']):
+            raise lifecycle.error(
+                'Durable capture bytes do not match their fingerprint; copy preserved.', 73)
+        result = dict(common, schema=1,
+                      base_head=(copy.metadata.get('base_head')
+                                 or copy.metadata.get('source_head')),
+                      patch={'file': 'changes.patch', 'bytes': capture['bytes'],
+                             'sha256': capture['sha256']})
+        attempt_id = capture.get('attempt_id')
+        if attempt_id is None:
+            candidate = copy.metadata.get('attempt_id')
+            attempt_id = (candidate if isinstance(candidate, str)
+                          and re.fullmatch('[0-9a-f]{32}', candidate) else None)
+        if attempt_id is not None:
+            result['attempt_id'] = attempt_id
+        return result
+    if schema == 2:
+        if (finalization.get('discarded') is not True
+                or finalization.get('discard_result') is not True
+                or finalization.get('cancelled') is not True
+                or finalization.get('reason_code') not in DISCARD_REASONS):
+            raise lifecycle.error(
+                'Durable discard evidence is incomplete; history preserved.', 73)
+        result = dict(common, schema=2,
+                      base_head=copy.metadata.get('base_head'), patch=None,
+                      capture={'status': 'discarded',
+                               'reason_code': finalization['reason_code'],
+                               'reason': request['reason'],
+                               'baseline_status': ('recorded'
+                                   if copy.metadata.get('base_head') else 'unavailable')},
+                      historical_artifacts=_historical_artifacts(fd, copy, prior))
+        attempt_id = copy.metadata.get('attempt_id')
+        if isinstance(attempt_id, str) and re.fullmatch('[0-9a-f]{32}', attempt_id):
+            result['attempt_id'] = attempt_id
+        return result
+    raise lifecycle.error('Durable result schema is unsupported; history preserved.', 73)
+
+
+def _validate_lease_finalization(value):
+    if value is None:
+        return
+    allowed = {'request_id', 'at', 'cancelled', 'discard_result', 'reason',
+               'result_schema', 'reason_code', 'discarded', 'capture'}
+    if (not isinstance(value, dict) or set(value) - allowed
+            or not re.fullmatch('[0-9a-f]{32}', str(value.get('request_id', '')))
+            or type(value.get('at')) not in (int, float) or not math.isfinite(value['at'])
+            or type(value.get('cancelled')) is not bool
+            or type(value.get('discard_result')) is not bool
+            or value['discard_result'] and not value['cancelled']
+            or not isinstance(value.get('reason'), str)
+            or not value['reason'].strip() or len(value['reason']) > 1000
+            or ('result_schema' in value
+                and (type(value['result_schema']) is not int
+                     or value['result_schema'] not in (1, 2)))
+            or ('discarded' in value and type(value['discarded']) is not bool)
+            or ('discarded' in value and 'result_schema' not in value)
+            or ('reason_code' in value and value['reason_code'] not in DISCARD_REASONS)
+            or ('reason_code' in value and 'result_schema' not in value)
+            or (value.get('result_schema') == 2 and value.get('discarded') is not True)
+            or (value.get('result_schema') == 1 and value.get('discarded') is not False)
+            or (value.get('result_schema') == 1 and 'reason_code' in value)
+            or (value.get('result_schema') == 2
+                and value.get('reason_code') not in DISCARD_REASONS)
+            or (value.get('result_schema') == 2 and value.get('discard_result') is not True)
+            or ('capture' in value and not _validate_capture_evidence(value['capture']))
+            or ('capture' in value and value.get('result_schema') != 1)):
+        raise lifecycle.error('Logical job finalization request is malformed; copy preserved.', 73)
+
+
+def _ensure_finalization_request(lease, *, reason, cancelled, discard_result,
+                                 result_present):
+    existing = lease.get('finalization')
+    _validate_lease_finalization(existing)
+    if existing is None:
+        return ({'request_id': uuid.uuid4().hex, 'at': time.time(),
+                 'cancelled': bool(cancelled), 'discard_result': bool(discard_result),
+                 'reason': reason}, True)
+    if existing['cancelled'] != cancelled:
+        raise lifecycle.error('Finalization cannot change the original cancellation decision.', 73)
+    if 'result_schema' in existing:
+        # The result identity is already committed to the terminal lease. A
+        # repeated call cannot rewrite its schema or destructive decision.
+        if discard_result and existing.get('discard_result') is not True:
+            raise lifecycle.error(
+                'A committed captured result cannot be replaced by an explicit discard.', 73)
+        return existing, False
+    if discard_result and not existing['discard_result']:
+        if result_present:
+            raise lifecycle.error('A published result cannot be replaced by an explicit discard.', 73)
+        return (dict(existing, discard_result=True, reason=reason, at=time.time()), True)
+    # A durable destructive request remains authoritative across recovery. A
+    # caller repeating cancellation does not have to pass the flag again.
+    return existing, False
+
+
+def _result_matches_request(result, request):
+    finalization = (result or {}).get('finalization')
+    return (isinstance(finalization, dict) and isinstance(request, dict)
+            and all(finalization.get(key) == request.get(key)
+                    for key in ('request_id', 'at', 'cancelled',
+                                'discard_result', 'reason')))
+
+
+def _prior_is_finalized(prior, lease):
+    """Classify a manifest already present before this finalization attempt.
+
+    A schema 1 manifest without a finalization identity is historical evidence
+    (the completed execution's patch), not proof that a newer destructive
+    transaction has already published. A manifest carrying an identity must
+    match the durable lease request exactly; schema 2 is only meaningful after
+    such a request.
+    """
+    if prior is None:
+        return False
+    finalization = (lease or {}).get('finalization')
+    prior_finalization = prior.get('finalization')
+    if prior_finalization is not None:
+        if not _result_matches_request(prior, finalization):
+            raise lifecycle.error(
+                'An existing durable result has no matching finalization request; copy preserved.', 73)
+        return True
+    if prior.get('schema') == 1:
+        return False
+    raise lifecycle.error(
+        'Discarded history has no matching finalization request; copy preserved.', 73)
+
+
+def finalize(copy, *, reason='accepted', cancelled=False, orphan=False,
+             before_finalize=None, discard_result=False):
     # Keep the owner lock through the entire (possibly interrupted) rmtree,
     # while releasing the creation fence before recursive deletion.
     with ExitStack() as owned:
         with lifecycle.fence(copy.directory.parent.parent):
             fd = owned.enter_context(_owner(copy))
         return _finalize(copy, reason=reason, cancelled=cancelled, orphan=orphan,
-                         owner_fd=fd, before_finalize=before_finalize)
+                         owner_fd=fd, before_finalize=before_finalize,
+                         discard_result=discard_result)
 
 
-def _finalize(copy, *, reason, cancelled, orphan, owner_fd, before_finalize):
+def _finalize(copy, *, reason, cancelled, orphan, owner_fd, before_finalize,
+              discard_result=False):
     """Publish the result, end this job lease, then remove its execution tree.
 
     Caller owns final integration/review. Failure before publication preserves
-    the execution tree; interruption after rename leaves durable cleanup intent.
-    Historical record.json is never rewritten to disguise cleanup.
+    the execution tree; interruption after publication or rename leaves durable
+    identities so a repeat repairs cleanup without recapturing or rewriting
+    confirmed history. ``discard_result`` is valid only for cancellation, and
+    only a typed ``CaptureFailure`` reaches that branch.
     """
     if not isinstance(reason, str) or not reason.strip() or len(reason) > 1000:
         raise lifecycle.error('Finalization requires a bounded reason.', 64)
+    if type(discard_result) is not bool:
+        raise lifecycle.error('discard_result must be a boolean.', 64)
+    if discard_result and not cancelled:
+        raise lifecycle.error('--discard-result is valid only for cancellation.', 64)
+    if discard_result and reason.strip().lower() == 'cancelled':
+        raise lifecycle.error('Explicit discard requires a non-default reason.', 64)
     state = copy.directory.parent.parent
     quarantine_fd = None
     try:
@@ -420,13 +1058,30 @@ def _finalize(copy, *, reason, cancelled, orphan, owner_fd, before_finalize):
             if orphan and _pending_assignment(copy, lease):
                 raise lifecycle.error('A current review/retry queue protects this logical job.', 75)
             lifecycle.authorize_finalization(lease)
+            bound = (isinstance(lease, dict)
+                     and isinstance(lease.get('binding'), dict))
+            linked_metadata = bool(copy.metadata.get('coord_task')
+                                   and copy.metadata.get('coord_assignment'))
+            if (cancelled and before_finalize is None
+                    and (bound or (discard_result and linked_metadata))):
+                raise lifecycle.error(
+                    'Linked cancellation must use coordination finalize --cancel; '
+                    'copy preserved.', 64)
             if lease and lease.get('cleanup', {}).get('state') == 'cleaned':
                 if lifecycle._exists(fd, 'work'):
                     raise lifecycle.error('Cleaned job has a replacement execution tree; data preserved.', 73)
+                finalization = lease.get('finalization')
+                if discard_result and (not isinstance(finalization, dict)
+                        or finalization.get('discard_result') is not True):
+                    raise lifecycle.error(
+                        'A completed job cannot be reopened or replaced by an explicit discard.', 73)
                 if before_finalize is not None:
                     before_finalize()
-                return {'id': copy.id, 'action': 'already-cleaned', 'reason': reason,
-                        'allocated_bytes': 0, 'inodes': 0}
+                report = {'id': copy.id, 'action': 'already-cleaned',
+                          'reason': lease.get('final_reason', reason),
+                          'allocated_bytes': 0, 'inodes': 0}
+                report.update(_finalization_report(lease))
+                return report
             if lifecycle._exists(fd, 'work'):
                 identity, usage = _check_work(copy, fd, lease)
                 extras = []
@@ -443,25 +1098,122 @@ def _finalize(copy, *, reason, cancelled, orphan, owner_fd, before_finalize):
                                        'allocated_bytes': extra_usage[0], 'inodes': extra_usage[1]})
                 if _references([copy.path, *(copy.directory / entry['source'] for entry in extras)]):
                     raise lifecycle.error('A process has open execution state; cleanup deferred.', 75)
-                if before_finalize is not None:
-                    before_finalize()
-                    # Attestation can repair association; keep its durable lease.
-                    lease = lifecycle.read(copy)
-                patch = _capture(copy)
-                lifecycle.atomic_file(fd, 'changes.patch', patch)
-                result = {'schema': 1, 'workspace_id': copy.id,
-                          'source': str(copy.source),
-                          'base_head': copy.metadata.get('base_head') or copy.metadata.get('source_head'),
-                          'patch': {'file': 'changes.patch', 'bytes': len(patch),
-                                    'sha256': hashlib.sha256(patch).hexdigest()}}
-                if lease is not None:
-                    result['job_id'] = lease['job_id']
-                lifecycle.atomic_file(fd, 'result.json', (json.dumps(result) + '\n').encode())
                 lease = lease or lifecycle.initialize(copy)
+                raw_prior = _read_result_document(fd)
+                prior = None
+                if raw_prior is not None:
+                    try:
+                        prior_lease = (lease if isinstance(raw_prior, dict)
+                                       and raw_prior.get('schema') == 2 else None)
+                        prior = _validate_result_document(copy, raw_prior, fd, lease=prior_lease)
+                    except WorkspaceError:
+                        committed = lease.get('finalization')
+                        capture = (committed.get('capture')
+                                   if isinstance(committed, dict) else None)
+                        fingerprint = _artifact_digest(fd, 'changes.patch')
+                        stale = _stale_uncommitted_result(
+                            copy, raw_prior, fingerprint=fingerprint, lease=lease)
+                        # After a terminal capture, the lease fingerprint is the
+                        # only authority. Before that, a stale uncommitted
+                        # manifest is rebuilt by a fresh capture from the owned
+                        # tree. No other validation failure is tolerated.
+                        resumed = (
+                            stale
+                            and isinstance(committed, dict)
+                            and committed.get('result_schema') == 1
+                            and _validate_capture_evidence(capture)
+                            and fingerprint == (capture['bytes'], capture['sha256']))
+                        uncommitted = stale and (
+                            committed is None
+                            or (isinstance(committed, dict)
+                                and 'result_schema' not in committed))
+                        if not (resumed or uncommitted):
+                            raise
+                        prior = None
+                prior_finalized = _prior_is_finalized(prior, lease)
+                request, changed = _ensure_finalization_request(
+                    lease, reason=reason, cancelled=cancelled,
+                    discard_result=discard_result, result_present=prior_finalized)
+                if before_finalize is not None:
+                    # Attestation writes the durable ledger intent. It runs before
+                    # this copy's lease changes so a refused review leaves both
+                    # the ledger and the copy byte-identical.
+                    before_finalize()
+                    lease = lifecycle.read(copy)
+                    refreshed, _ = _ensure_finalization_request(
+                        lease, reason=reason, cancelled=cancelled,
+                        discard_result=discard_result, result_present=prior_finalized)
+                    if (isinstance(lease.get('finalization'), dict)
+                            and lease['finalization'].get('request_id') != request['request_id']):
+                        raise lifecycle.error('Finalization request changed during attestation; copy preserved.', 73)
+                    request = refreshed
+                if changed or not isinstance(lease.get('finalization'), dict):
+                    lease['finalization'] = request
+                    lifecycle.write(copy, lease)
+                effective_discard = request['discard_result'] is True
+                committed = lease.get('finalization')
+                committed_schema = (committed.get('result_schema')
+                                    if isinstance(committed, dict) else None)
+                if prior_finalized:
+                    if (committed_schema is not None
+                            and prior['schema'] != committed_schema):
+                        raise lifecycle.error(
+                            'Retained result schema conflicts with its terminal lease.', 73)
+                    if (isinstance(committed, dict)
+                            and committed.get('discarded') is not None
+                            and bool(committed['discarded']) != (prior['schema'] == 2)):
+                        raise lifecycle.error(
+                            'Retained discard state conflicts with its terminal lease.', 73)
+                    result = prior
+                elif committed_schema is not None:
+                    # Capture identity is durable in the terminal lease. Resume
+                    # publication without another model run or capture.
+                    if committed_schema == 2 and not effective_discard:
+                        raise lifecycle.error(
+                            'A committed discarded result cannot be replaced by a capture.', 73)
+                    result = _result_from_lease(copy, lease, fd, prior, request)
+                else:
+                    try:
+                        patch = _capture(copy)
+                    except CaptureFailure as failure:
+                        if not effective_discard:
+                            raise
+                        result = {'schema': 2, 'workspace_id': copy.id,
+                                  'source': str(copy.source),
+                                  'base_head': copy.metadata.get('base_head'),
+                                  'patch': None,
+                                  'capture': {
+                                      'status': 'discarded',
+                                      'reason_code': failure.reason_code,
+                                      'reason': request['reason'],
+                                      'baseline_status': ('recorded'
+                                          if copy.metadata.get('base_head') else 'unavailable')},
+                                  'historical_artifacts': _historical_artifacts(fd, copy, prior),
+                                  'finalization': dict((key, request[key]) for key in (
+                                      'request_id', 'at', 'cancelled', 'discard_result', 'reason'))}
+                    else:
+                        lifecycle.atomic_file(fd, 'changes.patch', patch)
+                        result = {'schema': 1, 'workspace_id': copy.id,
+                                  'source': str(copy.source),
+                                  'base_head': (copy.metadata.get('base_head')
+                                                or copy.metadata.get('source_head')),
+                                  'patch': {'file': 'changes.patch', 'bytes': len(patch),
+                                            'sha256': hashlib.sha256(patch).hexdigest()},
+                                  'finalization': dict((key, request[key]) for key in (
+                                      'request_id', 'at', 'cancelled', 'discard_result', 'reason'))}
+                    if lease is not None:
+                        result['job_id'] = lease['job_id']
+                    attempt_id = copy.metadata.get('attempt_id')
+                    if isinstance(attempt_id, str) and re.fullmatch('[0-9a-f]{32}', attempt_id):
+                        result['attempt_id'] = attempt_id
+                # The manifest and retained bytes are validated before the
+                # terminal lease makes the loss or capture durable.
+                _validate_result_document(copy, result, fd)
                 if lease['phase'] not in lifecycle.FINAL_PHASES:
                     lease['phase'] = 'cancelled' if cancelled else 'finalized'
-                    lease['final_reason'] = reason
-                    lease['events'].append({'event': lease['phase'], 'at': time.time(), 'reason': reason})
+                    lease['final_reason'] = request['reason']
+                    lease['events'].append({'event': lease['phase'], 'at': time.time(),
+                                            'reason': request['reason']})
                 # Idempotent recovery reuses its original quarantine name/inode.
                 pending = lease.get('cleanup') or {'name': uuid.uuid4().hex,
                     'device': identity[0], 'inode': identity[1],
@@ -471,7 +1223,26 @@ def _finalize(copy, *, reason, cancelled, orphan, owner_fd, before_finalize):
                 if (pending['device'], pending['inode']) != identity:
                     raise lifecycle.error('Cleanup intent does not match execution inode.', 73)
                 lease['cleanup'] = pending
+                terminal = dict(lease['finalization'],
+                                result_schema=result['schema'],
+                                discarded=result['schema'] == 2)
+                if result['schema'] == 1:
+                    patch = result['patch']
+                    terminal['capture'] = {
+                        'bytes': patch['bytes'], 'sha256': patch['sha256'],
+                        'attempt_id': result.get('attempt_id')}
+                    terminal.pop('reason_code', None)
+                else:
+                    terminal['reason_code'] = result['capture']['reason_code']
+                    terminal.pop('capture', None)
+                lease['finalization'] = terminal
+                # Durable request, terminal lease and cleanup intent precede
+                # manifest publication and deletion.
                 lifecycle.write(copy, lease)
+                if not prior_finalized:
+                    lifecycle.atomic_file(fd, 'result.json',
+                                          (json.dumps(result) + '\n').encode())
+                read_result(copy, fd=fd, lease=lease)
                 quarantine_fd = _quarantine(root_fd, state)
                 if lifecycle._exists(quarantine_fd, pending['name']):
                     raise lifecycle.error('Quarantine destination already exists; no overwrite.', 73)
@@ -484,6 +1255,14 @@ def _finalize(copy, *, reason, cancelled, orphan, owner_fd, before_finalize):
                 if before_finalize is not None:
                     before_finalize()
                     lease = lifecycle.read(copy)
+                result = read_result(copy, fd=fd, lease=lease)
+                if (result is None and isinstance(lease.get('finalization'), dict)
+                        and 'result_schema' in lease['finalization']):
+                    raise lifecycle.error(
+                        'Terminal result manifest is missing; history preserved.', 73)
+                if (result is not None and isinstance(lease.get('finalization'), dict)
+                        and not _result_matches_request(result, lease['finalization'])):
+                    raise lifecycle.error('Retained result does not match its finalization request.', 73)
                 quarantine_fd = _quarantine(root_fd, state)
         # The global admission fence is intentionally not held during deletion.
         return _finish_cleanup(copy, lease, quarantine_fd)
@@ -492,9 +1271,8 @@ def _finalize(copy, *, reason, cancelled, orphan, owner_fd, before_finalize):
             os.close(quarantine_fd)
 
 
-def cancel(copy, *, reason='cancelled'):
-    return finalize(copy, reason=reason, cancelled=True)
-
+def cancel(copy, *, reason='cancelled', discard_result=False):
+    return finalize(copy, reason=reason, cancelled=True, discard_result=discard_result)
 
 def recover(copy, *, owner=None):
     lease = lifecycle.read(copy)

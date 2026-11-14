@@ -15,7 +15,7 @@ import tempfile
 import time
 import tomllib
 
-from . import sandbox, state_storage
+from . import check_evidence, sandbox, state_storage
 from .effort import DEFAULT_EFFORT, EFFORT_LEVELS, normalize_effort
 
 
@@ -52,6 +52,13 @@ RETRYABLE = re.compile(
 class WorkerError(Exception):
     def __init__(self, code, message):
         self.code, self.message = code, message
+
+
+def check_timeout_argument(value):
+    try:
+        return check_evidence.parse_check_timeout(value)
+    except check_evidence.CheckEvidenceError as error:
+        raise argparse.ArgumentTypeError(error.message) from None
 
 
 def effort_level(value):
@@ -133,6 +140,11 @@ def acquire_job_slot(args, *, policy=None, root=None):
     from codex_deepseek_team import worker_admission
     return worker_admission.acquire(args, sys.modules[__name__],
                                     policy=policy, root=root)
+
+
+def release_job_reservation(args, *, root=None):
+    from codex_deepseek_team import worker_admission
+    return worker_admission.release(args, root=root)
 
 
 def child_environment(home, key, runtime='codex', effort=DEFAULT_EFFORT):
@@ -341,6 +353,11 @@ def runtime_result(runtime, raw):
 def run(args):
     if os.environ.get('DEEPSEEK_TEAM_DISABLED') == '1':
         raise WorkerError(69, 'DeepSeek delegation disabled; the coordinator should continue locally.')
+    try:
+        args.check_timeout = check_evidence.validate_check_timeout(
+            getattr(args, 'check_timeout', None), allow_none=True)
+    except check_evidence.CheckEvidenceError as error:
+        raise WorkerError(error.code, error.message) from None
     from . import activation, settings, workspace
     try:
         copy = workspace.load(args.state_dir, args.workspace) if getattr(args, 'workspace', None) else None
@@ -434,7 +451,10 @@ def run_worker(args):
                     print(f'DeepSeek unavailable (exit {code}); the coordinator should continue locally.', file=sys.stderr)
                 return code
     finally:
-        os.close(slot)
+        try:
+            release_job_reservation(args, root=getattr(args, 'policy_root', None))
+        finally:
+            os.close(slot)
 
 
 def parse_args():
@@ -451,6 +471,12 @@ def parse_args():
                              'Omit to use saved policy; policy default is auto.')
     parser.add_argument('--timeout', type=float, default=0,
                         help='0: wait without a total deadline (default); 1..900: total seconds including queue and retries.')
+    parser.add_argument('--check-timeout', type=check_timeout_argument, default=None,
+                        metavar='SECONDS',
+                        help='Managed check ceiling: 0 < SECONDS <= 86400, fractional allowed; '
+                             'fresh jobs default to 1800, legacy attempts without provenance '
+                             'use 120, and otherwise the recorded execution attempt is inherited. '
+                             'The total --timeout still clamps each check; readiness probes stay at 120.')
     parser.add_argument('--attempts', type=int, choices=[1, 2, 3],
                         help='Read-only: 2 by default. Managed full-access uses one attempt and explicit resume.')
     parser.add_argument('--delegation-level', type=settings.parse_level, choices=settings.LEVELS,

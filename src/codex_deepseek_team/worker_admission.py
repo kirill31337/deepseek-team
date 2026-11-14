@@ -20,6 +20,10 @@ def _head(root):
 def _unavailable_message(assignment_id, row):
     """Actionable rejection that never promises an automatic retry."""
     status = row['status']
+    if (row.get('error_kind') == 'cancelled'
+            and row.get('failure_stage') == 'before_start'):
+        return (f'Assignment {assignment_id} was cancelled before start; no queue ticket, copy '
+                'or provider launch is permitted. Register new scope in a new coordination task.')
     if status == 'failed':
         if row.get('failure_stage') == 'preparation':
             recovery = (
@@ -45,7 +49,11 @@ def _unavailable_message(assignment_id, row):
 
 def acquire(args, api, *, policy=None, root=None):
     root = settings.project_root(root or Path.cwd())
-    initial = settings.resolve(root)
+    try:
+        initial = settings.resolve(root)
+    except settings.SettingsError as error:
+        raise api.WorkerError(
+            78, settings.access_read_failure_message(error)) from None
     policy = policy or initial
     head = _head(root)
     started = time.monotonic()
@@ -61,16 +69,25 @@ def acquire(args, api, *, policy=None, root=None):
                                      'start a new job using the saved storage root.')
             if args.job_deadline is not None and time.monotonic() >= args.job_deadline:
                 raise api.WorkerError(124, 'DeepSeek worker exceeded its total timeout before launch.')
-            current = settings.resolve(root)
+            try:
+                current = settings.resolve(root)
+            except settings.SettingsError as error:
+                raise api.WorkerError(
+                    78, settings.access_read_failure_message(error)) from None
             if not current.enabled:
                 raise api.WorkerError(69, 'Delegation was disabled while this job waited.')
             if (policy.effective_access == 'full-access' and current.effective_access != 'full-access'
                     and not (explicit_access and current.as_dict() == initial.as_dict())):
-                raise api.WorkerError(78, 'Write access was revoked while this job waited.')
+                raise api.WorkerError(
+                    78, settings.write_access_revoked_message(current))
             if _head(root) != head:
                 raise api.WorkerError(78, 'Project HEAD changed while this job waited; review and replan it.')
             task_id = getattr(args, 'coord_task', None)
             if task_id:
+                reservation = getattr(args, 'launch_reservation', None)
+                if reservation is not None:
+                    coordination.validate_launch_reservation(
+                        root, task_id, args.coord_assignment, reservation)
                 task = coordination.load_task(root, task_id)
                 row = coordination._assignment(task, args.coord_assignment)
                 item = coordination.assignment_deliverable(task, args.coord_assignment)
@@ -99,11 +116,30 @@ def acquire(args, api, *, policy=None, root=None):
 
     args.validate_admission = validate
     slot = None
+    task_id = getattr(args, 'coord_task', None)
+    reservation = None
     try:
+        # Preserve the existing actionable admission errors before publishing
+        # any reservation state. Registration is a mutation; a duplicate or
+        # otherwise ineligible launch must remain side-effect free.
+        validate()
+        if task_id:
+            try:
+                reservation = coordination.register_launch_reservation(
+                    root, task_id, args.coord_assignment,
+                    resume=bool(getattr(args, 'resume_after_failure', False)))
+            except coordination.CoordinationError as error:
+                raise api.WorkerError(error.code, str(error)) from None
+            args.launch_reservation = reservation
         slot = api.acquire_slot(args.state_dir,
             limit=getattr(args, 'max_workers', None) or policy.max_workers,
             timeout=args.timeout, wait=not getattr(args, 'no_wait', False),
-            on_wait=waiting, validate=validate)
+            on_wait=waiting, validate=validate, binding=reservation)
+        if reservation is not None:
+            # The queue allocator lock has been released. This task-lock pass is
+            # the serialization point with C5 cancellation before allocation.
+            coordination.revalidate_launch_reservation(
+                root, task_id, args.coord_assignment, reservation)
         validate()
         if args.job_deadline is not None and time.monotonic() >= args.job_deadline:
             raise api.WorkerError(124, 'DeepSeek worker exceeded its total timeout while queued.')
@@ -113,8 +149,30 @@ def acquire(args, api, *, policy=None, root=None):
     except BaseException as error:
         if slot is not None:
             os.close(slot)
+        if reservation is not None:
+            try:
+                coordination.release_launch_reservation(
+                    root, task_id, args.coord_assignment, reservation)
+            except (coordination.CoordinationError, OSError):
+                pass
         try:
             queue_state('cancelled' if isinstance(error, KeyboardInterrupt) else 'blocked')
         except (coordination.CoordinationError, OSError):
             pass
         raise
+
+
+def release(args, *, root=None) -> None:
+    """Release this process's unused admission reservation during launch cleanup."""
+    reservation = getattr(args, 'launch_reservation', None)
+    task_id = getattr(args, 'coord_task', None)
+    assignment_id = getattr(args, 'coord_assignment', None)
+    if not (reservation and task_id and assignment_id):
+        return
+    try:
+        coordination.release_launch_reservation(
+            settings.project_root(root or Path.cwd()), task_id, assignment_id, reservation)
+    except (coordination.CoordinationError, OSError, settings.SettingsError):
+        pass
+    finally:
+        args.launch_reservation = None

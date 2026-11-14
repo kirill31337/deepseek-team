@@ -2,6 +2,7 @@
 import fcntl
 import multiprocessing
 import os
+import signal
 import shutil
 import stat
 import tempfile
@@ -67,6 +68,29 @@ def _holder(state, limit, ready, release, result):
     ready.set()
     release.wait(30)
     os.close(fd)
+
+
+def _wait_for_owned_ticket(state, process, *, timeout=10):
+    """Wait until the child has published and locked its durable queue ticket."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not process.is_alive():
+            raise AssertionError(
+                f'waiter exited before publishing an owned ticket (exit code {process.exitcode})')
+        for path in Path(state).glob('ticket-*'):
+            try:
+                fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            except FileNotFoundError:
+                continue
+            try:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return path
+            finally:
+                os.close(fd)
+        time.sleep(0.01)
+    raise AssertionError('waiter did not publish an owned ticket before timeout')
 
 
 class SlotTestBase(unittest.TestCase):
@@ -268,17 +292,23 @@ class WaitingTests(SlotTestBase):
 
     def test_dead_waiter_ticket_is_reclaimed(self):
         release_holder = self.wait_for_holder()
-        waited = CTX.Event()
-        process = self.process(_waiter, str(self.state), 'doomed', limit=1,
-                               waited=waited)
-        self.assertTrue(waited.wait(10))
-        process.terminate()
-        process.join(10)
-        self.assertTrue(list(self.state.glob('ticket-*')),
-                        'waiter ticket should remain after abrupt death')
-        release_holder.set()
-        self.release(self.acquire(self.state, limit=1, timeout=10))
-        self.assertEqual(list(self.state.glob('ticket-*')), [])
+        process = self.process(_waiter, str(self.state), 'doomed', limit=1)
+        try:
+            ticket = _wait_for_owned_ticket(self.state, process)
+            process.kill()
+            process.join(10)
+            self.assertFalse(process.is_alive(), 'waiter did not terminate')
+            self.assertEqual(process.exitcode, -signal.SIGKILL)
+            self.assertTrue(ticket.exists(), 'waiter ticket should remain after abrupt death')
+            self.assertEqual(list(self.state.glob('ticket-*')), [ticket])
+            release_holder.set()
+            self.release(self.acquire(self.state, limit=1, timeout=10))
+            self.assertEqual(list(self.state.glob('ticket-*')), [])
+        finally:
+            release_holder.set()
+            if process.is_alive():
+                process.kill()
+            process.join(10)
 
     def test_on_wait_fires_once_only_when_waiting_is_required(self):
         immediate = []

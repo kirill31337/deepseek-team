@@ -251,6 +251,11 @@ class HostReadinessTests(unittest.TestCase):
         copy = workspace.create(self.repo, self.state)
         return task['id'], plan['assignments'][0]['id'], copy
 
+    def _store_checks(self, task_id, checks):
+        task = coordination.load_task(self.repo, task_id)
+        task['deliverables'][0]['checks'] = list(checks)
+        coordination._atomic(coordination._task_path(self.repo, task_id), task)
+
     def test_host_readiness_accepts_assignment_prefix(self):
         task_id, assignment_id, copy = self._assignment(
             ['PYTHONPATH=src python3 -c pass'])
@@ -270,8 +275,22 @@ class HostReadinessTests(unittest.TestCase):
             coordination.ensure_assignment_ready(self.repo, task_id, assignment_id, copy)
         self.assertEqual(caught.exception.code, 64)
 
-    def test_host_readiness_rejects_assignment_only_and_empty(self):
-        for command in ('PYTHONPATH=src', '', '"" python3 -c pass', "A=1 '' python3 -c pass"):
+    def test_plan_rejects_empty_check_before_host_readiness(self):
+        with self.assertRaises(coordination.CoordinationError) as caught:
+            self._assignment([''])
+        self.assertEqual(caught.exception.code, 64)
+        self.assertIn('checks entries must be non-empty strings', str(caught.exception))
+
+    def test_host_readiness_rejects_historical_stored_empty_check(self):
+        task_id, assignment_id, copy = self._assignment(['python3 -c pass'])
+        self._store_checks(task_id, [''])
+        with self.assertRaises(coordination.CoordinationError) as caught:
+            coordination.ensure_assignment_ready(self.repo, task_id, assignment_id, copy)
+        self.assertEqual(caught.exception.code, 64)
+        self.assertIn('Empty declared verification command', str(caught.exception))
+
+    def test_host_readiness_rejects_assignment_only_and_shell_empty(self):
+        for command in ('PYTHONPATH=src', '"" python3 -c pass', "A=1 '' python3 -c pass"):
             with self.subTest(command=command):
                 task_id, assignment_id, copy = self._assignment([command])
                 with self.assertRaises(coordination.CoordinationError) as caught:

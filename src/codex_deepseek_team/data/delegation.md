@@ -339,6 +339,91 @@ Use `config set --project --max-workers N` or `--global` to save a limit, or
 Default queue and total timeout are unlimited; explicit `--timeout` includes queue time.
 Before secrets or provider launch, queued work rechecks off/access/routing/HEAD.
 
+### Cache declarations, check limits and explicit recovery
+
+Declare mutable build caches with repeatable `workspace prepare --cache-dir REL_DIR`,
+not with an environment variable alone. A declaration must be rooted strictly inside
+the copy, must not be the project root, `.git`, `.deepseek-tools` or a credential-like
+path, and must not contain tracked files. Add it before execution only for a new or
+empty tree, or for a tree covered by declared prepared copies; existing unprepared files
+are preserved with a refusal and a new copy is the safe recovery. Do not expand the set
+after execution. Removing a declaration before execution removes only its owned anchored
+exclusions, not foreign rules. Cache contents stay out of the result patch but remain
+inputs to check and preparation fingerprints, so large or unknown inputs can prevent
+reuse. Recipe version 2 records `cache_dirs`; version 1 reads as `[]`, and an unknown
+version is preserved.
+
+```bash
+deepseek-team workspace prepare WORKSPACE_ID \
+  --copy /prepared/wrapper=gradle-home/wrapper \
+  --copy /prepared/modules-2=gradle-home/caches/modules-2 \
+  --cache-dir gradle-home \
+  --env 'GRADLE_USER_HOME={workspace}/gradle-home' --save-project
+```
+
+`worker --check-timeout SECONDS` sets the limit for each managed check. It accepts finite
+fractional values with `0 < SECONDS <= 86400` and defaults to `1800` (30 minutes) for a new job; invalid values are
+rejected before a slot, copy or credential. Baseline and post checks use the same value,
+clamped by the remaining total deadline; readiness and security probes keep their own
+limits, and `worker --timeout` remains the total deadline including queue time. Record
+the used value in attempt and reuse evidence. Resume inherits the last started attempt;
+an explicit override starts a new attempt and invalidates reuse. Without `--timeout`,
+`workspace verify` uses the recorded execution limit; an explicit verification override
+does not change the limit inherited by a later resume or correction.
+Legacy execution attempts without a saved limit retain 120 seconds. Supply
+`--check-timeout 1800` explicitly when continuing one with the new default.
+
+An assignment that is still planned and has no workspace, job, attempt or start can be
+cancelled without launch:
+
+```bash
+deepseek-team coordination cancel --path PROJECT --task TASK_ID \
+  --assignment ASSIGNMENT_ID --evidence TEXT
+```
+
+A live launch or queue ticket refuses with code `75`; stop it first. History records a
+cancelled-before-start assignment, pending scope is released, no fictional execution,
+checks, cost or quality is created, and repetition is idempotent. `base_head` is
+immutable. Finish or cancel assignments, record outcomes and complete the task, then let
+the next `UserPromptSubmit` open a new task at the current `HEAD`; do not rebase the old
+task or create a task ID by hand.
+
+Ordinary cancellation, finalization and GC attempt safe capture first. If capture fails,
+preserve the copy and unknown state. Discard requires real user authorization to lose that
+copy's work; never infer it or add `--discard-result` automatically:
+
+```bash
+deepseek-team workspace cancel WORKSPACE_ID --discard-result --reason TEXT
+deepseek-team coordination finalize --path PROJECT --task TASK_ID \
+  --assignment ASSIGNMENT_ID --cancel --discard-result --evidence TEXT
+```
+
+Discard is for cancellation only, never acceptance. It needs a non-empty reason or
+evidence and still passes ownership, inode, mount, symlink and liveness checks. Only the
+named capture failures `git_integrity_mismatch`, `capture_too_large`,
+`capture_unavailable` and `capture_failed` permit it; unknown failures preserve the copy.
+A successful capture remains schema 1 even when the flag was supplied. An uncaptured
+result is schema 2 with `capture.status="discarded"`, `capture.reason_code` and
+`patch=null`; it never satisfies acceptance or integration.
+
+Schema 2 keeps an existing `changes.patch` at its path and lists it under
+`historical_artifacts` with `file`, `bytes`, `sha256`, `attempt_id` and `provenance`. Use
+`verified_attempt` only when durable history links those bytes to that attempt; otherwise
+use `legacy_unattributed` with no attempt ID. The filename or a fresh hash never makes
+the file the current patch. Existing checks, diagnostics and history stay at their paths;
+arbitrary files are not evidence. Status, history, completion, finalization and GC read
+schemas 1 and 2; unknown schemas fail safely. A 0.10.5 binary does not support schema 2, so
+downgrade is not recovery. A durable `job_finalization_request` resumes cleanup after a
+crash without another model run or capture.
+
+Plan validation reports every independent structural or enum error before any partial
+routing or ledger write, keeps text on `stderr`, exits `64`, and names the deliverable and
+changed fields without dumping values. Invalid or unsafe settings exit `78` before the
+provider; missing settings keep the normal fallback. A queued launch whose access changed
+reports `Current effective access no longer permits writes.` with the access and safe
+source names, without dumping settings. Do not turn a refused implementation into a
+protected kind, and do not invent placeholder checks.
+
 ### Workspace and branch hygiene
 
 This is coordinator process guidance, separate from the worker OS sandbox. Each write-capable

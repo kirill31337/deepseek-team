@@ -7,6 +7,8 @@ Bug 2: an explicit `config show --path` outside any Git working copy silently re
 the current directory's project settings instead of reporting the invalid path.
 """
 import contextlib
+import errno
+import sys
 import io
 import json
 import os
@@ -30,6 +32,28 @@ MALFORMED_BLOCKS = {
     'missing-start-marker': b'u\nbody\n' + END + b'\n',
     'out-of-order-markers': b'u\n' + END + b'\nbody\n' + START + b'\n',
 }
+
+class _FailingReadStream:
+    """A real settings stream whose read fails like an injected EIO."""
+
+    def __init__(self, stream, error):
+        self._stream = stream
+        self._error = error
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        return self._stream.__exit__(*exc_info)
+
+    def read(self, size=-1):
+        raise self._error
+
+    def close(self):
+        self._stream.close()
+
+    def fileno(self):
+        return self._stream.fileno()
 
 
 class TransactionCase(unittest.TestCase):
@@ -409,6 +433,193 @@ class ExplicitConfigPathTests(TransactionCase):
         code, out, err = self.cli('config', 'show', '--path', str(self.repo), '--json')
         self.assertEqual(code, 0, err)
         self.assertEqual(json.loads(out)['delegation_level'], 75)
+
+
+class ControlledSettingsReadTests(TransactionCase):
+    """Unsafe or malformed layers fail closed without a false fallback."""
+
+    def test_missing_file_keeps_the_default_fallback(self):
+        self.assertFalse(self.project_file().exists())
+        self.assertEqual(settings.read_values(self.project_file()), {})
+        policy = settings.resolve(self.repo)
+        self.assertEqual((policy.delegation_level, policy.access,
+                          policy.effective_access), ('auto', 'auto', 'read-only'))
+        self.assertEqual(policy.sources['access'], 'default')
+
+    def test_auto_access_explanation_tracks_the_effective_profile(self):
+        read_only = settings.Policy('auto', 'auto', {
+            'access': 'default', 'delegation_level': 'default'})
+        full_access = settings.Policy(75, 'auto', {
+            'access': 'default', 'delegation_level': 'project:/repo/.deepseek-team.toml'})
+        self.assertIn('yields read-only', settings.access_explanation(read_only))
+        self.assertIn('yields full-access', settings.access_explanation(full_access))
+
+    def test_invalid_toml_is_a_controlled_settings_error(self):
+        self.project_file().write_text('access = "full-access"\n[broken\n')
+        with self.assertRaises(settings.SettingsError) as caught:
+            settings.resolve(self.repo)
+        self.assertIn('Invalid delegation TOML', str(caught.exception))
+
+    def test_symlink_is_refused_without_following_it(self):
+        target = self.base / 'real-settings.toml'
+        settings.set_values(target, access='full-access')
+        self.project_file().symlink_to(target)
+        with self.assertRaises(settings.SettingsError) as caught:
+            settings.read_values(self.project_file())
+        self.assertIn('symbolic link', str(caught.exception).lower())
+
+    def test_hardlink_is_refused_without_using_its_content(self):
+        target = self.base / 'hardlinked-settings.toml'
+        target.write_text('access = "full-access"\n')
+        os.link(target, self.project_file())
+        with self.assertRaises(settings.SettingsError) as caught:
+            settings.read_values(self.project_file())
+        self.assertIn('hard link', str(caught.exception).lower())
+
+    def test_directory_is_refused_as_a_non_file(self):
+        self.project_file().mkdir()
+        with self.assertRaises(settings.SettingsError) as caught:
+            settings.read_values(self.project_file())
+        self.assertIn('directory', str(caught.exception).lower())
+
+    def test_fifo_is_refused_as_a_special_file_without_blocking(self):
+        os.mkfifo(self.project_file())
+        with self.assertRaises(settings.SettingsError) as caught:
+            settings.read_values(self.project_file())
+        self.assertIn('special file', str(caught.exception).lower())
+
+    def test_permission_error_is_named_without_traceback_or_fallback(self):
+        error = PermissionError(errno.EACCES, 'Permission denied',
+                                str(self.project_file()))
+        with mock.patch.object(settings, '_open_settings', side_effect=error):
+            with self.assertRaises(settings.SettingsError) as caught:
+                settings.read_values(self.project_file())
+        self.assertIn('permission denied', str(caught.exception).lower())
+        self.assertIn(str(self.project_file()), str(caught.exception))
+
+    def test_repeated_read_failures_do_not_leak_descriptors(self):
+        directory = self.project_file()
+        directory.mkdir()
+        before = len(os.listdir('/proc/self/fd'))
+        for _ in range(25):
+            with self.assertRaises(settings.SettingsError):
+                settings.read_values(directory)
+        after = len(os.listdir('/proc/self/fd'))
+        self.assertEqual(after, before)
+
+    def test_config_cli_reports_invalid_toml_without_traceback(self):
+        self.project_file().write_text('access = "full-access"\n[broken\n')
+        code, out, err = self.cli('config', 'show', '--path', str(self.repo),
+                                  '--json')
+        self.assertEqual(code, 78)
+        self.assertEqual(out, '')
+        self.assertIn('Invalid delegation TOML', err)
+        self.assertNotIn('Traceback', err)
+        self.assertNotIn('"access": "auto"', out)
+
+    def test_config_cli_reports_permission_error_without_traceback(self):
+        error = PermissionError(errno.EACCES, 'Permission denied',
+                                str(self.project_file()))
+        with mock.patch.object(settings, '_open_settings', side_effect=error):
+            code, out, err = self.cli('config', 'show', '--path', str(self.repo),
+                                      '--json')
+        self.assertEqual(code, 78)
+        self.assertEqual(out, '')
+        self.assertIn('permission denied', err.lower())
+        self.assertNotIn('Traceback', err)
+
+    def test_worker_cli_stops_before_provider_on_invalid_settings(self):
+        self.project_file().write_text('access = "full-access"\n[broken\n')
+        environment = dict(os.environ)
+        environment['PYTHONPATH'] = str(Path(__file__).resolve().parents[1] / 'src')
+        completed = subprocess.run(
+            [sys.executable, '-m', 'codex_deepseek_team', 'worker',
+             '--os-sandbox', 'required', 'redacted task'],
+            cwd=self.repo, env=environment, text=True, capture_output=True,
+            timeout=30)
+        self.assertEqual(completed.returncode, 78)
+        self.assertIn('Invalid delegation TOML', completed.stderr)
+        self.assertNotIn('Traceback', completed.stderr)
+
+
+    def test_post_open_fstat_eio_is_controlled_and_closes_descriptor(self):
+        path = self.project_file()
+        path.write_text('access = "full-access"\n')
+        original = path.read_bytes()
+        before = len(os.listdir('/proc/self/fd'))
+        for _ in range(5):
+            with mock.patch.object(
+                    settings.os, 'fstat',
+                    side_effect=OSError(errno.EIO, 'Input/output error')):
+                with self.assertRaises(settings.SettingsError) as caught:
+                    settings.read_values(path)
+            self.assertIn('Cannot safely read settings', str(caught.exception))
+            self.assertIn(str(path), str(caught.exception))
+        after = len(os.listdir('/proc/self/fd'))
+        self.assertEqual(after, before)
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_post_open_fdopen_eio_is_controlled_and_closes_descriptor(self):
+        path = self.project_file()
+        path.write_text('access = "full-access"\n')
+        original = path.read_bytes()
+        before = len(os.listdir('/proc/self/fd'))
+        for _ in range(5):
+            with mock.patch.object(
+                    settings.os, 'fdopen',
+                    side_effect=OSError(errno.EIO, 'Input/output error')):
+                with self.assertRaises(settings.SettingsError) as caught:
+                    settings.read_values(path)
+            self.assertIn('Cannot safely read settings', str(caught.exception))
+            self.assertIn(str(path), str(caught.exception))
+        after = len(os.listdir('/proc/self/fd'))
+        self.assertEqual(after, before)
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_post_open_read_eio_is_controlled_and_closes_descriptor(self):
+        path = self.project_file()
+        path.write_text('access = "full-access"\n')
+        original = path.read_bytes()
+        real_fdopen = os.fdopen
+
+        def failing_fdopen(fd, mode='r', *args, **kwargs):
+            return _FailingReadStream(
+                real_fdopen(fd, mode, *args, **kwargs),
+                OSError(errno.EIO, 'Input/output error'))
+
+        before = len(os.listdir('/proc/self/fd'))
+        for _ in range(5):
+            with mock.patch.object(
+                    settings.os, 'fdopen', side_effect=failing_fdopen):
+                with self.assertRaises(settings.SettingsError) as caught:
+                    settings.read_values(path)
+            self.assertIn('Cannot safely read settings', str(caught.exception))
+            self.assertIn(str(path), str(caught.exception))
+        after = len(os.listdir('/proc/self/fd'))
+        self.assertEqual(after, before)
+        self.assertEqual(path.read_bytes(), original)
+
+    def test_config_cli_reports_post_open_read_eio_without_traceback(self):
+        path = self.project_file()
+        path.write_text('access = "full-access"\n')
+        original = path.read_bytes()
+        real_fdopen = os.fdopen
+
+        def failing_fdopen(fd, mode='r', *args, **kwargs):
+            return _FailingReadStream(
+                real_fdopen(fd, mode, *args, **kwargs),
+                OSError(errno.EIO, 'Input/output error'))
+
+        with mock.patch.object(
+                settings.os, 'fdopen', side_effect=failing_fdopen):
+            code, out, err = self.cli('config', 'show', '--path', str(self.repo),
+                                      '--json')
+        self.assertEqual(code, 78)
+        self.assertEqual(out, '')
+        self.assertIn('Cannot safely read settings', err)
+        self.assertNotIn('Traceback', err)
+        self.assertNotIn('full-access', out)
+        self.assertEqual(path.read_bytes(), original)
 
 
 if __name__ == '__main__':

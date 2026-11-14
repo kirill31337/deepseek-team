@@ -470,6 +470,12 @@ def _toolchain_condition(metadata):
                        for key, value in environment.items())):
         return None
     result['environment'] = {key: environment[key] for key in sorted(environment)}
+    if 'cache_dirs' in raw:
+        cache_dirs = raw['cache_dirs']
+        if (not isinstance(cache_dirs, list)
+                or not all(isinstance(value, str) for value in cache_dirs)):
+            return None
+        result['cache_dirs'] = sorted(set(cache_dirs))
     probes = raw.get('probes', [])
     if not isinstance(probes, list) or not all(isinstance(value, str)
                                                for value in probes):
@@ -840,6 +846,11 @@ def _normalize_declarations(declarations, *, path_value='', project=None):
                 isinstance(value, str) for value in probes):
             return None
         result['probes'] = list(probes)
+    cache_dirs = declarations.get('cache_dirs', [])
+    if (not isinstance(cache_dirs, (list, tuple))
+            or not all(isinstance(value, str) for value in cache_dirs)):
+        return None
+    result['cache_dirs'] = sorted(set(cache_dirs))
     for name in ('tools', 'copies'):
         if name not in declarations:
             continue

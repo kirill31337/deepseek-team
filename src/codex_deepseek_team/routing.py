@@ -209,12 +209,22 @@ class RoutingService:
             decision = self.store.get(db, 'decisions', decision_id)
             if decision is None:
                 raise RoutingError('Unknown routing decision.', 66)
-            current = settings.resolve(self.root)
+            try:
+                current = settings.resolve(self.root)
+            except settings.SettingsError as error:
+                raise RoutingError(
+                    settings.access_read_failure_message(error), 78) from None
             current_access = access or current.effective_access
             if not current.enabled:
                 raise RoutingError('Delegation was disabled while the assignment waited.', 69)
             if decision['features']['kind'] in WRITE_KINDS and current_access != 'full-access':
-                raise RoutingError('Current access does not permit this queued writing assignment.', 78)
+                if current_access == current.effective_access:
+                    message = settings.write_access_revoked_message(current)
+                else:
+                    message = ('Current effective access no longer permits writes. '
+                               'The recorded task access is no longer honored by the '
+                               'current policy; revise the plan before launch.')
+                raise RoutingError(message, 78)
             if already_running:
                 return  # Reconcile the same owned workspace; do not create a new assignment.
             config = self._config(db)

@@ -489,5 +489,25 @@ class RoutingCliServiceIntegrationTests(unittest.TestCase):
         self.assertEqual(exported['sources'], [])
 
 
+    def test_invalid_settings_are_structured_and_do_not_record(self):
+        (self.root / '.deepseek-team.toml').write_text(
+            'access = "full-access"\n[broken\n')
+        payload = json.dumps({
+            'kind': 'review', 'domain': 'python', 'operation': 'review',
+            'localization': 'known', 'coupling': 'local',
+            'verification': 'manual', 'clarity': 'clear', 'risk': 'low',
+            'scope_size': 'small', 'runtime': 'codex',
+            'model': 'deepseek-flash', 'effort': 'high',
+            'context_version': 'routing-cli-settings',
+        })
+        code, output, errors = self.invoke(
+            ['routing', 'recommend', '--path', str(self.root)], payload)
+        self.assertEqual((code, output), (78, ''))
+        error = json.loads(errors)
+        self.assertEqual(error['code'], 78)
+        self.assertIn('Invalid delegation TOML', error['error'])
+        self.assertNotIn('Traceback', errors)
+
+
 if __name__ == '__main__':
     unittest.main()

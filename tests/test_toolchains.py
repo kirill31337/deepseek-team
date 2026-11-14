@@ -24,7 +24,7 @@ from unittest import mock
 
 from codex_deepseek_team import toolchains, workspace
 
-TOOLCHAIN_VERSION = 1
+TOOLCHAIN_VERSION = 2
 
 
 def _git(root, *args, ok=(0,)):
@@ -123,7 +123,8 @@ class ToolchainFixture(unittest.TestCase):
     def recipe_payload(self, copy, **overrides):
         payload = {'version': TOOLCHAIN_VERSION, 'kind': 'toolchain-recipe',
                    'source_project': str(Path(copy.source).resolve()), 'saved_at': time.time(),
-                   'tools': {}, 'copies': [], 'environment': {}, 'probes': []}
+                   'tools': {}, 'copies': [], 'environment': {}, 'probes': [],
+                   'cache_dirs': []}
         payload.update(overrides)
         return payload
 
@@ -278,7 +279,7 @@ class PrepareToolsTests(ToolchainFixture):
             'source_project': str(Path(copy.source).resolve()),
             'tools': {'other': {'source': '/opt/other', 'files': 0, 'bytes': 0,
                                 'links_skipped': 0}},
-            'copies': [], 'environment': {}, 'probes': []}
+            'copies': [], 'environment': {}, 'probes': [], 'cache_dirs': []}
         record.save()
         with self.assertRaises(toolchains.ToolchainError):
             toolchains.prepare(record, tools={'sdk': self.software()})
@@ -737,16 +738,43 @@ class EnvironmentTests(ToolchainFixture):
         root = self.software()
         toolchains.prepare(self.copy, tools={'sdk': root},
                            environment={'JAVA_HOME': '{workspace}/.deepseek-tools/sdk'})
+        for version in (99, [], {}, None, True, 1.5):
+            record = self.reloaded(self.copy)
+            record.metadata['toolchain']['version'] = version
+            record.save()
+            loaded = self.reloaded(self.copy)
+            with self.subTest(version=version):
+                with self.assertRaises(toolchains.ToolchainError):
+                    toolchains.environment_for(loaded, {'PATH': '/usr/bin'})
+                with self.assertRaises(toolchains.ToolchainError):
+                    toolchains.probes_for(loaded)
+                with self.assertRaises(toolchains.ToolchainError):
+                    toolchains.read_only_roots(loaded)
+
+    def test_v1_metadata_reads_cache_dirs_as_empty_and_v2_records_them(self):
+        toolchains.prepare(self.copy, cache_dirs=['cache'])
+        metadata = self.reloaded(self.copy).metadata['toolchain']
+        self.assertEqual(metadata['version'], 2)
+        self.assertEqual(metadata['cache_dirs'], ['cache'])
+
+        malformed = self.reloaded(self.copy)
+        malformed.metadata['toolchain']['cache_dirs'] = None
+        malformed.save()
+        with self.assertRaises(toolchains.ToolchainError):
+            toolchains.environment_for(malformed, {'PATH': '/usr/bin'})
+
         record = self.reloaded(self.copy)
-        record.metadata['toolchain']['version'] = 2
+        legacy = dict(record.metadata['toolchain'])
+        legacy.pop('cache_dirs')
+        legacy.pop('exclude_ownership', None)
+        legacy['version'] = 1
+        record.metadata['toolchain'] = legacy
         record.save()
-        loaded = self.reloaded(self.copy)
-        with self.assertRaises(toolchains.ToolchainError):
-            toolchains.environment_for(loaded, {'PATH': '/usr/bin'})
-        with self.assertRaises(toolchains.ToolchainError):
-            toolchains.probes_for(loaded)
-        with self.assertRaises(toolchains.ToolchainError):
-            toolchains.read_only_roots(loaded)
+        with self.copy.lock():
+            result = toolchains.apply_saved_recipe(self.copy)
+        self.assertFalse(result['applied'])
+        self.assertEqual(result['toolchain']['version'], 1)
+        self.assertEqual(result['toolchain']['cache_dirs'], [])
 
     def test_tool_directory_replaced_by_escaping_symlink_fails_closed(self):
         root = self.software()
@@ -847,8 +875,12 @@ class RecipeTests(ToolchainFixture):
     def test_malformed_or_unsafe_recipes_fail_closed(self):
         payloads = [
             '{',
-            self.recipe_payload(self.copy, version=2),
+            self.recipe_payload(self.copy, version=99),
+            self.recipe_payload(self.copy, version=[]),
             self.recipe_payload(self.copy, kind='other'),
+            self.recipe_payload(self.copy, cache_dirs=None),
+            self.recipe_payload(self.copy, cache_dirs='cache'),
+            self.recipe_payload(self.copy, cache_dirs=[1]),
             self.recipe_payload(self.copy, source_project='/somewhere/else'),
             self.recipe_payload(self.copy, environment={'HOME': '/root'}),
             self.recipe_payload(self.copy, environment={'JAVA_HOME': '/etc'}),

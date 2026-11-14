@@ -80,6 +80,52 @@ def missing_semantic_fields(value) -> list[str]:
     return [field for field in REQUIRED_SEMANTIC_FIELDS if field not in value]
 
 
+def feature_value_problems(value) -> list[dict]:
+    """Return every independent structural/enum problem in one raw card.
+
+    Known fields are checked in the schema's stable declaration order. A
+    non-object card yields one parent-shape problem instead of a cascade of
+    missing-field problems. Messages never include submitted values.
+    """
+    if not isinstance(value, dict):
+        return [{'field': 'features', 'code': 'invalid_type',
+                 'message': 'Features must be a structured feature card.'}]
+    problems = []
+    for key, allowed in FEATURE_VALUES.items():
+        if key not in value:
+            continue
+        item = value[key]
+        choices = ', '.join(sorted(allowed))
+        if not isinstance(item, str):
+            problems.append({
+                'field': f'features.{key}', 'code': 'invalid_type',
+                'message': f'Feature {key} must be a string; allowed values: {choices}.',
+            })
+        elif item not in allowed:
+            problems.append({
+                'field': f'features.{key}', 'code': 'invalid_enum',
+                'message': f'Invalid feature {key}; allowed values: {choices}.',
+            })
+    if set(value) - set(FEATURE_DEFAULTS):
+        problems.append({
+            'field': 'features', 'code': 'unsupported_field',
+            'message': 'Feature card contains unsupported fields; never include '
+                       'prompts, code or paths.',
+        })
+    for key in ('model', 'context_version'):
+        if key not in value:
+            continue
+        try:
+            identifier(value[key], key)
+        except RoutingError:
+            problems.append({
+                'field': f'features.{key}', 'code': 'invalid_value',
+                'message': f'Feature {key} must be a nonempty identifier of at most '
+                           '128 characters.',
+            })
+    return problems
+
+
 def feature_schema() -> dict:
     """Return the read-only machine-readable feature-card contract."""
     return {

@@ -20,14 +20,15 @@ for the live help.
 
 ```text
 deepseek-team workspace prepare ID [--tool NAME=HOST_DIR] [--copy SOURCE=REL_DEST]
-  [--env NAME=VALUE] [--probe COMMAND] [--save-project]
+  [--env NAME=VALUE] [--cache-dir REL_DIR] [--probe COMMAND] [--save-project]
   [--cache-max-bytes BYTES] [--cache-max-inodes COUNT]
   [--resume-after-failure] [-- COMMAND ARG ...]
 ```
 
 Every option is repeatable, and declarative-only preparation (no legacy command)
-is valid. The copy lock is owned for the whole operation and a version-1 recipe is
-recorded in the private workspace metadata.
+is valid. The copy lock is owned for the whole operation and a version-2 recipe is
+recorded in the private workspace metadata. Version-1 records remain readable and
+are interpreted as having no declared cache directories.
 
 - **`--tool NAME=HOST_DIR`** copies an explicitly selected host software directory
   into `.deepseek-tools/NAME`. The name must match
@@ -48,7 +49,30 @@ recorded in the private workspace metadata.
   `{workspace}` placeholder that resolves inside the copy. Each `PATH` element must
   be such a workspace directory; the prepared `PATH` is prepended to the caller's
   sanitized `PATH`. `HOME`, provider variables, hook/config overrides and loader
-  injection variables are never accepted.
+  injection variables are never accepted. A prepared variable may resolve to an
+  existing directory, a staged copy target, an existing descendant of a staged
+  directory, a future parent of a declared copy target, or a declared cache root.
+  Missing descendants and unrelated paths are never created implicitly.
+- **`--cache-dir REL_DIR`** declares a mutable cache root strictly inside the
+  owned copy. Repeat it to declare several roots; nested roots are normalized to
+  the smallest covering set. The root is created on successful preparation and
+  receives an exact anchored `.git/info/exclude` entry, so its runtime contents
+  are not attributed to the worker result. Declaring a directory in `--env` does
+  not create such an exclusion by itself. A root cannot be the project root,
+  `.git`, `.deepseek-tools`, a credential-like path, or contain tracked source.
+  Before the first execution a new root must be new/empty or contain only data
+  already covered by recorded prepared copy destinations; existing unprepared
+  files are preserved with a refusal that recommends a new copy. After execution
+  the normalized set is fixed, although repeating it is idempotent. Removing a
+  declaration before execution removes only the exact generated exclude lines that
+  preparation itself inserted; foreign rules, identical foreign duplicates and
+  cache data are preserved. Preparation persists the exact owned occurrences in
+  the private `exclude_ownership` map (`pattern -> count`) inside prepared
+  toolchain metadata. Older records without that field have unknown ownership, so
+  their existing lines are never removed automatically; recreate the copy to drop
+  stale rules. Publishing an owned exclude change verifies the previous Git
+  administrative evidence under the copy owner lock, then records refreshed
+  canonical and legacy digests.
 - **`--probe COMMAND`** declares an explicit smoke command. Probes run only inside
   the worker namespace, before the provider key is read, up to 64 probes. A failed
   probe is a preparation failure (`environment` / `probe_failure`) that stops the
@@ -60,8 +84,12 @@ recorded in the private workspace metadata.
   incompatible or failed recipe fails closed; a missing recipe preserves the old
   behavior. Every tool and copy source recorded by the recipe is an immutable
   `toolchain-cache/entries/<sha256>` entry snapshotted from the actual prepared
-  destination, not a mutable host path. Recipes, diagnostics and hashes stay in
-  private state outside the source patch.
+  destination, not a mutable host path. Version-2 recipes also record the declared
+  `cache_dirs`; replay creates those roots and their exclusions in the fresh copy.
+  Cache contents are excluded from the result patch but remain part of bounded
+  preparation/check input fingerprints, so an unknown or oversized cache is never
+  treated as reusable evidence. Recipes, diagnostics and hashes stay in private
+  state outside the source patch.
 - **`--cache-max-bytes BYTES` / `--cache-max-inodes COUNT`** set the finite
   aggregate saved-cache ceiling for one save operation. Both accept only positive
   decimal integers from `1` through `2**63 - 1`; zero, negative, boolean,
@@ -94,7 +122,7 @@ new source and every still-referenced prior recipe entry fails before publishing
 new recipe. The current recipe stays byte-identical and its usable cache entries
 remain protected. Valid entries selected earlier in the same batch are protected
 from eviction too, so one declaration cannot evict another or the previous recipe's
-references. The limits are operation options: they are not written into version-1
+references. The limits are operation options: they are not written into prepared
 metadata or the recipe and do not change its key. Replay reads already cached
 entries and does not impose the old save limit again.
 
@@ -208,7 +236,9 @@ cp -a /path/to/.gradle/caches/modules-2 "$gradle_snapshot/caches/"
 
 deepseek-team workspace prepare WORKSPACE_ID \
   --tool JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64 \
-  --copy "$gradle_snapshot=gradle-home" \
+  --copy "$gradle_snapshot/wrapper=gradle-home/wrapper" \
+  --copy "$gradle_snapshot/caches/modules-2=gradle-home/caches/modules-2" \
+  --cache-dir gradle-home \
   --env 'JAVA_HOME={workspace}/.deepseek-tools/JAVA_HOME' \
   --env 'GRADLE_USER_HOME={workspace}/gradle-home' \
   --env 'PATH={workspace}/.deepseek-tools/JAVA_HOME/bin' \
@@ -220,11 +250,15 @@ deepseek-team workspace prepare WORKSPACE_ID \
   --save-project
 ```
 
-Choose ceilings that fit the selected inputs and available storage; the example
-allows an 8 GiB shared cache. The ordinary free-space and inode reservations still
-apply. After a successful saved preparation, the temporary input is no longer
-needed for replay. Projects without a wrapper instead need an explicitly prepared
-Gradle installation, with its `bin` directory added to the workspace-rooted PATH.
+The two nested copies share the explicitly declared `gradle-home` cache root, so
+Gradle runtime writes below it stay out of the worker result. The equivalent
+existing form `--copy "$gradle_snapshot=gradle-home"` remains valid when the whole
+prepared root is the copy source. Choose ceilings that fit the selected inputs and
+available storage; the example allows an 8 GiB shared cache. The ordinary
+free-space and inode reservations still apply. After a successful saved
+preparation, the temporary input is no longer needed for replay. Projects without
+a wrapper instead need an explicitly prepared Gradle installation, with its `bin`
+directory added to the workspace-rooted PATH.
 
 If the project needs a standalone Kotlin compiler in addition to the Kotlin Gradle
 plugin, add `--tool KOTLIN_HOME=/opt/kotlin`,

@@ -81,6 +81,29 @@ class WorkspaceContinuityTests(LifecycleFixture):
                 identifier, scope=scope, correction=reference))
         return {'classification': 'substantial', 'deliverables': deliverables}
 
+    def test_coordinator_correction_does_not_hide_latest_worker_assignment(self):
+        settings.set_values(self.source / settings.PROJECT_FILE,
+                            delegation_level=25, access='full-access')
+        task, assignment, _copy = self.reworked_job()
+        reference = {'task_id': task['id'], 'assignment_id': assignment}
+        plan = self.correction_plan(task['id'], reference,
+                                    identifier='coordinator-correction')
+        plan['deliverables'][-1]['executor'] = 'coordinator'
+        coordinator_plan = coordination.plan_task(self.source, task['id'], plan)
+        self.assertFalse(any(row['deliverable_id'] == 'coordinator-correction'
+                             for row in coordinator_plan['assignments']))
+        coordination.record_coordinator_event(
+            self.source, task['id'], 'mutation_requested', ['app.txt'])
+        planned = coordination.plan_task(
+            self.source, task['id'], self.correction_plan(task['id'], reference))
+        correction = next(row for row in planned['assignments']
+                          if row['deliverable_id'] == 'fix-correction')
+        self.assertEqual(correction['correction_of'], reference)
+        with self.assertRaises(coordination.CoordinationError) as caught:
+            coordination.plan_task(self.source, task['id'], self.correction_plan(
+                task['id'], reference, identifier='duplicate-worker-correction'))
+        self.assertIn('correction deliverables', str(caught.exception))
+
     def args(self, task_id, assignment_id, *, workspace_id=None, resume=False):
         binary = self.root / 'disposable-codex'
         if not binary.exists():
@@ -833,7 +856,11 @@ class WorkspaceContinuityTests(LifecycleFixture):
         self.assertEqual(lease['binding'], {
             'task_id': task['id'], 'assignment_id': correction['id']})
         self.assertEqual([attempt['status'] for attempt in lease['attempts']],
-                         ['succeeded', 'succeeded'])
+                         ['succeeded', 'failed', 'succeeded'])
+        baseline_failure = lease['attempts'][1]
+        self.assertEqual(baseline_failure['operation'], 'execution')
+        self.assertEqual(baseline_failure['status'], 'failed')
+        self.assertEqual(baseline_failure['error_kind'], 'environment')
 
 
 if __name__ == '__main__':

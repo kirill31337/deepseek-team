@@ -206,6 +206,60 @@ inode. A succeeded result that needs a substantive correction gets
 `needs-rework` first, then a newly planned linked assignment using the same
 still-unfinalized `--workspace WORKSPACE_ID`.
 
+An assignment that has not started can be cancelled without creating a workspace or
+running a model:
+
+```bash
+deepseek-team coordination cancel --path PROJECT --task TASK_ID \
+  --assignment ASSIGNMENT_ID --evidence TEXT
+```
+
+The command accepts only a planned assignment with no workspace, job, attempt or start
+marker, and no prepared or worker changes. An active launch or queue ticket refuses with
+code `75`; stop that pending process first.
+History records a cancellation before start, releases pending scope, makes no fictional
+execution, check, cost or quality record, and repeating it is idempotent. `base_head`
+remains immutable. After assignments are finished or cancelled, their outcomes recorded
+and the task completed, the next `UserPromptSubmit` opens a new task at the current
+`HEAD`; do not rebase an existing task or create its task ID by hand.
+
+Ordinary cancellation, finalization and GC first attempt the existing safe result
+capture. If capture fails, the copy and any unknown state remain preserved. Discard
+requires real user authorization to lose this copy's work; the coordinator never infers
+it or adds `--discard-result` automatically:
+
+```bash
+deepseek-team workspace cancel WORKSPACE_ID --discard-result --reason TEXT
+deepseek-team coordination finalize --path PROJECT --task TASK_ID \
+  --assignment ASSIGNMENT_ID --cancel --discard-result --evidence TEXT
+```
+
+Discard is valid only for cancellation, never acceptance. It requires a non-empty reason
+or evidence, still performs ownership, inode, mount, symlink and liveness checks, and is
+available only for the named capture failures `git_integrity_mismatch`,
+`capture_too_large`, `capture_unavailable` and `capture_failed`. Unknown capture faults
+preserve the copy for inspection. A capture that succeeds keeps result schema 1 even if
+the flag was supplied.
+
+An uncaptured result uses result schema 2 with `capture.status="discarded"`,
+`capture.reason_code` and `patch=null`; it never satisfies acceptance or integration. An
+existing `changes.patch` is not overwritten and is listed under `historical_artifacts`
+with its `file`, `bytes`, `sha256`, `attempt_id` and `provenance`. Provenance is
+`verified_attempt` only when durable history links those bytes to that attempt; otherwise
+it is `legacy_unattributed` with no attempt ID. The file's name or a fresh hash never
+makes it the current patch. Existing checks, diagnostics and history stay at their paths;
+arbitrary files are not treated as evidence. Current status, history, completion,
+finalization and GC read schemas 1 and 2; an unknown schema is refused safely, and a
+0.10.5 binary does not support schema 2, so downgrading is not a recovery route. Once a discard
+request is durable, a crash during cleanup resumes cleanup from `job_finalization_request`
+without another model run or capture.
+
+Plan validation reports all independent structural and enum errors before any partial
+routing or ledger write, leaves text on `stderr`, exits `64`, and names the deliverable
+and changed fields without dumping values. Malformed TOML, unreadable, symlink, hardlink,
+directory or special settings files fail with a controlled exit `78` before the provider;
+a missing settings file keeps the normal fallback.
+
 `gc --dry-run` is the default and explains every keep or delete decision with
 measured allocated bytes and inodes. `gc --apply` performs only the reported safe
 deletions:
@@ -328,8 +382,10 @@ deepseek-team workspace verify WORKSPACE_ID --check 'java -version' --timeout 12
 ```
 
 - `--tool NAME=HOST_DIR` copies a selected software directory into `.deepseek-tools/NAME`, bound read-only inside the namespace. `--copy SOURCE=REL_DEST` copies explicit non-secret files or caches; caches stay writable in the copy. `--env NAME=VALUE` accepts only `JAVA_HOME`, `ANDROID_HOME`, `ANDROID_SDK_ROOT`, `GRADLE_USER_HOME`, `M2_HOME`, `KOTLIN_HOME` and `PATH`, each rooted in the workspace with the literal `{workspace}` placeholder.
+- `--cache-dir REL_DIR` declares a repeatable writable cache root inside the copy and writes an exact anchored exclusion. An environment variable alone does not exclude files. The root cannot be the project root, `.git`, `.deepseek-tools`, a credential-like path or contain tracked files; declare it before execution and do not expand the set afterwards. Cache contents stay out of the result patch but still count as check and preparation inputs, so large or unknown inputs can prevent reuse.
 - `--probe COMMAND` runs only inside the worker namespace, before any model key; a failed probe stops the job. `--save-project` records a private recipe that replays these declarations into a later copy and never executes or replays host commands. The legacy `workspace prepare ID -- COMMAND ARG ...` form is unchanged and still runs on the coordinator host.
 - `--save-project --cache-max-bytes BYTES --cache-max-inodes COUNT` sets the aggregate shared-cache ceiling for the save operation (defaults `2147483648`/`200000`, positive decimal values only). Limits are not persisted in the recipe; replay reads cached entries without reapplying the old limit.
+- `worker --check-timeout SECONDS` sets one limit for each managed check. It accepts finite fractional values with `0 < SECONDS <= 86400` and defaults to `1800` (30 minutes) for a new job; zero, negative, NaN and infinity are rejected before a slot, copy or credential. The same value applies to baseline and post checks, clamped by the remaining total deadline. `worker --timeout` remains the total deadline including queue time. The used value is recorded in attempt and reuse evidence; resume inherits the last started attempt, while an explicit override starts a new attempt and invalidates reuse. Readiness and security probes keep their own limits.
 - `workspace verify ID [--check COMMAND] [--timeout SECONDS] [--json]` rebuilds the prepared environment, reruns the declared or supplied checks and appends evidence. It never loads the provider key, starts a relay or starts a model, and it preserves the original worker result. Output is capped at 65,536 bytes per stream, redacted, and kept owner-only under the workspace's private `diagnostics/` directory.
 - Checks are captured as a baseline before the model runs, so an already-red suite does not block a bugfix assignment. A failed project check stays neutral `unknown` until the coordinator reviews the actual diff and evidence.
 
@@ -345,6 +401,12 @@ entries and their recipe are preserved for inspection. Legacy
 version-1 recipes that name mutable host sources are preserved but refused on
 fresh replay; re-run preparation with the matching `--tool` and/or `--copy`
 declarations and `--save-project` to snapshot them.
+Recipe version 2 records `cache_dirs`; version 1 is read as an empty list, and an
+unknown version is preserved rather than deleted. Without an explicit `--timeout`,
+`workspace verify` uses the check limit recorded by the last started execution attempt
+and does not change the limit inherited by a later resume or correction.
+A legacy execution attempt without a saved limit retains its historical 120 seconds.
+Use `--check-timeout 1800` to continue it with the new limit.
 Allocation reserves aggregate bytes and inodes with free margins under the
 configured storage root and `TMPDIR`; `/mnt/data` is not a portable default.
 

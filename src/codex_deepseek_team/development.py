@@ -265,7 +265,8 @@ def missing_requirements(args: list[str], env: dict[str, str], item: dict) -> li
 
 
 def run_checks(args: list[str], env: dict[str, str], commands: list[str],
-               timeout: float = 120, *, deadline: float | None = None,
+               timeout: float = check_evidence.DEFAULT_CHECK_TIMEOUT, *,
+               deadline: float | None = None,
                directory: Path | None = None, phase: str = 'post',
                redact_values=(), copy=None, reusable: bool = False,
                force: bool = False) -> list[dict]:

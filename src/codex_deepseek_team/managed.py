@@ -11,7 +11,7 @@ import time
 
 from . import (check_evidence, check_reuse, coordination, development,
                preparation_guard, prepared_inputs, relay, runtime_preflight,
-               settings, toolchains, workspace,
+               settings, toolchains, workspace, workspace_lifecycle,
                execution_allocation, storage_budget)
 
 
@@ -85,6 +85,11 @@ def _mark_preparation_failed(copy, error):
 
 def run(args, policy: settings.Policy, api, copy=None) -> int:
     """Resolve containment before credential access; preserve every started copy."""
+    try:
+        args.check_timeout = check_evidence.validate_check_timeout(
+            getattr(args, 'check_timeout', None), allow_none=True)
+    except check_evidence.CheckEvidenceError as error:
+        raise api.WorkerError(error.code, error.message) from None
     if args.os_sandbox != 'required':
         raise api.WorkerError(64, 'Managed access requires --os-sandbox required; no unsafe fallback.')
     writable = policy.effective_access == 'full-access'
@@ -112,6 +117,9 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
     slot = api.acquire_job_slot(args, policy=policy, root=source)
     started = time.monotonic()
     coord_started = False
+    execution_attempt_id = None
+    baseline_failed = False
+    check_timeout = None
     runtime = None
     preparation_cause = 'environment'
     # A freshly created copy and a successfully declaratively prepared copy are
@@ -134,6 +142,16 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
             print('Preparation guard record was not stored; the observed failure was '
                   'preserved and no automatic retry was attempted.', file=api.sys.stderr)
 
+    def fence_allocation():
+        reservation = getattr(args, 'launch_reservation', None)
+        if not (coord_task and coord_assignment and reservation):
+            return
+        try:
+            coordination.begin_launch_allocation(
+                source, coord_task, coord_assignment, reservation)
+        except coordination.CoordinationError as error:
+            raise api.WorkerError(error.code, str(error)) from None
+
     early_owner = ExitStack()
     try:
         if copy is not None and coord_task and coord_assignment:
@@ -142,6 +160,7 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
             if not copy._locked:
                 early_owner.enter_context(copy.lock(recover=bool(
                     getattr(args, 'resume_after_failure', False) or linked_correction)))
+            fence_allocation()
             coordination.assignment_preparing(
                 copy.source, coord_task, coord_assignment, copy)
         if new_job:
@@ -179,6 +198,7 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
                 raise api.WorkerError(78, 'This failed job has no existing execution copy; '
                                       'inspect preparation evidence and plan a new job.')
             if copy is None:
+                fence_allocation()
                 copy = workspace.load(args.state_dir, previous_id)
             elif copy.id != previous_id:
                 raise api.WorkerError(64, 'Explicit continuation must reuse the job\'s original workspace.')
@@ -197,6 +217,7 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
                         raise workspace.WorkspaceError(str(cause), cause.code) from None
             expected_head = (coordination.load_task(source, coord_task)['base_head']
                              if coord_task else None)
+            fence_allocation()
             copy = workspace.create(Path.cwd(), args.state_dir, on_created=associate,
                                     expected_head=expected_head)
         coord_before = None
@@ -220,8 +241,18 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
                 if linked_correction and (linked is None or linked.id != copy.id):
                     raise api.WorkerError(
                         64, 'Correction predecessor changed before execution; no copy was prepared.')
+                fence_allocation()
                 coordination.assignment_preparing(
                     copy.source, coord_task, coord_assignment, copy)
+            try:
+                inherited_check_timeout = workspace_lifecycle.execution_check_timeout(copy)
+            except workspace.WorkspaceError as error:
+                raise api.WorkerError(error.code, str(error)) from None
+            explicit_check_timeout = args.check_timeout is not None
+            check_timeout = (args.check_timeout if explicit_check_timeout
+                             else inherited_check_timeout)
+            force_checks = bool(getattr(args, 'force_checks', False)
+                                or explicit_check_timeout)
             # Retained preflight failures must remain linked to their assignment,
             # even when runtime selection never reaches the readiness probes.
             copy.metadata.update(coord_task=coord_task, coord_assignment=coord_assignment,
@@ -256,7 +287,8 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
                 preparation_cause = 'environment'
                 diagnostics = copy.directory / 'diagnostics'
                 probe_checks = development.run_checks(layout, env, toolchains.probes_for(copy),
-                    deadline=args.job_deadline, directory=diagnostics, phase='probe')
+                    timeout=check_evidence.PROBE_CHECK_TIMEOUT, deadline=args.job_deadline,
+                    directory=diagnostics, phase='probe')
                 copy.metadata.update(runtime=runtime, runtime_binary=binary,
                     runtime_explicit=(getattr(args, runtime + '_explicit',
                         getattr(args, runtime) != runtime)), readiness_checks=probe_checks,
@@ -298,23 +330,10 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
                             78, constraint_code='dependency_unavailable')
                 commands = coord_item.get('checks', []) if coord_item is not None else []
                 checks_reusable = bool(coord_item and coord_item.get('checks_reusable') is True)
-                force_checks = bool(getattr(args, 'force_checks', False))
                 copy.metadata['verification_commands'] = list(commands)
-                baseline_checks = development.run_checks(layout, env, commands,
-                    deadline=args.job_deadline, directory=diagnostics, phase='baseline',
-                    copy=copy, reusable=checks_reusable, force=force_checks)
-                copy.metadata['baseline_checks'] = baseline_checks
-                baseline_classification = check_evidence.classify_checks(baseline_checks, [])
-                copy.metadata['verification_cause'] = baseline_classification['cause']
-                copy.save()
-                if baseline_classification['kind'] == 'environment':
-                    raise development.DevelopmentError(
-                        'Preparation: baseline check could not complete; inspect retained diagnostics.',
-                        124 if baseline_classification['cause'] == 'timeout' else 78)
                 if coord_task:
                     prepared_changes, _ignored = copy.changes()
-                    coord_before = workspace.content_snapshot(copy)
-                input_before = prepared_inputs.input_snapshot(copy)
+                    execution_before = workspace.content_snapshot(copy)
                 # Only after the actual namespace/readiness probes have succeeded.
                 preparation_cause = 'admission'
                 args.validate_admission()
@@ -324,44 +343,83 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
                         preparation_guard.clear(args.state_dir, guard_conditions)
                     except (preparation_guard.PreparationGuardError, OSError):
                         pass  # Successful preparation is not failed by optional cleanup.
-                key = api.load_api_key()
-                if not key.strip():
-                    raise api.WorkerError(78, 'Provider credential is absent; configure it locally. Workspace retained.')
-                development.write_launch(control, binary, runtime, env, writable=writable,
-                                         effort=effort)
-                if coord_task:
-                    # Bounded pre-execution evidence for the lessons journal: the
-                    # prompt digest plus a redacted brief, the workspace baseline and
-                    # the coordinator-prepared content fingerprints. No credential or
-                    # raw model output is captured here.
-                    fingerprints = {}
-                    if coord_before is not None:
-                        fingerprints = {name: coord_before[name] for name in prepared_changes
-                                        if name in coord_before}
-                    execution = {
-                        'prompt_sha256': hashlib.sha256(
-                            task.encode('utf-8', errors='replace')).hexdigest(),
-                        'prompt_brief': api.redact(task, key).strip()[:600],
-                        'model': api.MODEL,
-                        'base_head': copy.metadata.get('base_head'),
-                        'git_digest': copy.metadata.get('git_digest'),
-                        'prepared_fingerprints': fingerprints,
-                    }
-                    coordination.assignment_started(
-                        copy.source, coord_task, coord_assignment, copy.id, runtime,
-                        prepared_changes, effort=effort, execution=execution,
-                        resume_running=getattr(args, 'resume_after_failure', False))
-                    coord_started = True
                 provider = None
                 execution_started = False
                 try:
-                    copy.begin('execution')
+                    if coord_task:
+                        previous_assignment = coordination._assignment(
+                            coordination.load_task(source, coord_task), coord_assignment)
+                        if (previous_assignment.get('status') == 'failed'
+                                and previous_assignment.get('disposition') is None):
+                            raise coordination.CoordinationError(
+                                'Review and disposition the failed attempt before explicit continuation.', 64)
+                        prepared_job_id, reserved_attempt_id = workspace_lifecycle.prepare_attempt(
+                            copy, coord_task, coord_assignment,
+                            replace_pending=bool(getattr(args, 'resume_after_failure', False)))
+                    copy.begin('execution', check_timeout_seconds=check_timeout)
+                    if coord_task:
+                        execution_attempt_id = copy.metadata.get('attempt_id')
+                        if (copy.metadata.get('job_id') != prepared_job_id
+                                or execution_attempt_id != reserved_attempt_id):
+                            raise workspace.WorkspaceError(
+                                'Reserved execution attempt identity changed; copy retained.', 73)
                     copy.metadata.update(delegation_level=policy.delegation_level,
                                          requested_access=policy.access, effective_access=policy.effective_access,
                                          configuration_sources=dict(policy.sources), runtime=runtime,
                                          model=api.MODEL, effort=effort)
                     copy.save()
-                    args.validate_admission(started=coord_started)
+                    try:
+                        baseline_checks = development.run_checks(layout, env, commands,
+                            timeout=check_timeout, deadline=args.job_deadline,
+                            directory=diagnostics, phase='baseline',
+                            copy=copy, reusable=checks_reusable, force=force_checks)
+                        copy.metadata['baseline_checks'] = baseline_checks
+                        baseline_classification = check_evidence.classify_checks(baseline_checks, [])
+                        copy.metadata['verification_cause'] = baseline_classification['cause']
+                        copy.save()
+                        if baseline_classification['kind'] == 'environment':
+                            raise development.DevelopmentError(
+                                'Baseline check could not complete; inspect retained diagnostics.',
+                                124 if baseline_classification['cause'] == 'timeout' else 78)
+                    except BaseException:
+                        baseline_failed = True
+                        raise
+                    if coord_task:
+                        coord_before = workspace.content_snapshot(copy)
+                    input_before = prepared_inputs.input_snapshot(copy)
+                    development.write_launch(control, binary, runtime, env, writable=writable,
+                                             effort=effort)
+                    preparation_cause = 'admission'
+                    args.validate_admission()
+                    preparation_cause = 'environment'
+                    key = api.load_api_key()
+                    if not key.strip():
+                        raise api.WorkerError(78, 'Provider credential is absent; configure it locally. Workspace retained.')
+                    if coord_task:
+                        # Bounded pre-execution evidence for the lessons journal: the
+                        # prompt digest plus a redacted brief, the workspace baseline and
+                        # the coordinator-prepared content fingerprints. No credential or
+                        # raw model output is captured here.
+                        fingerprints = {}
+                        if execution_before is not None:
+                            fingerprints = {name: execution_before[name] for name in prepared_changes
+                                            if name in execution_before}
+                        execution = {
+                            'prompt_sha256': hashlib.sha256(
+                                task.encode('utf-8', errors='replace')).hexdigest(),
+                            'prompt_brief': api.redact(task, key).strip()[:600],
+                            'model': api.MODEL,
+                            'base_head': copy.metadata.get('base_head'),
+                            'git_digest': copy.metadata.get('git_digest'),
+                            'prepared_fingerprints': fingerprints,
+                        }
+                        coordination.assignment_started(
+                            copy.source, coord_task, coord_assignment, copy.id, runtime,
+                            prepared_changes, effort=effort, execution=execution,
+                            resume_running=getattr(args, 'resume_after_failure', False),
+                            check_timeout_seconds=check_timeout,
+                            attempt_id=execution_attempt_id)
+                        coord_started = True
                     with relay.ProviderRelay(socket_path, key) as provider:
                         timeout = args.job_deadline - time.monotonic() if args.job_deadline else None
                         if timeout is not None and timeout <= 0:
@@ -374,7 +432,8 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
                         check_results = []
                         if code == 0 and coord_item is not None:
                             check_results = development.run_checks(
-                                layout, env, commands, deadline=args.job_deadline,
+                                layout, env, commands, timeout=check_timeout,
+                                deadline=args.job_deadline,
                                 directory=diagnostics, phase='post', redact_values=(key,),
                                 copy=copy, reusable=checks_reusable, force=force_checks)
                             if any(row['exit_code'] != 0 for row in check_results):
@@ -488,7 +547,11 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
                     runtime=runtime, effort=effort, cause=cause,
                     baseline_checks=copy.metadata.get('baseline_checks', []) if copy else [],
                     verification_cause=copy.metadata.get('verification_cause') if copy else None,
-                    readiness_checks=copy.metadata.get('readiness_checks', []) if copy else [])
+                    readiness_checks=copy.metadata.get('readiness_checks', []) if copy else [],
+                    attempt_id=execution_attempt_id if baseline_failed else None,
+                    check_timeout_seconds=(check_timeout if baseline_failed else None),
+                    resume_after_failure=bool(baseline_failed and
+                        getattr(args, 'resume_after_failure', False)))
             except (coordination.CoordinationError, OSError):
                 print('Could not record the preparation failure in the coordination ledger; '
                       'inspect the task before another assignment.', file=api.sys.stderr)
@@ -501,6 +564,9 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
         raise
     finally:
         try:
-            early_owner.close()
+            api.release_job_reservation(args, root=source)
         finally:
-            os.close(slot)
+            try:
+                early_owner.close()
+            finally:
+                os.close(slot)

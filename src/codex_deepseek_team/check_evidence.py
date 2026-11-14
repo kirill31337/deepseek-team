@@ -23,6 +23,11 @@ renamed diagnostic file per stream and returns rows with the schema in
   (125).
 * ``stdout_sha256``/``stderr_sha256`` - digests of the retained bytes, used to
   compare baseline and post failures without publishing content.
+* ``check_timeout_seconds`` - configured nominal per-check limit; it is stable
+  provenance and participates in reuse identity.
+* ``effective_timeout_seconds`` - budget handed to the command supervisor after
+  the total job deadline clamp; zero means the deadline had already expired and
+  no command was launched.
 
 Known sensitive ``redact_values`` are replaced with ``[REDACTED]`` in published
 evidence, including values split across read chunks, values straddling the
@@ -40,6 +45,7 @@ never proves a matching cause, and no result grades worker quality.
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import re
 import selectors
@@ -54,11 +60,16 @@ MAX_OUTPUT_BYTES = 65536
 READ_CHUNK_SIZE = 65536
 TIMEOUT_EXIT_CODE = 124
 LAUNCH_FAILURE_EXIT_CODE = 125
+DEFAULT_CHECK_TIMEOUT = 1800.0
+LEGACY_CHECK_TIMEOUT = 120.0
+PROBE_CHECK_TIMEOUT = 120.0
+MAX_CHECK_TIMEOUT = 86400.0
 
 LEGACY_ROW_KEYS = ('command', 'exit_code')
 EVIDENCE_ROW_KEYS = ('command', 'exit_code', 'phase', 'stdout_path', 'stderr_path',
                      'stdout_truncated', 'stderr_truncated', 'timed_out',
-                     'launch_failed', 'stdout_sha256', 'stderr_sha256')
+                     'launch_failed', 'stdout_sha256', 'stderr_sha256',
+                     'check_timeout_seconds', 'effective_timeout_seconds')
 
 _REDACTED = b'[REDACTED]'
 _SAFE_PHASE = re.compile(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}\Z')
@@ -71,6 +82,67 @@ class CheckEvidenceError(Exception):
         super().__init__(message)
         self.message = message
         self.code = code
+
+
+def _invalid_check_timeout():
+    return CheckEvidenceError(
+        'Check timeout must be a finite number of seconds greater than 0 and at most 86400.',
+        64)
+
+
+def validate_check_timeout(value, *, allow_none: bool = False) -> float | None:
+    """Validate one managed check timeout without boolean coercion."""
+    if value is None and allow_none:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise _invalid_check_timeout()
+    if isinstance(value, int):
+        if not 0 < value <= MAX_CHECK_TIMEOUT:
+            raise _invalid_check_timeout()
+        return float(value)
+    result = float(value)
+    if not math.isfinite(result) or not 0 < result <= MAX_CHECK_TIMEOUT:
+        raise _invalid_check_timeout()
+    return result
+
+
+def parse_check_timeout(value) -> float:
+    """Parse an argparse string before applying the strict numeric contract."""
+    if isinstance(value, str):
+        try:
+            value = float(value)
+        except ValueError:
+            raise _invalid_check_timeout() from None
+    return validate_check_timeout(value)
+
+
+def _invalid_effective_timeout():
+    return CheckEvidenceError(
+        'Effective check timeout must be a finite number of seconds between 0 and '
+        'the configured check timeout.', 64)
+
+
+def validate_effective_timeout(value, configured) -> float:
+    """Validate the command-supervisor budget after the deadline clamp.
+
+    The configured timeout remains the nominal value carried in evidence and
+    reuse identity.  The effective timeout never exceeds it and may be zero when
+    the total job deadline had already expired before launch.
+    """
+    configured = validate_check_timeout(configured)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise _invalid_effective_timeout()
+    if isinstance(value, int):
+        if not 0 <= value <= MAX_CHECK_TIMEOUT:
+            raise _invalid_effective_timeout()
+        result = float(value)
+    else:
+        result = float(value)
+        if not math.isfinite(result) or not 0 <= result <= MAX_CHECK_TIMEOUT:
+            raise _invalid_effective_timeout()
+    if result > configured:
+        raise _invalid_effective_timeout()
+    return result
 
 
 def _normalize_secrets(redact_values) -> tuple[bytes, ...]:
@@ -236,7 +308,7 @@ class _Capture:
 
 
 def run_checks(args: list[str], env: dict[str, str], commands: list[str],
-               timeout: float = 120, *, deadline: float | None = None,
+               timeout: float = DEFAULT_CHECK_TIMEOUT, *, deadline: float | None = None,
                directory: Path | None = None, phase: str = 'post',
                redact_values=()) -> list[dict]:
     """Run declared checks in order; stop at the first failed command.
@@ -244,8 +316,12 @@ def run_checks(args: list[str], env: dict[str, str], commands: list[str],
     ``args`` is the already-built namespace command prefix, so every check runs
     as ``[*args, '--', '/bin/sh', '-lc', command]``.  ``deadline`` is a
     ``time.monotonic()`` timestamp for the whole job; the effective per-command
-    ceiling is the smaller of ``timeout`` and the remaining deadline.
+    ceiling is the smaller of ``timeout`` and the remaining deadline.  Each
+    evidence row keeps the configured ``timeout`` and the budget actually handed
+    to the supervisor as ``effective_timeout_seconds`` (zero when the deadline
+    had already expired, in which case nothing is launched).
     """
+    timeout = validate_check_timeout(timeout)
     command_list = [commands] if isinstance(commands, str) else list(commands or ())
     secrets = _normalize_secrets(redact_values)
     target = None
@@ -262,14 +338,15 @@ def run_checks(args: list[str], env: dict[str, str], commands: list[str],
         remaining = timeout if deadline is None else min(timeout, deadline - time.monotonic())
         if remaining <= 0:
             capture = _Capture(TIMEOUT_EXIT_CODE, b'', b'', False, False, True, False)
-            rows.append(_evidence_row(command, phase, run_id, index, capture) if target
-                        else {'command': command, 'exit_code': capture.exit_code})
+            rows.append(_evidence_row(command, phase, run_id, index, capture, timeout, 0.0)
+                        if target else {'command': command, 'exit_code': capture.exit_code})
             break
         capture = _execute(args, env, command, remaining, secrets)
         if target is None:
             row = {'command': command, 'exit_code': capture.exit_code}
         else:
-            row = _publish_row(target, phase, run_id, index, command, capture)
+            row = _publish_row(target, phase, run_id, index, command, timeout,
+                               remaining, capture)
         rows.append(row)
         if row['exit_code'] != 0:
             break
@@ -404,14 +481,15 @@ def _prepare_directory(directory: Path) -> None:
 
 
 def _publish_row(directory: Path, phase: str, run_id: str, index: int,
-                 command: str, capture: _Capture) -> dict:
+                 command: str, timeout: float, effective: float,
+                 capture: _Capture) -> dict:
     if capture.launch_failed:
-        return _evidence_row(command, phase, run_id, index, capture)
+        return _evidence_row(command, phase, run_id, index, capture, timeout, effective)
     stdout_name = f'{phase}-{run_id}-{index:03d}.stdout'
     stderr_name = f'{phase}-{run_id}-{index:03d}.stderr'
     _publish(directory, stdout_name, capture.stdout)
     _publish(directory, stderr_name, capture.stderr)
-    return _evidence_row(command, phase, run_id, index, capture,
+    return _evidence_row(command, phase, run_id, index, capture, timeout, effective,
                          stdout_path=stdout_name, stderr_path=stderr_name)
 
 
@@ -456,7 +534,8 @@ def _fsync_directory(directory: Path) -> None:
 
 
 def _evidence_row(command: str, phase: str, run_id: str, index: int,
-                  capture: _Capture, stdout_path=None, stderr_path=None) -> dict:
+                  capture: _Capture, timeout: float, effective: float,
+                  stdout_path=None, stderr_path=None) -> dict:
     return {
         'command': command,
         'exit_code': capture.exit_code,
@@ -471,6 +550,8 @@ def _evidence_row(command: str, phase: str, run_id: str, index: int,
                           if stdout_path is not None else None),
         'stderr_sha256': (hashlib.sha256(capture.stderr).hexdigest()
                           if stderr_path is not None else None),
+        'check_timeout_seconds': timeout,
+        'effective_timeout_seconds': effective,
     }
 
 

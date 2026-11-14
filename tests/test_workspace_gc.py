@@ -8,7 +8,7 @@ import sys
 from types import SimpleNamespace
 from unittest import mock
 
-from codex_deepseek_team import workspace
+from codex_deepseek_team import git_integrity, workspace
 from tests.test_workspace_lifecycle import LifecycleFixture
 
 
@@ -72,18 +72,38 @@ print('file bind mount preserved before quarantine')
 
     def test_nonroot_capture_keeps_the_callers_mapped_nonzero_identity(self):
         gc = self.api('workspace_gc')
-        copy = self.completed()
+        copy = self.completed(require_namespace=False)
         with mock.patch('codex_deepseek_team.sandbox.probe_backend',
                         return_value=SimpleNamespace(prefix=('bwrap',))), \
                 mock.patch.object(gc.os, 'geteuid', return_value=1001), \
                 mock.patch.object(gc.os, 'getegid', return_value=1002), \
-                mock.patch.object(workspace, '_git_digest', return_value=copy.metadata['git_digest']), \
+                mock.patch.object(git_integrity, 'verify') as verify, \
                 mock.patch.object(gc.subprocess, 'run',
-                        return_value=SimpleNamespace(returncode=0, stdout=b'')) as run:
+                        return_value=SimpleNamespace(
+                            returncode=0, stdout=b'',
+                            stderr=(b'{"status":"ok","bytes":0,"sha256":"'
+                                    b'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}'))) as run:
             gc._capture(copy)
+        verify.assert_called_once_with(copy.path, copy.metadata['git_integrity'])
         command = run.call_args.args[0]
         self.assertEqual(command[command.index('--uid') + 1], '1001')
         self.assertEqual(command[command.index('--gid') + 1], '1002')
+
+    def test_capture_refuses_current_owner_mismatch_before_launch(self):
+        gc = self.api('workspace_gc')
+        copy = self.completed(require_namespace=False)
+        current_uid = os.geteuid()
+        with mock.patch.object(gc.os, 'geteuid', return_value=current_uid + 1):
+            with self.assertRaises(git_integrity.GitIntegrityError) as verifier:
+                git_integrity.verify(copy.path, copy.metadata['git_integrity'])
+            with mock.patch.object(gc.subprocess, 'run',
+                    return_value=SimpleNamespace(returncode=0, stdout=b'')) as run:
+                with self.assertRaises(workspace.WorkspaceError) as caught:
+                    gc._capture(copy)
+        self.assertEqual(verifier.exception.code, 73)
+        self.assertEqual(caught.exception.code, 73)
+        self.assertIn('owned ordinary file', str(caught.exception))
+        run.assert_not_called()
 
     def test_stopped_runtime_socket_left_by_crash_does_not_prevent_cleanup(self):
         copy = self.completed()
@@ -99,8 +119,9 @@ print('file bind mount preserved before quarantine')
         self.assertFalse(runtime.exists())
         self.assertFalse(copy.path.exists())
 
-    def completed(self):
-        self.require_capture()
+    def completed(self, require_namespace=True):
+        if require_namespace:
+            self.require_capture()
         copy = self.copy()
         (copy.path / 'app.txt').write_text('accepted fix\n')
         (copy.path / 'data.bin').write_bytes(b'\x00\xfe\x81new\x00')

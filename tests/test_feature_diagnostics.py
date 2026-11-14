@@ -16,6 +16,7 @@ from codex_deepseek_team.routing_models import (
     FEATURE_VALUES,
     REQUIRED_SEMANTIC_FIELDS,
     RoutingError,
+    feature_value_problems,
     missing_semantic_fields,
     validate_features,
 )
@@ -63,6 +64,21 @@ class FeatureContractTests(unittest.TestCase):
         self.assertEqual(FEATURE_DEFAULTS['effort'], 'high')
         self.assertIn('java', FEATURE_VALUES['domain'])
         self.assertIn('other', FEATURE_VALUES['domain'])
+
+    def test_structural_problems_are_bounded_and_deterministic(self):
+        problems = feature_value_problems({
+            'risk': 'critical', 'model': 'bad model', 'context_version': [],
+            'prompt': 'private prompt', 'paths': ['private/path.py'],
+        })
+        self.assertEqual(
+            [(problem['field'], problem['code']) for problem in problems],
+            [('features.risk', 'invalid_enum'),
+             ('features', 'unsupported_field'),
+             ('features.model', 'invalid_value'),
+             ('features.context_version', 'invalid_value')])
+        rendered = json.dumps(problems)
+        self.assertNotIn('private prompt', rendered)
+        self.assertNotIn('private/path.py', rendered)
 
     def test_missing_semantic_fields_uses_the_required_contract(self):
         self.assertEqual(missing_semantic_fields({}), list(REQUIRED_SEMANTIC_FIELDS))
@@ -403,6 +419,74 @@ class KotlinLessonsTests(unittest.TestCase):
         message = str(caught.exception)
         for allowed in sorted(lessons.DOMAIN_VALUES):
             self.assertIn(allowed, message)
+
+
+class StartedFeatureIdentityDiagnostics(unittest.TestCase):
+    setUp = FeaturePlanCase.setUp
+    assert_canaries = FeaturePlanCase.assert_canaries
+    task = FeaturePlanCase.task
+    deliverable = FeaturePlanCase.deliverable
+    plan = FeaturePlanCase.plan
+
+    def start(self, turn='started-identity'):
+        task = self.task(turn)
+        planned = self.plan(task, [self.deliverable(features=complete_card())])
+        assignment = planned['assignments'][0]
+        coordination.assignment_started(
+            self.repo, task['id'], assignment['id'], 'ws', 'codex', [],
+            effort='high')
+        return task
+
+    def test_medium_and_high_share_one_started_identity(self):
+        task = self.start('effort-alias')
+        path = coordination._task_path(self.repo, task['id'])
+        before = path.read_bytes()
+        repeated = self.plan(
+            task, [self.deliverable(features=complete_card(effort='medium'))])
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(repeated['deliverables'][0]['features']['effort'], 'high')
+
+    def test_omitted_legacy_defaults_are_not_false_changes(self):
+        task = self.start('legacy-defaults')
+        path = coordination._task_path(self.repo, task['id'])
+        before = path.read_bytes()
+        incoming = self.deliverable(features=complete_card())
+        repeated = self.plan(task, [incoming])
+        self.assertEqual(path.read_bytes(), before)
+        self.assertIs(repeated['deliverables'][0]['checks_reusable'], False)
+
+    def test_invalid_started_feature_enum_is_structural_not_immutable(self):
+        task = self.start('invalid-started-enum')
+        path = coordination._task_path(self.repo, task['id'])
+        before = path.read_bytes()
+        with self.assertRaises(coordination.CoordinationError) as caught:
+            self.plan(
+                task,
+                [self.deliverable(features=complete_card(risk='critical'))])
+        self.assertEqual(caught.exception.code, 64)
+        self.assertEqual(
+            [(problem['deliverable_id'], problem['field'], problem['code'])
+             for problem in caught.exception.problems],
+            [('impl', 'features.risk', 'invalid_enum')])
+        self.assertNotIn('immutable', caught.exception.message.lower())
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_invalid_started_identifier_fields_are_structural_not_immutable(self):
+        task = self.start('invalid-started-identifiers')
+        path = coordination._task_path(self.repo, task['id'])
+        before = path.read_bytes()
+        for field, value in (('model', 'bad model'), ('context_version', [])):
+            with self.subTest(field=field):
+                with self.assertRaises(coordination.CoordinationError) as caught:
+                    self.plan(
+                        task,
+                        [self.deliverable(features=complete_card(**{field: value}))])
+                self.assertEqual(
+                    [(problem['deliverable_id'], problem['field'], problem['code'])
+                     for problem in caught.exception.problems],
+                    [('impl', f'features.{field}', 'invalid_value')])
+                self.assertNotIn('immutable', caught.exception.message.lower())
+                self.assertEqual(path.read_bytes(), before)
 
 
 if __name__ == '__main__':

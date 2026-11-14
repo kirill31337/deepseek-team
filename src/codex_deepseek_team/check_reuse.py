@@ -124,10 +124,10 @@ def _commands(values):
 
 
 def _validate_timeout(timeout):
-    if (isinstance(timeout, bool) or not isinstance(timeout, (int, float))
-            or not 0 < float(timeout) < float('inf')):
-        raise CheckReuseError('Check reuse timeout must be a positive finite number.', 64)
-    return float(timeout)
+    try:
+        return check_evidence.validate_check_timeout(timeout)
+    except check_evidence.CheckEvidenceError as error:
+        raise CheckReuseError(error.message, error.code) from None
 
 
 def _require_lock(copy):
@@ -628,6 +628,15 @@ def _rows_from_entry(entry, commands, directory: Path, redactions):
                 or row.get('stdout_truncated') is not False
                 or row.get('stderr_truncated') is not False):
             return None
+        try:
+            configured = check_evidence.validate_check_timeout(
+                row.get('check_timeout_seconds'))
+            check_evidence.validate_effective_timeout(
+                row.get('effective_timeout_seconds'), configured)
+        except check_evidence.CheckEvidenceError:
+            return None
+        if configured != entry.get('timeout'):
+            return None
         if not _SAFE_PHASE.fullmatch(str(row.get('phase', ''))):
             return None
         for stream in ('stdout', 'stderr'):
@@ -729,7 +738,8 @@ def _within_deadline(deadline):
 
 
 def run_checks(copy, layout: list[str], env: dict[str, str], commands: list[str], *,
-               timeout: float = 120, deadline: float | None = None,
+               timeout: float = check_evidence.DEFAULT_CHECK_TIMEOUT,
+               deadline: float | None = None,
                directory: Path, phase: str = 'post', reusable: bool = False,
                force: bool = False, redact_values=()) -> list[dict]:
     """Run checks with conservative, evidence-validated reuse when attested.

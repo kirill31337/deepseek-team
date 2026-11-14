@@ -20,6 +20,7 @@ import shutil
 import tempfile
 import time
 from typing import Any
+import uuid
 
 from . import lessons, scope_matching, settings, state_storage
 from . import verification
@@ -27,7 +28,8 @@ from .config import sync_directory
 from .effort import DEFAULT_EFFORT, normalize_effort, normalize_policy_effort
 from .native_delegation import validate_native_exception
 from .routing import RoutingService
-from .routing_models import (REQUIRED_SEMANTIC_FIELDS, RoutingError, fingerprint,
+from .routing_models import (FEATURE_VALUES, REQUIRED_SEMANTIC_FIELDS, RoutingError,
+                            feature_value_problems, fingerprint,
                             missing_semantic_fields, number, validate_features,
                             validate_quality)
 
@@ -47,11 +49,23 @@ EXECUTION_CONTEXT_KEYS = ("prompt_sha256", "prompt_brief", "base_head", "git_dig
                           "prepared_fingerprints", "model")
 LESSONS_EVIDENCE_LIMIT = 4000
 OUTCOME_CONTEXT_LIMIT = 512 * 1024
+LAUNCH_PHASE_ALLOCATION = 'allocation'
+LAUNCH_PHASE_CANCELLED = 'cancelled-before-start'
 # Optional plan metadata that also becomes part of a deliverable's identity, so an
 # accepted or started scope cannot silently change by replanning. They stay
 # optional: read-only protected plans do not need a mutation authorization.
 OPTIONAL_DEFINITION_FIELDS = ("integration_of", "write_scope", "decision_artifacts",
                               "correction_of")
+DELIVERABLE_REQUIRED_FIELDS = ("id", "kind", "scope", "executor", "acceptance",
+                               "dependencies", "checks")
+# Every logical field participates in the started-definition identity. New
+# logical fields must be appended here so diagnostics and replay stay aligned.
+LOGICAL_DEFINITION_FIELDS = (
+    "id", "kind", "scope", "acceptance", "dependencies", "checks",
+    "checks_reusable", "retention", "features", "requested_executor",
+    "integration_of", "write_scope", "decision_artifacts", "correction_of",
+    "delegation_reason", "native_exception",
+)
 _DELIVERABLE_ID = re.compile(r"[A-Za-z0-9_.-]{1,80}")
 _CORRECTION_TASK_ID = re.compile(r"task-[0-9a-f]{20}")
 _CORRECTION_ASSIGNMENT_ID = re.compile(r"as-[0-9a-f]{16}")
@@ -73,9 +87,13 @@ ROUTING_NEXT_STEPS = {
                                "change before delegating",
     "ineligible_clarity": "use a bounded read-only diagnostic deliverable to clarify the "
                           "requirements before delegating",
-    "ineligible_verification": "declare executable checks or a reproducer before delegating",
-    "declared_verification_required": "declare executable checks or a reproducer before "
-                                      "delegating, or keep this slice with the coordinator",
+    "ineligible_verification": "declare real executable checks or a reproducer before "
+                               "delegating; an empty checks list is allowed when the scope has no "
+                               "runnable check, but never add placeholder commands",
+    "declared_verification_required": "declare real executable checks or a reproducer before "
+                                      "delegating, or keep this slice with the coordinator; an "
+                                      "empty checks list is allowed when no runnable check exists, "
+                                      "but never add placeholder commands",
     "ineligible_domain": "use a bounded read-only diagnostic deliverable to establish the domain",
     "ineligible_operation": "use a bounded read-only diagnostic deliverable to establish the operation",
     "ineligible_context_version": "state the exact context version before delegating",
@@ -88,9 +106,11 @@ ROUTING_NEXT_STEPS = {
 
 
 class CoordinationError(Exception):
-    def __init__(self, message: str, code: int = 78, *, constraint_code: str | None = None):
+    def __init__(self, message: str, code: int = 78, *, constraint_code: str | None = None,
+                 problems: list[dict] | None = None):
         self.message, self.code = message, code
         self.constraint_code = constraint_code
+        self.problems = list(problems or [])
         super().__init__(message)
 
 
@@ -383,6 +403,7 @@ def begin_turn(root: Path, *, session_id: str, turn_id: str, prompt: str,
 
 def complete_task(root: Path, task_id: str) -> dict:
     root = _project_root(root)
+    _validate_retained_results(root, task_id)
     _reconcile_job_publications(root, task_id)
     with _lock(root):
         task = load_task(root, task_id)
@@ -444,7 +465,10 @@ def _plan_metadata(value, field: str):
 
 def _requested_executor(item: dict) -> str:
     """The executor the coordinator asked for, before the saved routing decision."""
-    return (item.get("routing") or {}).get("requested_executor", item["executor"])
+    routing = item.get("routing") or {}
+    if "requested_executor" in routing:
+        return routing["requested_executor"]
+    return item.get("executor")
 
 
 def _started_deliverable_ids(task: dict) -> set[str]:
@@ -557,32 +581,190 @@ def routing_diagnostics(task: dict) -> list[dict]:
     return rows
 
 
-def _normalize_deliverable(raw: dict) -> dict:
+def _problem(deliverable_id, field: str, code: str, message: str) -> dict:
+    return {'deliverable_id': deliverable_id, 'field': field, 'code': code,
+            'message': message}
+
+
+def _problems_error(problems: list[dict], *, code: int = 64,
+                    header: str | None = None) -> None:
+    """Raise one controlled error carrying deterministic structured problems."""
+    message = '\n'.join(problem['message'] for problem in problems)
+    if header:
+        message = header + ('\n' + message if message else '')
+    raise CoordinationError(message, code, problems=problems)
+
+
+def _deliverable_prefix(deliverable_id, index: int) -> str:
+    if deliverable_id is not None:
+        return f'{deliverable_id}: '
+    return f'Deliverable {index}: '
+
+
+def _validate_deliverable(raw, index: int):
+    """Collect independent structural/enum problems for one raw deliverable."""
     if not isinstance(raw, dict):
-        raise CoordinationError("Each deliverable must be an object.", 64)
-    required = {"id", "kind", "scope", "executor", "acceptance", "dependencies", "checks"}
-    if not required.issubset(raw):
-        raise CoordinationError("Deliverables require id/kind/scope/executor/acceptance/dependencies/checks.", 64)
-    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,80}", str(raw["id"])):
-        raise CoordinationError("Invalid deliverable id.", 64)
+        return None, [_problem(
+            None, 'deliverable', 'invalid_type',
+            f'Each deliverable must be an object; entry {index} is not an object.')]
+    raw_id = raw.get('id')
+    valid_id = (isinstance(raw_id, str)
+                and bool(_DELIVERABLE_ID.fullmatch(raw_id)))
+    deliverable_id = raw_id if valid_id else None
+    prefix = _deliverable_prefix(deliverable_id, index)
+    problems = []
+    required_text = '/'.join(DELIVERABLE_REQUIRED_FIELDS)
+    for field in DELIVERABLE_REQUIRED_FIELDS:
+        if field in raw:
+            continue
+        if field == 'checks':
+            problems.append(_problem(
+                deliverable_id, 'checks', 'missing_field',
+                f'{prefix}Deliverables require {required_text}; checks must be present as a '
+                'list. An empty list is allowed when no runnable check exists; do not add '
+                'placeholder checks.'))
+        else:
+            problems.append(_problem(
+                deliverable_id, field, 'missing_field',
+                f'{prefix}Deliverables require {required_text}; missing field {field}.'))
+    if 'id' in raw and not valid_id:
+        problems.append(_problem(
+            deliverable_id, 'id', 'invalid_value',
+            f'{prefix}Invalid deliverable id; expected 1-80 letters, digits, dot, dash or underscore.'))
+
+    kind = raw.get('kind')
+    if 'kind' in raw:
+        if not isinstance(kind, str):
+            problems.append(_problem(
+                deliverable_id, 'kind', 'invalid_type',
+                f'{prefix}Deliverable kind must be a string.'))
+        elif kind not in FEATURE_VALUES['kind']:
+            choices = ', '.join(sorted(FEATURE_VALUES['kind']))
+            problems.append(_problem(
+                deliverable_id, 'kind', 'invalid_enum',
+                f'{prefix}Deliverable kind must be one of: {choices}.'))
+
+    executor = raw.get('executor')
+    executor_choices = ('auto', 'worker', 'coordinator', 'native-agent')
+    if 'executor' in raw:
+        if not isinstance(executor, str):
+            problems.append(_problem(
+                deliverable_id, 'executor', 'invalid_type',
+                f'{prefix}Deliverable executor must be a string.'))
+        elif executor not in executor_choices:
+            problems.append(_problem(
+                deliverable_id, 'executor', 'invalid_enum',
+                f'{prefix}Deliverable executor must be auto, worker, coordinator or native-agent.'))
+
     if 'checks_reusable' in raw and type(raw['checks_reusable']) is not bool:
-        raise CoordinationError('checks_reusable must be a boolean.', 64)
-    if raw["executor"] not in ("auto", "worker", "coordinator", "native-agent"):
-        raise CoordinationError("Deliverable executor must be auto, worker, coordinator or native-agent.", 64)
-    if raw['executor'] == 'worker' and raw['kind'] in PROTECTED_COORDINATOR_KINDS:
-        raise CoordinationError('Protected coordinator responsibilities cannot be assigned to a worker.', 64)
-    if raw["executor"] == "native-agent":
-        reason = raw.get("delegation_reason")
+        problems.append(_problem(
+            deliverable_id, 'checks_reusable', 'invalid_type',
+            f'{prefix}checks_reusable must be a boolean.'))
+
+    for field in ('scope', 'acceptance', 'dependencies', 'checks'):
+        if field not in raw:
+            continue
+        value = raw[field]
+        if field == 'scope' and isinstance(value, str):
+            # One path string is a supported shorthand; normalize it to a
+            # one-entry list only after the entry itself validates.
+            entries = [value]
+        elif isinstance(value, list):
+            entries = value
+        else:
+            shape = 'a list or a single path string' if field == 'scope' else 'a list'
+            problems.append(_problem(
+                deliverable_id, field, 'invalid_type',
+                f'{prefix}{field} must be {shape}.'))
+            continue
+        if field == 'scope':
+            for entry in entries:
+                if (not isinstance(entry, str) or not entry
+                        or '\x00' in entry):
+                    problems.append(_problem(
+                        deliverable_id, 'scope', 'invalid_type',
+                        f'{prefix}scope entries must be non-empty strings.'))
+        elif field in ('acceptance', 'checks'):
+            for entry in entries:
+                if (not isinstance(entry, str) or not entry.strip()
+                        or '\x00' in entry):
+                    problems.append(_problem(
+                        deliverable_id, field, 'invalid_type',
+                        f'{prefix}{field} entries must be non-empty strings '
+                        'without NUL.'))
+        elif field == 'dependencies':
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    problems.append(_problem(
+                        deliverable_id, 'dependencies', 'invalid_type',
+                        f'{prefix}Each dependency must be an object.'))
+                    continue
+                dependency_kind = entry.get('kind')
+                if dependency_kind not in ('command', 'path'):
+                    problems.append(_problem(
+                        deliverable_id, 'dependencies.kind', 'invalid_enum',
+                        f'{prefix}Dependencies must use kind=command or kind=path.'))
+                dependency_value = entry.get('value')
+                if not isinstance(dependency_value, str) or not dependency_value:
+                    problems.append(_problem(
+                        deliverable_id, 'dependencies.value', 'invalid_type',
+                        f'{prefix}Dependency values must be non-empty strings.'))
+
+    if 'features' in raw:
+        features = raw['features']
+        if not isinstance(features, dict):
+            problems.append(_problem(
+                deliverable_id, 'features', 'invalid_type',
+                f'{prefix}Features must be a structured feature card.'))
+        else:
+            for issue in feature_value_problems(features):
+                problems.append(_problem(
+                    deliverable_id, issue['field'], issue['code'],
+                    f"{prefix}{issue['field']}: {issue['message']}"))
+            feature_kind = features.get('kind')
+            if (isinstance(kind, str) and kind in FEATURE_VALUES['kind']
+                    and isinstance(feature_kind, str)
+                    and feature_kind in FEATURE_VALUES['kind']
+                    and feature_kind != kind):
+                problems.append(_problem(
+                    deliverable_id, 'features.kind', 'invalid_value',
+                    f'{prefix}Feature kind must match deliverable kind.'))
+
+    for field in OPTIONAL_DEFINITION_FIELDS:
+        if field not in raw:
+            continue
+        try:
+            _plan_metadata(raw[field], field)
+        except CoordinationError as error:
+            problems.append(_problem(
+                deliverable_id, field, 'invalid_metadata',
+                f'{prefix}{error.message}'))
+
+    if (executor == 'worker' and isinstance(kind, str)
+            and kind in PROTECTED_COORDINATOR_KINDS):
+        problems.append(_problem(
+            deliverable_id, 'executor', 'protected_assignment',
+            f'{prefix}Protected coordinator responsibilities cannot be assigned to a worker.'))
+    if executor == 'native-agent':
+        reason = raw.get('delegation_reason')
         if not isinstance(reason, str) or len(reason.strip()) < 12:
-            raise CoordinationError(
-                "native-agent deliverables require a concrete delegation_reason.", 64)
-        if raw.get("kind") in PROTECTED_COORDINATOR_KINDS:
-            raise CoordinationError(
-                "Protected coordinator responsibilities cannot be assigned to a native agent.", 64)
+            problems.append(_problem(
+                deliverable_id, 'delegation_reason', 'missing_field',
+                f'{prefix}native-agent deliverables require a concrete delegation_reason.'))
+        if isinstance(kind, str) and kind in PROTECTED_COORDINATOR_KINDS:
+            problems.append(_problem(
+                deliverable_id, 'executor', 'protected_assignment',
+                f'{prefix}Protected coordinator responsibilities cannot be assigned to a native agent.'))
         try:
             validate_native_exception(raw)
         except ValueError as error:
-            raise CoordinationError(str(error), 64) from None
+            problems.append(_problem(
+                deliverable_id, 'native_exception', 'invalid_value',
+                f'{prefix}{error}'))
+
+    if problems:
+        return None, problems
+
     value = dict(raw)
     # Derived state is read only from our ledger, never accepted from a plan.
     for key in ('routing', 'routing_feedback', 'result', 'result_invalidated_at',
@@ -591,12 +773,47 @@ def _normalize_deliverable(raw: dict) -> dict:
     for field in OPTIONAL_DEFINITION_FIELDS:
         if field in raw:
             value[field] = _plan_metadata(raw[field], field)
-    value["scope"] = list(raw["scope"]) if isinstance(raw["scope"], list) else [str(raw["scope"])]
-    value["acceptance"] = list(raw["acceptance"])
-    value["dependencies"] = list(raw["dependencies"])
-    value["checks"] = list(raw["checks"])
-    value["checks_reusable"] = raw.get("checks_reusable", False)
+    value['scope'] = ([raw['scope']] if isinstance(raw['scope'], str)
+                      else list(raw['scope']))
+    value['acceptance'] = list(raw['acceptance'])
+    value['dependencies'] = list(raw['dependencies'])
+    value['checks'] = list(raw['checks'])
+    value['checks_reusable'] = raw.get('checks_reusable', False)
+    return value, []
+
+
+def _normalize_deliverable(raw: dict) -> dict:
+    value, problems = _validate_deliverable(raw, 0)
+    if problems:
+        _problems_error(problems)
+    assert value is not None
     return value
+
+
+def _validate_plan_payload(plan):
+    """Validate plan-level shape and all deliverables before any ledger write."""
+    if not isinstance(plan, dict):
+        return [], [_problem(None, 'plan', 'invalid_type',
+                             'Coordination plan must be an object.')]
+    problems = []
+    classification = plan.get('classification')
+    if classification not in ('substantial', 'small'):
+        problems.append(_problem(
+            None, 'classification', 'invalid_enum',
+            'classification must be substantial or small.'))
+    raw_deliverables = plan.get('deliverables', [])
+    if not isinstance(raw_deliverables, list):
+        problems.append(_problem(
+            None, 'deliverables', 'invalid_type', 'deliverables must be a list.'))
+        return [], problems
+    deliverables = []
+    for index, raw in enumerate(raw_deliverables):
+        value, item_problems = _validate_deliverable(raw, index)
+        if item_problems:
+            problems.extend(item_problems)
+        elif value is not None:
+            deliverables.append(value)
+    return deliverables, problems
 
 
 def _definition(item):
@@ -775,6 +992,7 @@ def _correction_workspace(root: Path, task: dict, reference: dict, *,
     continuation_reserved = False
     if continuation_row is not None and not prestart_failure:
         current_attempt_id = continuation_row.get('attempt_id')
+        latest_attempt = (lease.get('attempts') or [None])[-1]
         running_attempt = next(
             (attempt for attempt in lease.get('attempts', [])
              if isinstance(attempt, dict) and attempt.get('id') == current_attempt_id),
@@ -786,10 +1004,28 @@ def _correction_workspace(root: Path, task: dict, reference: dict, *,
             and running_attempt.get('status') == 'running'
             and continuation_row.get('workspace_id') in (None, identifier)
             and copy.metadata.get('attempt_id') == current_attempt_id)
+        current_attempt_reservation = bool(
+            continuation_row.get('status') == 'failed'
+            and not lease.get('pending_attempt')
+            and lease.get('binding') == {'task_id': task['id'],
+                                         'assignment_id': continuation_assignment}
+            and isinstance(latest_attempt, dict)
+            and latest_attempt.get('id') != current_attempt_id
+            and latest_attempt.get('id') == copy.metadata.get('attempt_id')
+            and latest_attempt.get('operation') == 'execution'
+            and latest_attempt.get('status') == 'running'
+            and latest_attempt.get('generation') == lease['generation']
+            and latest_attempt.get('check_timeout_seconds')
+               == copy.metadata.get('check_timeout_seconds')
+            and copy.metadata.get('job_id') == lease['job_id']
+            and copy.metadata.get('attempt') == len(lease.get('attempts', []))
+            and copy.metadata.get('operation') == 'execution'
+            and copy.metadata.get('status') == 'running'
+            and copy.metadata.get('work_inode') == lease['work_inode'])
         continuation_reserved = (
             pending_binding == {'task_id': task['id'],
                                 'assignment_id': continuation_assignment}
-            or running_reservation)
+            or running_reservation or current_attempt_reservation)
     bound_to_current = (preparation_reserved or
                         ((bound_assignment is not None or continuation_assignment is not None)
                          and not prestart_failure))
@@ -799,6 +1035,7 @@ def _correction_workspace(root: Path, task: dict, reference: dict, *,
         expected_binding = {'task_id': task['id'], 'assignment_id': bound_assignment}
         current_row = _assignment(task, bound_assignment)
         current_attempt_id = current_row.get('attempt_id')
+        latest_attempt = (lease.get('attempts') or [None])[-1]
         running_attempt = next(
             (attempt for attempt in lease.get('attempts', [])
              if isinstance(attempt, dict) and attempt.get('id') == current_attempt_id),
@@ -812,7 +1049,24 @@ def _correction_workspace(root: Path, task: dict, reference: dict, *,
             and copy.metadata.get('attempt_id') == current_attempt_id)
         pending_reservation = pending_binding == {
             'task_id': task['id'], 'assignment_id': bound_assignment}
-        if not pending_reservation and not running_reservation:
+        current_attempt_reservation = bool(
+            current_row.get('status') == 'failed'
+            and not lease.get('pending_attempt')
+            and lease.get('binding') == expected_binding
+            and isinstance(latest_attempt, dict)
+            and latest_attempt.get('id') != current_attempt_id
+            and latest_attempt.get('id') == copy.metadata.get('attempt_id')
+            and latest_attempt.get('operation') == 'execution'
+            and latest_attempt.get('status') == 'running'
+            and latest_attempt.get('generation') == lease['generation']
+            and latest_attempt.get('check_timeout_seconds')
+               == copy.metadata.get('check_timeout_seconds')
+            and copy.metadata.get('job_id') == lease['job_id']
+            and copy.metadata.get('attempt') == len(lease.get('attempts', []))
+            and copy.metadata.get('operation') == 'execution'
+            and copy.metadata.get('status') == 'running'
+            and copy.metadata.get('work_inode') == lease['work_inode'])
+        if not (pending_reservation or running_reservation or current_attempt_reservation):
             raise CoordinationError(
                 'Correction assignment start did not reserve this predecessor workspace.', 64)
     elif continuation_assignment is not None and not prestart_failure:
@@ -917,24 +1171,63 @@ def _logical_job_chain(root: Path, task_id: str, assignment_id: str):
 def _finalization_request(request, root, task_id, assignment_id, copy, lease,
                           cancelled):
     """Validate both the old bounded intent and the fully identified new form."""
-    if (not isinstance(request, dict)
+    allowed = {'at', 'evidence', 'cancelled', 'workspace_id', 'project', 'task_id',
+               'assignment_id', 'job_id', 'discard_result', 'reason_code',
+               'result_schema', 'discarded'}
+    if (not isinstance(request, dict) or set(request) - allowed
             or type(request.get('cancelled')) is not bool
             or request['cancelled'] != cancelled
             or request.get('workspace_id') != copy.id
             or not isinstance(request.get('evidence'), str)
             or not request['evidence'].strip()
             or type(request.get('at')) not in (int, float)
-            or not math.isfinite(request['at'])):
+            or not math.isfinite(request['at'])
+            or ('discard_result' in request and type(request['discard_result']) is not bool)
+            or (request.get('discard_result') and not request['cancelled'])
+            or ('discarded' in request and type(request['discarded']) is not bool)
+            or ('discarded' in request and 'result_schema' not in request)
+            or ('result_schema' in request and request['result_schema'] not in (1, 2))
+            or ('reason_code' in request and request['reason_code'] not in
+                ('git_integrity_mismatch', 'capture_too_large',
+                 'capture_unavailable', 'capture_failed'))
+            or ('reason_code' in request and 'result_schema' not in request)
+            or (request.get('result_schema') == 1
+                and (request.get('discarded') is not False
+                     or 'reason_code' in request))
+            or (request.get('result_schema') == 2
+                and (request.get('discarded') is not True
+                     or request.get('reason_code') not in
+                     ('git_integrity_mismatch', 'capture_too_large',
+                      'capture_unavailable', 'capture_failed')
+                     or request.get('discard_result') is not True))):
         raise CoordinationError('Finalization intent is missing or conflicts with this job.', 73)
     expected = {'project': str(root), 'task_id': task_id,
                 'assignment_id': assignment_id, 'job_id': lease['job_id']}
     if any(key in request and request[key] != value for key, value in expected.items()):
         raise CoordinationError('Finalization intent identity does not match this job.', 73)
+    durable = lease.get('finalization')
+    if isinstance(durable, dict):
+        requested_discard = bool(request.get('discard_result', False))
+        if requested_discard != (durable.get('discard_result') is True):
+            raise CoordinationError(
+                'Finalization intent conflicts with the durable result handling.', 73)
+        if ('discarded' in request and durable.get('discarded') is not None
+                and bool(request['discarded']) != bool(durable['discarded'])):
+            raise CoordinationError(
+                'Finalization intent conflicts with the retained result schema.', 73)
+        if ('result_schema' in request and durable.get('result_schema') is not None
+                and request['result_schema'] != durable['result_schema']):
+            raise CoordinationError(
+                'Finalization intent conflicts with the retained result schema.', 73)
+        if ('reason_code' in request and durable.get('reason_code') is not None
+                and request['reason_code'] != durable['reason_code']):
+            raise CoordinationError(
+                'Finalization intent conflicts with the discard reason.', 73)
 
 
 def _cleaned_job_evidence(copy, lease):
-    """Validate retained evidence without trusting a missing execution tree."""
-    from . import workspace_gc, workspace_lifecycle as lifecycle
+    """Validate retained schema 1/2 evidence without trusting a missing tree."""
+    from . import workspace, workspace_gc, workspace_lifecycle as lifecycle
 
     cleanup = lease.get('cleanup')
     if (not isinstance(cleanup, dict) or cleanup.get('state') != 'cleaned'
@@ -949,23 +1242,23 @@ def _cleaned_job_evidence(copy, lease):
         if lifecycle._exists(fd, 'work') or any(
                 workspace_gc._extra_name(name) for name in os.listdir(fd)):
             raise CoordinationError('Cleaned job has replacement execution data; history preserved.', 73)
-        raw = lifecycle.read_file(fd, 'result.json')
         try:
-            result = json.loads(raw)
-            patch = result['patch']
-            if (result.get('schema') != 1 or result.get('workspace_id') != copy.id
-                    or result.get('source') != str(copy.source)
-                    or result.get('job_id', lease['job_id']) != lease['job_id']
-                    or result.get('base_head') != (copy.metadata.get('base_head') or
-                                                  copy.metadata.get('source_head'))
-                    or patch.get('file') != 'changes.patch'):
-                raise ValueError()
-            contents = lifecycle.read_file(fd, 'changes.patch', maximum=workspace_gc.MAX_PATCH_BYTES)
-            if (contents is None or patch.get('bytes') != len(contents)
-                    or patch.get('sha256') != hashlib.sha256(contents).hexdigest()):
-                raise ValueError()
-        except (ValueError, TypeError, KeyError, AttributeError):
-            raise CoordinationError('Retained result does not identify the cleaned logical job.', 73) from None
+            result = workspace_gc.read_result(copy, fd=fd, lease=lease)
+        except workspace.WorkspaceError as error:
+            raise CoordinationError(str(error), error.code) from None
+    if result is None:
+        raise CoordinationError('Retained result does not identify the cleaned logical job.', 73)
+    finalization = lease.get('finalization')
+    if isinstance(finalization, dict) and finalization.get('result_schema') is not None:
+        if finalization['result_schema'] != result['schema']:
+            raise CoordinationError('Retained result schema conflicts with the logical job lease.', 73)
+        if bool(finalization.get('discarded')) != (result['schema'] == 2):
+            raise CoordinationError('Retained discard state conflicts with the logical job lease.', 73)
+        if (result['schema'] == 2
+                and finalization.get('reason_code') != result['capture']['reason_code']):
+            raise CoordinationError('Retained discard reason conflicts with the logical job lease.', 73)
+        if result['schema'] == 1 and finalization.get('reason_code') is not None:
+            raise CoordinationError('A captured result cannot carry a discard reason.', 73)
     state = copy.directory.parent.parent
     with lifecycle.fence(state) as (root_fd, _):
         if lifecycle._exists(root_fd, 'quarantine'):
@@ -975,6 +1268,8 @@ def _cleaned_job_evidence(copy, lease):
                     raise CoordinationError('Cleaned job still has quarantined execution data.', 73)
             finally:
                 os.close(qfd)
+    return {'schema': result['schema'], 'discarded': result['schema'] == 2,
+            'reason_code': (result.get('capture') or {}).get('reason_code')}
 
 
 def _preparation_only_history(copy, lease):
@@ -992,7 +1287,7 @@ def _preparation_only_history(copy, lease):
 
 
 def _finalization_authority(root, task_id, assignment_id, copy, *,
-                            cancelled=None, recover_binding=False):
+                            cancelled=None, recover_binding=False, discarding=None):
     """Resolve publication authority before cleanup and again before publication.
 
     Caller holds the owner lock, lifecycle fence and project ledger lock. A
@@ -1014,11 +1309,23 @@ def _finalization_authority(root, task_id, assignment_id, copy, *,
         raise CoordinationError('Logical job workspace/job identity does not match.', 73)
     lifecycle.authorize_finalization(lease)
     terminal = lease['phase'] in lifecycle.FINAL_PHASES
+    evidence = None
     if terminal:
         if cancelled is not None and (lease['phase'] == 'cancelled') != cancelled:
             raise CoordinationError('Finalization cannot change the original terminal decision.', 73)
+        finalization = lease.get('finalization')
+        if isinstance(finalization, dict):
+            if finalization.get('cancelled') != (lease['phase'] == 'cancelled'):
+                raise CoordinationError('Lease finalization conflicts with its terminal decision.', 73)
+            if discarding is True and finalization.get('discard_result') is not True:
+                raise CoordinationError(
+                    'Lease finalization conflicts with the requested destructive handling.', 73)
         if lease.get('cleanup', {}).get('state') == 'cleaned':
-            _cleaned_job_evidence(copy, lease)
+            evidence = _cleaned_job_evidence(copy, lease)
+            if (isinstance(finalization, dict)
+                    and finalization.get('discarded') is not None
+                    and bool(finalization['discarded']) != evidence['discarded']):
+                raise CoordinationError('Lease finalization conflicts with its retained result schema.', 73)
     binding = lease.get('binding')
     repaired = False
     if binding is None:
@@ -1038,7 +1345,8 @@ def _finalization_authority(root, task_id, assignment_id, copy, *,
             raise CoordinationError('Missing binding has insufficient or conflicting preparation evidence.', 73)
         if terminal:
             _finalization_request(row.get('job_finalization_request'), root, task_id,
-                                  assignment_id, copy, lease, True)
+                                  assignment_id, copy, lease,
+                                  lease['phase'] == 'cancelled')
         lease = dict(lease)
         lifecycle._record_binding(lease, candidate)
         binding, repaired = candidate, True
@@ -1102,14 +1410,67 @@ def _finalization_authority(root, task_id, assignment_id, copy, *,
                     or publication.get('job_id') != lease['job_id']
                     or publication.get('workspace_id', copy.id) != copy.id
                     or publication.get('cancelled', decision) != decision
-                    or publication.get('action') not in ('cleaned', 'already-cleaned')):
+                    or publication.get('action') not in ('cleaned', 'already-cleaned')
+                    or ('discarded' in publication
+                        and type(publication['discarded']) is not bool)
+                    or (publication.get('discarded') and not publication.get('cancelled'))):
                 raise CoordinationError('Existing finalization conflicts with this logical job.', 73)
+            if evidence is not None:
+                if bool(publication.get('discarded', False)) != evidence['discarded']:
+                    raise CoordinationError('Existing finalization conflicts with the retained result schema.', 73)
+                if ('result_schema' in publication
+                        and publication['result_schema'] != evidence['schema']):
+                    raise CoordinationError('Existing finalization conflicts with the retained result schema.', 73)
+                if (evidence['discarded']
+                        and publication.get('reason_code') not in (None, evidence['reason_code'])):
+                    raise CoordinationError('Existing finalization conflicts with the discard reason.', 73)
+                if (not evidence['discarded']
+                        and publication.get('reason_code') is not None):
+                    raise CoordinationError('A captured result cannot carry a discard reason.', 73)
         request = chain_row.get('job_finalization_request')
         if request is not None:
             decision = (lease['phase'] == 'cancelled') if terminal else bool(cancelled)
             _finalization_request(request, root, chain_task_id, chain_assignment_id,
                                   copy, lease, decision)
     return lease, chain, repaired
+
+
+def _reject_discarded_chain(root: Path, chain: list, evidence: str, *,
+                            request: dict | None = None) -> None:
+    """Reconcile every current disposition under an explicit job discard intent.
+
+    Callers hold the project ledger lock. Each write is replayable after a
+    partial cross-task publication, while previous decisions and grades remain
+    in their append-only histories.
+    """
+    quality = {
+        'grade': 'unassessable', 'attribution': 'unknown',
+        'evidence': 'The uncapturable result was explicitly discarded; no quality assessment is possible.',
+    }
+    for chain_task_id, chain_assignment_id in chain:
+        task = load_task(root, chain_task_id)
+        row = _assignment(task, chain_assignment_id)
+        intent_added = request is not None and not row.get('job_finalization_request')
+        if intent_added:
+            row['job_finalization_request'] = dict(
+                request, task_id=chain_task_id, assignment_id=chain_assignment_id)
+        if (row.get('disposition') or {}).get('kind') == 'rejected':
+            if intent_added:
+                task['updated_at'] = time.time()
+                _atomic(_task_path(root, chain_task_id), task)
+            continue
+        if row.get('disposition'):
+            row.setdefault('disposition_history', []).append(dict(row['disposition']))
+        row['disposition'] = {
+            'kind': 'rejected', 'evidence': evidence[:2000], 'at': time.time()}
+        if row.get('routing_features'):
+            _queue_feedback(
+                task, row, action='worker', outcome='rejected', cost_usd=None,
+                features=row['routing_features'],
+                decision_id=row.get('routing_decision_id'),
+                started_at=row.get('started_at', task['created_at']), quality=quality)
+        task['updated_at'] = time.time()
+        _atomic(_task_path(root, chain_task_id), task)
 
 
 def _publish_job_finalization(root: Path, task_id: str, assignment_id: str,
@@ -1128,16 +1489,30 @@ def _publish_job_finalization(root: Path, task_id: str, assignment_id: str,
             with lifecycle.fence(_state_root()):
                 owned.enter_context(workspace_gc._owner(copy))
             with lifecycle.fence(_state_root()), _lock(root):
-                lease, chain, _ = _finalization_authority(root, task_id, assignment_id, copy)
+                discarding = (report.get('discarded')
+                              if type(report.get('discarded')) is bool else None)
+                lease, chain, _ = _finalization_authority(
+                    root, task_id, assignment_id, copy, discarding=discarding)
                 if lease['phase'] not in lifecycle.FINAL_PHASES:
                     raise CoordinationError('Logical job is not finalized; publication is deferred.', 75)
-                _cleaned_job_evidence(copy, lease)
+                evidence = _cleaned_job_evidence(copy, lease)
                 for key, value in (('id', copy.id), ('workspace_id', copy.id),
                                    ('job_id', lease['job_id'])):
                     if key in report and report[key] != value:
                         raise CoordinationError('Finalization publication belongs to another logical job.', 73)
                 if report.get('cancelled', lease['phase'] == 'cancelled') != (lease['phase'] == 'cancelled'):
                     raise CoordinationError('Finalization publication changes the terminal decision.', 73)
+                if ('discarded' in report
+                        and bool(report['discarded']) != evidence['discarded']):
+                    raise CoordinationError('Finalization publication conflicts with the retained result.', 73)
+                if ('result_schema' in report
+                        and report['result_schema'] != evidence['schema']):
+                    raise CoordinationError('Finalization publication conflicts with the retained result.', 73)
+                if (evidence['discarded']
+                        and report.get('reason_code') not in (None, evidence['reason_code'])):
+                    raise CoordinationError('Finalization publication conflicts with the discard reason.', 73)
+                if (not evidence['discarded'] and report.get('reason_code') is not None):
+                    raise CoordinationError('A captured result cannot carry a discard reason.', 73)
                 existing_reports, requests = [], []
                 for chain_task_id, chain_assignment_id in chain:
                     chain_row = _assignment(load_task(root, chain_task_id), chain_assignment_id)
@@ -1147,10 +1522,22 @@ def _publish_job_finalization(root: Path, task_id: str, assignment_id: str,
                         requests.append(chain_row['job_finalization_request'])
                 if not existing_reports and not requests:
                     raise CoordinationError('Logical job has no explicit finalization intent.', 73)
+                if existing_reports and any(item != existing_reports[0]
+                                            for item in existing_reports[1:]):
+                    raise CoordinationError('Linked finalization publications are inconsistent.', 73)
                 publication = dict(existing_reports[0] if existing_reports else report)
-                publication.update(id=copy.id, job_id=lease['job_id'])
+                publication.update(id=copy.id, workspace_id=copy.id, job_id=lease['job_id'])
+                publication['discarded'] = evidence['discarded']
+                publication['result_schema'] = evidence['schema']
+                if evidence['discarded']:
+                    publication['reason_code'] = evidence['reason_code']
+                else:
+                    publication.pop('reason_code', None)
                 publication.setdefault('cancelled', lease['phase'] == 'cancelled')
                 publication.setdefault('at', time.time())
+                if evidence['discarded']:
+                    _reject_discarded_chain(root, chain, publication.get('evidence',
+                                             'Explicit logical job discard'))
                 for chain_task_id, chain_assignment_id in chain:
                     chain_task = load_task(root, chain_task_id)
                     chain_row = _assignment(chain_task, chain_assignment_id)
@@ -1165,6 +1552,9 @@ def _publish_job_finalization(root: Path, task_id: str, assignment_id: str,
                         _atomic(_task_path(root, chain_task_id), chain_task)
     except (workspace.WorkspaceError, state_storage.StorageError) as error:
         raise CoordinationError(str(error), error.code) from None
+    if evidence['discarded']:
+        for chain_task_id in {identifier for identifier, _assignment_id in chain}:
+            sync_routing_feedback(root, chain_task_id)
 
 
 def _reconcile_job_publications(root: Path, task_id: str) -> None:
@@ -1194,8 +1584,25 @@ def _reconcile_job_publications(root: Path, task_id: str) -> None:
         if request is not None:
             if not isinstance(request, dict):
                 raise CoordinationError('Malformed saved finalization intent; history preserved.', 73)
-            finalize_assignment(project_root, task_id, row['id'],
-                request.get('evidence'), cancelled=request.get('cancelled'))
+            binding = lease.get('binding')
+            if (isinstance(binding, dict)
+                    and set(binding) == {'task_id', 'assignment_id'}
+                    and binding != {'task_id': task_id, 'assignment_id': row['id']}):
+                latest = _assignment(load_task(project_root, binding['task_id']),
+                                     binding['assignment_id'])
+                latest_request = latest.get('job_finalization_request')
+                if not isinstance(latest_request, dict):
+                    raise CoordinationError('Latest correction has no saved finalization intent.', 73)
+                finalize_assignment(
+                    project_root, binding['task_id'], binding['assignment_id'],
+                    latest_request.get('evidence'),
+                    cancelled=latest_request.get('cancelled'),
+                    discard_result=latest_request.get('discard_result') is True)
+                continue
+            finalize_assignment(
+                project_root, task_id, row['id'], request.get('evidence'),
+                cancelled=request.get('cancelled'),
+                discard_result=request.get('discard_result') is True)
             continue
         binding = lease.get('binding')
         if (not isinstance(binding, dict)
@@ -1355,6 +1762,8 @@ def _validate_correction_plan(root: Path, task: dict, deliverables: list[dict]) 
     corrections require an explicit ``correction_of`` reference.
     """
     started = _started_deliverable_ids(task)
+    worker_deliverables = {row.get('deliverable_id')
+                           for row in task.get('assignments', [])}
     references = {}
     for item in deliverables:
         reference = item.get('correction_of')
@@ -1370,6 +1779,7 @@ def _validate_correction_plan(root: Path, task: dict, deliverables: list[dict]) 
                      'assignment_id': predecessor_assignment_id}
         for existing in task.get('deliverables', []):
             if (existing.get('id') != item['id']
+                    and existing.get('id') in worker_deliverables
                     and existing.get('correction_of') == reference):
                 raise CoordinationError(
                     'Correction predecessor already has a linked successor; link the latest correction assignment.',
@@ -1387,19 +1797,19 @@ def _validate_correction_plan(root: Path, task: dict, deliverables: list[dict]) 
     _reject_unlinked_overlaps(root, task, new_items)
 
 
-def _canonical_features(item, task):
+def _canonical_features(item, task, *, require_kind: bool = True):
     raw = item.get('features', {})
     if not isinstance(raw, dict):
         raise ValueError('features must be an object')
     defaults = {'kind': item['kind'], 'runtime': task.get('runtime', 'codex'),
                 'effort': normalize_effort(task['policy'].get('effort')) or DEFAULT_EFFORT}
     features = validate_features({**defaults, **raw})
-    if features['kind'] != item['kind']:
+    if require_kind and features['kind'] != item['kind']:
         raise ValueError('feature kind differs from deliverable kind')
     return features
 
 
-def _new_auto_feature_card_issues(task, deliverables):
+def _new_auto_feature_card_problems(task, deliverables):
     """Validate new ordinary substantial Auto cards before any routing side effect.
 
     Only cards that still request ``executor:auto`` are required to declare the
@@ -1408,50 +1818,157 @@ def _new_auto_feature_card_issues(task, deliverables):
     Explicit ``unknown`` values satisfy presence and remain honest declarations.
     """
     started = _started_deliverable_ids(task)
-    issues = []
+    problems = []
     for item in deliverables:
         if (item.get('executor') != 'auto' or item.get('id') in started
                 or item.get('kind') in PROTECTED_COORDINATOR_KINDS):
             continue
+        item_id = item.get('id')
         raw = item.get('features')
         if raw is None:
             missing = list(REQUIRED_SEMANTIC_FIELDS)
         elif not isinstance(raw, dict):
-            issues.append(f"{item['id']}: features must be a structured feature card")
+            problems.append(_problem(
+                item_id, 'features', 'invalid_type',
+                f'{item_id}: features must be a structured feature card'))
             continue
         else:
             missing = missing_semantic_fields(raw)
         if missing:
-            issues.append(
-                f"{item['id']}: missing semantic feature fields: {', '.join(missing)}")
+            problems.append(_problem(
+                item_id, 'features', 'missing_semantic_fields',
+                f"{item_id}: missing semantic feature fields: {', '.join(missing)}"))
             continue
         defaults = {'kind': item['kind'], 'runtime': task.get('runtime', 'codex'),
                     'effort': normalize_effort(task['policy'].get('effort')) or DEFAULT_EFFORT}
         try:
             card = validate_features({**defaults, **raw})
         except RoutingError as error:
-            issues.append(f"{item['id']}: {error.message}")
+            problems.append(_problem(
+                item_id, 'features', 'invalid_value',
+                f'{item_id}: {error.message}'))
             continue
         if card['kind'] != item['kind']:
-            issues.append(f"{item['id']}: feature kind must match deliverable kind")
-    return issues
+            problems.append(_problem(
+                item_id, 'features.kind', 'invalid_value',
+                f'{item_id}: feature kind must match deliverable kind'))
+    return problems
 
 
 def _logical_definition(item, task):
-    definition = {key: item[key] for key in ('id', 'kind', 'scope', 'acceptance',
-                                             'dependencies', 'checks')}
-    definition['checks_reusable'] = item.get('checks_reusable', False)
-    if 'retention' in item:
-        definition['retention'] = item['retention']
-    for field in OPTIONAL_DEFINITION_FIELDS:
-        if field in item:
-            definition[field] = item[field]
-    if item.get('executor') == 'native-agent':
-        definition['delegation_reason'] = item.get('delegation_reason')
-        definition['native_exception'] = item.get('native_exception')
-    definition['features'] = _canonical_features(item, task)
-    definition['requested_executor'] = _requested_executor(item)
-    return definition
+    """The canonical identity of every logical deliverable field.
+
+    Derived routing decisions, assignment rows, results and dispatch history are
+    deliberately absent. Optional fields are present with ``None`` so an omitted
+    legacy field and an explicitly null field compare identically.
+    """
+    definition = {
+        'id': item.get('id'),
+        'kind': item.get('kind'),
+        'scope': item.get('scope'),
+        'acceptance': item.get('acceptance'),
+        'dependencies': item.get('dependencies'),
+        'checks': item.get('checks'),
+        'checks_reusable': item.get('checks_reusable', False),
+        'retention': item.get('retention'),
+        'features': _canonical_features(item, task, require_kind=False),
+        'requested_executor': _requested_executor(item),
+        'integration_of': item.get('integration_of'),
+        'write_scope': item.get('write_scope'),
+        'decision_artifacts': item.get('decision_artifacts'),
+        'correction_of': item.get('correction_of'),
+        'delegation_reason': item.get('delegation_reason'),
+        'native_exception': item.get('native_exception'),
+    }
+    return {field: definition[field] for field in LOGICAL_DEFINITION_FIELDS}
+
+
+def _fallback_definition_value(item, field, task):
+    if field == 'features':
+        try:
+            return _canonical_features(item, task, require_kind=False)
+        except (RoutingError, KeyError, TypeError, ValueError):
+            return item.get('features')
+    if field == 'requested_executor':
+        try:
+            return _requested_executor(item)
+        except (KeyError, TypeError):
+            return item.get('executor')
+    if field == 'checks_reusable':
+        return item.get(field, False)
+    return item.get(field)
+
+
+def _definition_differences(incoming, saved, task) -> list[str]:
+    """Changed logical keys in canonical order, using canonical comparisons."""
+    try:
+        new = _logical_definition(incoming, task)
+        old = _logical_definition(saved, task)
+    except (RoutingError, KeyError, TypeError, ValueError):
+        return [
+            field for field in LOGICAL_DEFINITION_FIELDS
+            if _fallback_definition_value(incoming, field, task)
+            != _fallback_definition_value(saved, field, task)
+        ]
+    return [field for field in LOGICAL_DEFINITION_FIELDS if new[field] != old[field]]
+
+
+def _started_definition_differences(item, prior, task) -> list[str]:
+    """Compare a started definition while preserving the allowed ``auto`` alias.
+
+    A started worker may replay ``executor: auto`` (or its recorded executor)
+    without being reported as a requested-executor change. A genuinely different
+    explicit executor remains a changed ``requested_executor`` key.
+    """
+    candidate = dict(item)
+    prior_requested = _requested_executor(prior)
+    if (item.get('executor') == prior.get('executor')
+            or (item.get('executor') == 'auto' and prior_requested == 'auto')):
+        candidate['routing'] = {'requested_executor': prior_requested}
+    return _definition_differences(candidate, prior, task)
+
+
+def _started_definition_revision_problems(task, deliverables) -> list[dict]:
+    """Collect duplicate, started-change and removal problems before routing."""
+    problems = []
+    previous = {item.get('id'): item for item in task.get('deliverables', [])}
+    started = _started_deliverable_ids(task)
+    seen = set()
+    for item in deliverables:
+        item_id = item.get('id')
+        if item_id in seen:
+            problems.append(_problem(
+                item_id, 'id', 'duplicate',
+                f'{item_id}: Duplicate deliverable identity.'))
+            continue
+        seen.add(item_id)
+        prior = previous.get(item_id)
+        if prior is None or item_id not in started:
+            continue
+        changed = _started_definition_differences(item, prior, task)
+        if changed:
+            keys = ', '.join(changed)
+            for field in changed:
+                problems.append(_problem(
+                    item_id, field, 'immutable_definition',
+                    f'{item_id}: started deliverable definition is immutable; '
+                    f"changed keys: {keys}. Field '{field}' cannot change."))
+    incoming = {item.get('id') for item in deliverables}
+    missing = []
+    for item in task.get('deliverables', []):
+        item_id = item.get('id')
+        if item_id in started and item_id not in incoming and item_id not in missing:
+            missing.append(item_id)
+    for row in task.get('assignments', []):
+        item_id = row.get('deliverable_id')
+        if item_id in started and item_id not in incoming and item_id not in missing:
+            missing.append(item_id)
+    for item_id in missing:
+        problems.append(_problem(
+            item_id, 'id', 'immutable_removal',
+            f'Plan revision cannot remove started/completed deliverable {item_id}; '
+            'add a new deliverable id for revised scope.'))
+    return problems
 
 
 def _same_logical_plan(task, deliverables, classification, small_evidence):
@@ -1482,25 +1999,16 @@ def _prepare_routing(root, task, items, service):
     ids = set()
     for item in items:
         if item['id'] in ids:
-            raise CoordinationError('Duplicate deliverable identity.', 64)
+            _problems_error([_problem(
+                item['id'], 'id', 'duplicate',
+                f"{item['id']}: Duplicate deliverable identity.")])
         ids.add(item['id'])
-        raw = item.get('features', {})
-        defaults = {'kind': item['kind'], 'runtime': task.get('runtime', 'codex'),
-                    'effort': normalize_effort(task['policy'].get('effort')) or DEFAULT_EFFORT}
-        if not isinstance(raw, dict):
-            raise CoordinationError('features must be a structured feature card.', 64)
-        item['features'] = validate_features({**defaults, **raw})
-        if item['features']['kind'] != item['kind']:
-            raise CoordinationError('Feature kind must match deliverable kind.', 64)
         prior = previous.get(item['id'])
-        if item['id'] in started and prior and isinstance(prior.get('features'), dict):
-            # A saved ledger may still carry the legacy 'medium' spelling; compare the
-            # canonical feature card but keep the stored spelling so its routing
-            # decision binding stays valid without a destructive rewrite.
-            canonical_prior = dict(prior, features=validate_features(prior['features']))
-            if _definition(item) != _definition(canonical_prior) or item['executor'] not in (prior['executor'], 'auto'):
-                raise CoordinationError('Started deliverable scope and features are immutable; use a new deliverable id.', 64)
-            item['features'] = prior['features']
+        if item['id'] in started and prior:
+            # Revision validation already proved the logical definition unchanged.
+            # Restore the saved derived routing/result binding byte-for-byte so the
+            # original decision stays valid without a destructive rewrite.
+            item['features'] = prior.get('features', item.get('features'))
             item['executor'] = prior['executor']
             item['routing'] = prior.get('routing')
             for key in ('routing_feedback', 'result', 'result_invalidated_at',
@@ -1508,16 +2016,40 @@ def _prepare_routing(root, task, items, service):
                 if key in prior:
                     item[key] = prior[key]
             continue
+        raw = item.get('features', {})
+        defaults = {'kind': item['kind'], 'runtime': task.get('runtime', 'codex'),
+                    'effort': normalize_effort(task['policy'].get('effort')) or DEFAULT_EFFORT}
+        if not isinstance(raw, dict):
+            _problems_error([_problem(
+                item['id'], 'features', 'invalid_type',
+                f"{item['id']}: features must be a structured feature card.")])
+        try:
+            item['features'] = validate_features({**defaults, **raw})
+        except RoutingError as error:
+            _problems_error([_problem(
+                item['id'], 'features', 'invalid_value',
+                f"{item['id']}: {error.message}")])
+        if item['features']['kind'] != item['kind']:
+            _problems_error([_problem(
+                item['id'], 'features.kind', 'invalid_value',
+                f"{item['id']}: Feature kind must match deliverable kind.")])
         requested = item['executor']
         if requested == 'auto' and service.config()['mode'] != 'auto':
-            raise CoordinationError(
-                'executor:auto requires routing mode auto. Explicitly choose '
+            _problems_error([_problem(
+                item['id'], 'executor', 'invalid_routing_mode',
+                f"{item['id']}: executor:auto requires routing mode auto. Explicitly choose "
                 '`deepseek-team routing configure --mode auto`, or save a manual '
-                '25/50/75 delegation profile before registering new work.', 64)
+                '25/50/75 delegation profile before registering new work.')])
         from .routing_admission import manual_acceptance
-        decision = service.predict(item['features'], access=task['policy']['effective_access'],
-                                   binding=_binding(task['id'], item),
-                                   verification_ready=bool(item['checks']) or manual_acceptance(item))
+        try:
+            decision = service.predict(
+                item['features'], access=task['policy']['effective_access'],
+                binding=_binding(task['id'], item),
+                verification_ready=bool(item['checks']) or manual_acceptance(item))
+        except RoutingError as error:
+            _problems_error([_problem(
+                item['id'], 'routing', 'routing_error',
+                f"{item['id']}: {error.message}")], code=error.code)
         if requested == 'auto':
             item['executor'] = 'worker' if decision['action'] == 'worker' else 'coordinator'
         item['routing'] = {'decision_id': decision['id'], 'requested_executor': requested,
@@ -1548,20 +2080,27 @@ def _routing_batch(root):
 
 
 def plan_task(root: Path, task_id: str, plan: dict) -> dict:
-    if not isinstance(plan, dict):
-        raise CoordinationError("Coordination plan must be an object.", 64)
+    deliverables, problems = _validate_plan_payload(plan)
+    if problems:
+        _problems_error(problems)
     classification = plan.get("classification")
-    if classification not in ("substantial", "small"):
-        raise CoordinationError("classification must be substantial or small.", 64)
-    deliverables = [_normalize_deliverable(x) for x in plan.get("deliverables", [])]
     if classification == "small":
+        small_problems = []
         if len(deliverables) != 1 or not plan.get("small_evidence"):
-            raise CoordinationError("Small tasks require one deliverable and concrete small_evidence.", 64)
-        scopes = deliverables[0].get("scope", [])
-        if len(scopes) != 1 or any("*" in value or "?" in value or "[" in value for value in scopes):
-            raise CoordinationError(
-                "Small-task exemption requires one concrete non-wildcard scope; "
-                "otherwise register a substantial distribution.", 64)
+            small_problems.append(_problem(
+                None, 'small_evidence', 'missing_field',
+                'Small tasks require one deliverable and concrete small_evidence.'))
+        if len(deliverables) == 1:
+            scopes = deliverables[0].get("scope", [])
+            if (len(scopes) != 1
+                    or any("*" in value or "?" in value or "[" in value
+                           for value in scopes)):
+                small_problems.append(_problem(
+                    deliverables[0].get('id'), 'scope', 'invalid_value',
+                    'Small-task exemption requires one concrete non-wildcard scope; '
+                    'otherwise register a substantial distribution.'))
+        if small_problems:
+            _problems_error(small_problems)
     root = _project_root(root)
     with _lock(root):
         task = load_task(root, task_id)
@@ -1579,43 +2118,36 @@ def plan_task(root: Path, task_id: str, plan: dict) -> dict:
                 and task['policy'].get('delegation_level') == 'auto'):
             # A legacy/replayed plan may carry only the old canonical defaults, so
             # strict semantic completeness applies only to genuinely new work.
-            issues = _new_auto_feature_card_issues(task, deliverables)
-            if issues:
-                raise CoordinationError(
-                    'New substantial Auto plans require complete semantic feature cards: '
-                    + '; '.join(issues)
-                    + '. Declare the named fields in the features card; explicit unknown '
-                      'is allowed when a value is honestly unknown.', 64)
+            card_problems = _new_auto_feature_card_problems(task, deliverables)
+            if card_problems:
+                _problems_error(
+                    card_problems,
+                    header=('New substantial Auto plans require complete semantic feature '
+                            'cards. Declare the named fields in the features card; explicit '
+                            'unknown is allowed when a value is honestly unknown.'))
         _validate_correction_plan(root, task, deliverables)
+        revision_problems = _started_definition_revision_problems(task, deliverables)
+        if revision_problems:
+            _problems_error(revision_problems)
+        if classification == "substantial" and task['policy'].get('delegation_level') == 'auto':
+            # Reject an explicit executor bypass before any durable ledger record
+            # or routing decision exists for this revision. Started deliverables
+            # are immutable and keep their already-validated saved decision.
+            bypasses = _auto_executor_issues(deliverables, _started_deliverable_ids(task))
+            if bypasses:
+                _problems_error(
+                    [_problem(issue.split(':', 1)[0], 'executor', 'auto_bypass', issue)
+                     for issue in bypasses],
+                    header='Auto distribution cannot be bypassed.')
         with _routing_batch(root) as service:
-            if classification == "substantial" and task['policy'].get('delegation_level') == 'auto':
-                # Reject an explicit executor bypass before any durable ledger record
-                # or routing decision exists for this revision. Started deliverables
-                # are immutable and keep their already-validated saved decision.
-                bypasses = _auto_executor_issues(deliverables, _started_deliverable_ids(task))
-                if bypasses:
-                    raise CoordinationError(
-                        'Auto distribution cannot be bypassed: ' + '; '.join(bypasses) + '.', 64)
             try:
                 _prepare_routing(root, task, deliverables, service)
+            except CoordinationError:
+                raise
             except RoutingError as error:
                 raise CoordinationError(error.message, error.code) from None
             previous = {a["deliverable_id"]: a for a in task.get("assignments", [])}
-            incoming_ids = {item["id"] for item in deliverables}
             started = _started_deliverable_ids(task)
-            historical_missing = [
-                row["deliverable_id"] for row in task.get("assignments", [])
-                if row.get('deliverable_id') in started and row.get("deliverable_id") not in incoming_ids
-            ]
-            historical_missing.extend(item['id'] for item in task.get('deliverables', [])
-                                      if (item.get('routing_feedback') or item.get('result')
-                                          or item.get('native_dispatches'))
-                                      and item['id'] not in incoming_ids)
-            if historical_missing:
-                raise CoordinationError(
-                    "Plan revision cannot remove started/completed deliverables: " +
-                    ", ".join(historical_missing) +
-                    ". Add a new deliverable id for revised scope.", 64)
             assignments = []
             for item in deliverables:
                 prior = previous.get(item["id"])
@@ -1717,7 +2249,11 @@ def validate_task(root: Path, task_id: str) -> list[str]:
     level = policy['delegation_level']
     # A task's distribution profile is a snapshot across compaction. Current
     # access revocations still apply immediately and cannot force a writer.
-    current = settings.resolve(root)
+    try:
+        current = settings.resolve(root)
+    except settings.SettingsError as error:
+        raise CoordinationError(
+            settings.access_read_failure_message(error), 78) from None
     access = _effective_task_access(task, current)
     issues = list(native_issues)
     worker_count = 0
@@ -1734,7 +2270,8 @@ def validate_task(root: Path, task_id: str) -> list[str]:
             if auto_issue and not _valid_started_legacy_executor(root, task, item):
                 issues.append(auto_issue)
         if executor == 'worker' and kind in WORKER_WRITE_KINDS and access != 'full-access':
-            issues.append(f"{item['id']}: current access does not permit worker writes; revise the plan")
+            issues.append(
+                f"{item['id']}: " + settings.write_access_revoked_message(current))
         if (item.get('routing') or {}).get('requested_executor') == 'auto':
             try:
                 valid_auto = _valid_auto_decision(root, task, item)
@@ -1759,9 +2296,17 @@ def validate_task(root: Path, task_id: str) -> list[str]:
                 continue
             if (level == 75 and not _retention_ok(task, item)
                     and not _current_cancellation(task, item)):
-                issues.append(f"{item['id']}: worker-eligible {kind} retained by coordinator without a supported constraint")
+                issues.append(
+                    f"{item['id']}: worker-eligible {kind} retained by coordinator without "
+                    "a supported constraint. The router admission does not cancel the manual "
+                    "75 retention rule; delegate this work, record a supported retention "
+                    "constraint, or keep it within an accepted cancellation. Do not "
+                    "reclassify an ordinary implementation as a protected kind to bypass "
+                    "the rule.")
     if level == 75 and access == "full-access" and eligible_count and worker_count == 0:
-        issues.append("75/full-access requires worker assignment for separable worker-eligible deliverables")
+        issues.append(
+            "75/full-access requires worker assignment for separable worker-eligible "
+            "deliverables; router admission does not cancel the manual 75 retention rule")
     if level == 50 and access == "full-access" and eligible_write_count and worker_write_count == 0:
         issues.append("50/full-access requires at least one worker implementation/test/docs slice when worker-eligible implementation exists")
     return issues
@@ -1789,12 +2334,16 @@ def _effective_task_access(task, current):
 
 
 def _check_assignment_access(root, task, item):
-    current = settings.resolve(root)
+    try:
+        current = settings.resolve(root)
+    except settings.SettingsError as error:
+        raise CoordinationError(
+            settings.access_read_failure_message(error), 78) from None
     if not current.enabled:
         raise CoordinationError('Delegation is disabled; no new worker assignment may start.', 69)
     access = _effective_task_access(task, current)
     if item['kind'] in WORKER_WRITE_KINDS and access != 'full-access':
-        raise CoordinationError('Current access does not permit this worker writing assignment; revise the plan.', 78)
+        raise CoordinationError(settings.write_access_revoked_message(current), 78)
 
 
 def assignment_queue_state(root: Path, task_id: str, assignment_id: str, state: str) -> None:
@@ -1819,6 +2368,360 @@ def assignment_queue_state(root: Path, task_id: str, assignment_id: str, state: 
             row.setdefault('queued_at', now)
         task['updated_at'] = now
         _atomic(_task_path(root, task_id), task)
+
+
+def _launch_owner_state(owner):
+    """Prove a reservation owner dead without trusting a reusable PID alone."""
+    from . import workspace_lifecycle
+    if not workspace_lifecycle._valid_identity(owner):
+        return 'unknown'
+    try:
+        return workspace_lifecycle.identity_state(owner)
+    except (OSError, ValueError):
+        return 'unknown'
+
+
+def _valid_launch_reservation(reservation) -> bool:
+    from . import workspace_lifecycle
+    return (isinstance(reservation, dict)
+            and set(reservation) >= {'token', 'generation', 'owner', 'created_at'}
+            and isinstance(reservation.get('token'), str)
+            and 0 < len(reservation['token']) <= 128
+            and type(reservation.get('generation')) is int
+            and reservation['generation'] > 0
+            and workspace_lifecycle._valid_identity(reservation.get('owner'))
+            and type(reservation.get('created_at')) in (int, float)
+            and math.isfinite(reservation['created_at']))
+
+
+def _same_reservation(left, right) -> bool:
+    return (_valid_launch_reservation(left) and _valid_launch_reservation(right)
+            and left['token'] == right['token']
+            and left['generation'] == right['generation'])
+
+
+def _launch_refusal(message: str) -> CoordinationError:
+    return CoordinationError(message, 75)
+
+
+def _stop_waiting_guidance(assignment_id: str) -> str:
+    return (f'Assignment {assignment_id} has a live or uninspectable launch. Stop the waiting '
+            'worker process, wait for it to exit, then retry coordination cancel. Cancellation '
+            'does not terminate a process or mutate its active slot.')
+
+
+def register_launch_reservation(root: Path, task_id: str, assignment_id: str, *,
+                                resume: bool = False) -> dict:
+    """Publish one pre-queue reservation under the task lock.
+
+    The caller must not hold the queue allocator lock. The identity is captured
+    before the reservation becomes durable so PID reuse can be rejected later.
+    A live reservation from another process is a duplicate launch.
+    """
+    from . import workspace_lifecycle
+    owner = workspace_lifecycle.process_identity(os.getpid())
+    if owner is None:
+        raise CoordinationError('Cannot identify the launching process; no reservation was written.', 78)
+    root = _project_root(root)
+    with _lock(root):
+        task = load_task(root, task_id)
+        row = _assignment(task, assignment_id)
+        assignment_deliverable(task, assignment_id)
+        if task.get('status') in ('completed', 'closed'):
+            raise CoordinationError('Coordination task is already terminal; no launch is permitted.', 78)
+        if row.get('job_finalization_request') or row.get('job_finalization'):
+            raise CoordinationError('Logical job has a finalization intent; no launch is permitted.', 73)
+        if row.get('error_kind') == 'cancelled' and row.get('failure_stage') == 'before_start':
+            raise CoordinationError(
+                'Assignment was cancelled before start; no queue ticket, copy or provider launch is permitted.',
+                78)
+        if row.get('status') not in ('planned', 'failed', 'running'):
+            raise CoordinationError('Assignment is already terminal; no launch is permitted.', 78)
+        if row.get('status') != 'planned' and not resume:
+            raise CoordinationError('Only an explicit resume may launch a failed/running assignment.', 75)
+        previous = row.get('launch_reservation')
+        if previous is not None and not _valid_launch_reservation(previous):
+            raise _launch_refusal(
+                'The existing launch reservation is malformed or uninspectable. Stop the process '
+                'and inspect the ledger before another launch.')
+        generation = row.get('launch_generation', 0)
+        if type(generation) is not int or generation < 0:
+            raise _launch_refusal('Launch generation is malformed; stop the process and inspect the ledger.')
+        if previous is not None:
+            previous_state = _launch_owner_state(previous['owner'])
+            same_owner = previous['owner'] == owner
+            if previous_state == 'unknown':
+                raise _launch_refusal(_stop_waiting_guidance(assignment_id))
+            if previous_state == 'live' and not same_owner:
+                raise _launch_refusal(_stop_waiting_guidance(assignment_id))
+            if row.get('launch_phase') == LAUNCH_PHASE_ALLOCATION and row.get('status') == 'planned':
+                raise CoordinationError(
+                    'Launch crossed the allocation fence; C5 cancellation and a plain relaunch '
+                    'are no longer available. Use the existing recovery/finalize path.', 75)
+            if row.get('status') == 'running' and not resume:
+                raise _launch_refusal(_stop_waiting_guidance(assignment_id))
+            generation = max(generation, previous['generation'])
+        except_generation = generation + 1
+        now = time.time()
+        reservation = {'schema': 1, 'task_id': task_id, 'assignment_id': assignment_id,
+                       'token': uuid.uuid4().hex,
+                       'generation': except_generation, 'owner': owner,
+                       'created_at': now}
+        if row.get('status') != 'planned':
+            # An explicit resume of an already-started or previously failed job
+            # keeps its history byte-for-byte unless that resume actually starts
+            # a new execution attempt. The reservation is still durable while the
+            # launcher is active, and release restores this pre-launch snapshot.
+            reservation['resume_snapshot'] = {
+                'status': row.get('status'),
+                'attempt_id': row.get('attempt_id'),
+                'started_at': row.get('started_at'),
+                'generation_present': 'launch_generation' in row,
+                'generation': row.get('launch_generation'),
+            }
+        else:
+            row.pop('launch_phase', None)
+            row['launch_phase'] = None
+            row['queue_state'] = None
+            row['queue_updated_at'] = now
+            row.pop('queued_at', None)
+        row['launch_generation'] = except_generation
+        row['launch_reservation'] = reservation
+        task['updated_at'] = now
+        _atomic(_task_path(root, task_id), task)
+        return reservation
+
+
+def _validate_launch_reservation_locked(task, row, reservation):
+    if not _valid_launch_reservation(reservation):
+        raise CoordinationError('Launch reservation is malformed; no launch is permitted.', 78)
+    if row.get('error_kind') == 'cancelled' and row.get('failure_stage') == 'before_start':
+        raise CoordinationError(
+            'Assignment was cancelled before start; no queue ticket, copy or provider launch is permitted.',
+            78)
+    current = row.get('launch_reservation')
+    if not _same_reservation(current, reservation):
+        raise _launch_refusal('Launch reservation changed; stop any stale waiter and launch again.')
+    if (reservation.get('task_id') != task.get('id')
+            or reservation.get('assignment_id') != row.get('id')):
+        raise _launch_refusal('Launch reservation belongs to another assignment.')
+    if row.get('launch_generation') != reservation['generation']:
+        raise _launch_refusal('Launch generation changed; stop any stale waiter and launch again.')
+    if row.get('status') not in ('planned', 'failed', 'running'):
+        raise CoordinationError('Assignment is already terminal; no launch is permitted.', 78)
+    return row
+
+
+def validate_launch_reservation(root: Path, task_id: str, assignment_id: str,
+                                reservation) -> dict:
+    """Read-only reservation check used inside queue allocation callbacks."""
+    task = load_task(root, task_id)
+    row = _assignment(task, assignment_id)
+    return _validate_launch_reservation_locked(task, row, reservation)
+
+
+def revalidate_launch_reservation(root: Path, task_id: str, assignment_id: str,
+                                  reservation) -> dict:
+    """Serialize a queued launcher with cancellation after the queue lock is released."""
+    root = _project_root(root)
+    with _lock(root):
+        task = load_task(root, task_id)
+        row = _assignment(task, assignment_id)
+        return _validate_launch_reservation_locked(task, row, reservation)
+
+
+def begin_launch_allocation(root: Path, task_id: str, assignment_id: str,
+                            reservation) -> dict:
+    """Publish the durable fence before the first copy, import or binding.
+
+    C5 cancellation refuses from this point even when no workspace ID has been
+    published yet. Repeating the same reservation is idempotent for a managed
+    launch that must enter several allocation branches.
+    """
+    root = _project_root(root)
+    with _lock(root):
+        task = load_task(root, task_id)
+        row = _assignment(task, assignment_id)
+        _validate_launch_reservation_locked(task, row, reservation)
+        if row.get('launch_phase') == LAUNCH_PHASE_ALLOCATION:
+            return task
+        if row.get('launch_phase') is not None:
+            raise CoordinationError('Launch phase is not preallocation; no copy may be created.', 75)
+        if _cancel_touched_reason(row):
+            # Allocation already happened (for example, an explicit resume of a
+            # retained copy). C5 is already closed by that history; do not add
+            # launch bookkeeping to the protected earlier attempt.
+            return task
+        now = time.time()
+        row['launch_phase'] = LAUNCH_PHASE_ALLOCATION
+        row['launch_allocation_started_at'] = now
+        task['updated_at'] = now
+        _atomic(_task_path(root, task_id), task)
+        return task
+
+
+def release_launch_reservation(root: Path, task_id: str, assignment_id: str,
+                               reservation) -> dict | None:
+    """Clear only this process's unused reservation; allocation history is retained."""
+    if reservation is None:
+        return None
+    root = _project_root(root)
+    with _lock(root):
+        task = load_task(root, task_id)
+        row = _assignment(task, assignment_id)
+        current = row.get('launch_reservation')
+        if not _same_reservation(current, reservation):
+            return task
+        now = time.time()
+        snapshot = reservation.get('resume_snapshot')
+        if snapshot is not None:
+            unchanged = (row.get('status') == snapshot.get('status')
+                         and row.get('attempt_id') == snapshot.get('attempt_id')
+                         and row.get('started_at') == snapshot.get('started_at'))
+            if unchanged and row.get('launch_phase') != LAUNCH_PHASE_ALLOCATION:
+                row.pop('launch_reservation', None)
+                if snapshot.get('generation_present'):
+                    row['launch_generation'] = snapshot.get('generation')
+                else:
+                    row.pop('launch_generation', None)
+                task['updated_at'] = now
+                _atomic(_task_path(root, task_id), task)
+            # If the attempt advanced or crossed the allocation fence, another
+            # writer owns that history. A losing launcher must never rewrite it.
+            return task
+        if row.get('launch_phase') == LAUNCH_PHASE_ALLOCATION:
+            return task
+        if row.get('status') != 'planned':
+            return task
+        row.pop('launch_reservation', None)
+        row['queue_state'] = 'blocked'
+        row['queue_updated_at'] = now
+        task['updated_at'] = now
+        _atomic(_task_path(root, task_id), task)
+        return task
+
+
+def _cancel_touched_reason(row):
+    if row.get('status') == 'running' or row.get('started_at') or row.get('attempt_id'):
+        return 'assignment execution has started'
+    phase = row.get('launch_phase')
+    if phase == LAUNCH_PHASE_ALLOCATION:
+        return 'the durable allocation fence was published'
+    if phase is not None:
+        return 'the launch phase is not preallocation'
+    if row.get('workspace_id') or row.get('job_id'):
+        return 'a workspace/job is already bound'
+    if row.get('prepared_changes') or row.get('worker_changes') or row.get('checks'):
+        return 'prepared or worker changes already exist'
+    if row.get('execution_snapshot') or row.get('attempt_history'):
+        return 'execution history already exists'
+    if (row.get('finished_at') is not None or row.get('exit_code') is not None
+            or row.get('failure_stage') or row.get('error_kind')
+            or row.get('result_summary') or row.get('disposition')):
+        return 'result or disposition history already exists'
+    if row.get('job_finalization_request') or row.get('job_finalization'):
+        return 'job finalization already exists'
+    return None
+
+
+def _queue_artifact_relation(artifact, task_id, assignment_id):
+    binding = artifact.get('binding')
+    if binding is None:
+        return 'ambiguous'
+    if (binding['task_id'], binding['assignment_id']) == (task_id, assignment_id):
+        return 'related'
+    return 'foreign'
+
+
+def cancel_unstarted_assignment(root: Path, task_id: str, assignment_id: str,
+                                evidence: str) -> dict:
+    """C5 cancellation for one planned assignment that never started work."""
+    if not isinstance(evidence, str) or not evidence.strip():
+        raise CoordinationError('Cancellation requires nonempty evidence.', 64)
+    evidence = evidence.strip()
+    root = _project_root(root)
+
+    with _lock(root):
+        task = load_task(root, task_id)
+        row = _assignment(task, assignment_id)
+        assignment_deliverable(task, assignment_id)
+        if (row.get('status') == 'failed' and row.get('error_kind') == 'cancelled'
+                and row.get('failure_stage') == 'before_start'
+                and (row.get('disposition') or {}).get('kind') == 'rejected'):
+            return task
+        if row.get('status') != 'planned':
+            raise _launch_refusal(
+                f'Assignment {assignment_id} is {row.get("status")}; C5 only cancels an untouched '
+                'planned assignment. Stop any active launch and use the existing recovery/finalize path.')
+        touched = _cancel_touched_reason(row)
+        if touched:
+            raise _launch_refusal(
+                f'Assignment {assignment_id} cannot be C5-cancelled because {touched}. '
+                'Stop any active process and use the existing recovery/finalize path.')
+        initial_reservation = row.get('launch_reservation')
+        if initial_reservation is not None and not _valid_launch_reservation(initial_reservation):
+            raise _launch_refusal(
+                'The launch reservation is malformed or uninspectable. Stop the process and '
+                'inspect the ledger before cancellation.')
+
+    try:
+        from . import worker_slots
+        artifacts = worker_slots.inspect_bindings(_state_root())
+    except Exception as error:
+        raise _launch_refusal(
+            'Cannot inspect live queue tickets or worker slots safely; stop the waiting process '
+            'and retry. ' + str(getattr(error, 'message', error))) from None
+
+    if initial_reservation is not None:
+        owner_state = _launch_owner_state(initial_reservation['owner'])
+        if owner_state in ('live', 'unknown'):
+            detail = 'live' if owner_state == 'live' else 'uninspectable'
+            raise _launch_refusal(_stop_waiting_guidance(assignment_id) + f' Owner state is {detail}.')
+    for artifact in artifacts:
+        relation = _queue_artifact_relation(artifact, task_id, assignment_id)
+        if relation == 'ambiguous':
+            raise _launch_refusal(
+                f'An ambiguous live legacy {artifact["kind"]} has no launch binding; stop the '
+                'waiting process, wait for it to exit, then retry cancellation.')
+        if relation == 'related':
+            raise _launch_refusal(_stop_waiting_guidance(assignment_id))
+
+    with _lock(root):
+        task = load_task(root, task_id)
+        row = _assignment(task, assignment_id)
+        if (row.get('status') == 'failed' and row.get('error_kind') == 'cancelled'
+                and row.get('failure_stage') == 'before_start'
+                and (row.get('disposition') or {}).get('kind') == 'rejected'):
+            return task
+        if row.get('status') != 'planned' or _cancel_touched_reason(row):
+            raise _launch_refusal(
+                'Launch state changed during cancellation; exactly one operation may win. '
+                'Stop the process and inspect the assignment before retrying.')
+        current_reservation = row.get('launch_reservation')
+        if current_reservation is not None and not _same_reservation(
+                current_reservation, initial_reservation):
+            raise _launch_refusal(
+                'A new launch reservation won before cancellation; stop that process first.')
+        now = time.time()
+        tombstone = {
+            'schema': 1, 'state': 'cancelled-before-start', 'at': now,
+            'evidence': evidence[:2000],
+        }
+        if _valid_launch_reservation(initial_reservation):
+            tombstone['reservation'] = dict(initial_reservation)
+            tombstone['owner_state'] = _launch_owner_state(initial_reservation['owner'])
+        row.update(
+            status='failed', error_kind='cancelled', failure_stage='before_start',
+            queue_state='finished', queue_updated_at=now, finished_at=now,
+            result_summary=evidence[:4000],
+            disposition={'kind': 'rejected', 'evidence': evidence[:2000], 'at': now},
+            prepared_changes=[], worker_changes=[], checks=[],
+            launch_phase=LAUNCH_PHASE_CANCELLED, launch_cancelled=tombstone,
+        )
+        row.pop('launch_reservation', None)
+        task['updated_at'] = now
+        _atomic(_task_path(root, task_id), task)
+        return task
 
 
 def _lessons_guard(action, *, code: int = 64):
@@ -1993,7 +2896,7 @@ def _deliverable_snapshot(item) -> dict:
 
 def _execution_snapshot(root: Path, task: dict, item: dict, workspace_id: str, runtime: str,
                         prepared_changes, effort: str | None, execution, *,
-                        started_at: float) -> dict:
+                        started_at: float, check_timeout_seconds: float | None = None) -> dict:
     """Capture the immutable pre-execution context of one attempt.
 
     Records the original deliverable, actual runtime/effort, source/workspace and
@@ -2017,6 +2920,8 @@ def _execution_snapshot(root: Path, task: dict, item: dict, workspace_id: str, r
         "prompt_brief": inputs.get("prompt_brief"),
         "started_at": started_at,
     }
+    if check_timeout_seconds is not None:
+        execution_block["check_timeout_seconds"] = check_timeout_seconds
     return {
         "deliverable": _deliverable_snapshot(item),
         "features": _bounded_snapshot_value(matching, text=200, items=50),
@@ -2027,17 +2932,94 @@ def _execution_snapshot(root: Path, task: dict, item: dict, workspace_id: str, r
     }
 
 
+def _validate_retained_results(root: Path, task_id: str, *,
+                               allow_repairable_missing: bool = False) -> None:
+    """Fail closed when any durable assignment result uses an unknown schema.
+
+    Status and completion are read-only views, but they must not report a
+    clean task when a schema 2/historical result is malformed, a discarded
+    manifest claims a current patch, or a future schema is present. Missing
+    workspace records and copies without a result stay outside this check.
+    """
+    from . import workspace as workspace_module
+    from . import workspace_gc, workspace_lifecycle
+
+    root = _project_root(root)
+    task = load_task(root, task_id)
+    seen = set()
+    for row in task.get('assignments', []):
+        identifier = row.get('workspace_id')
+        if (not isinstance(identifier, str)
+                or re.fullmatch('[0-9a-f]{32}', identifier) is None
+                or identifier in seen):
+            continue
+        seen.add(identifier)
+        try:
+            copy = workspace_gc._load_record(_state_root(), identifier)
+            if copy.source.resolve() != root:
+                continue
+            with workspace_lifecycle.directory(copy) as fd:
+                lease = workspace_lifecycle.read(copy)
+                result = workspace_gc.read_result(copy, fd=fd, lease=lease)
+                if (result is None and isinstance(lease, dict)
+                        and isinstance(lease.get('finalization'), dict)
+                        and 'result_schema' in lease['finalization']):
+                    repairable = (allow_repairable_missing
+                                  and (lease.get('cleanup') or {}).get('state')
+                                  != 'cleaned')
+                    if not repairable:
+                        raise CoordinationError(
+                            'Terminal result manifest is missing; history preserved.', 73)
+        except workspace_module.WorkspaceError as error:
+            raise CoordinationError(str(error), error.code) from None
+        except OSError:
+            raise CoordinationError(
+                'Cannot inspect a retained assignment result; history preserved.', 73) from None
+
+
 def _changes_patch_reference(workspace_id):
-    """Return a private reference to a retained change patch, or None when unknown."""
+    """Return a private reference to the current result patch, or None.
+
+    A schema 2 discard keeps historical ``changes.patch`` bytes but never
+    presents them as the current result. Unknown result schemas fail closed
+    instead of inferring a patch from a filename.
+    """
     if not isinstance(workspace_id, str) or re.fullmatch(r"[0-9a-f]{32}", workspace_id) is None:
         return None
     from . import workspace as workspace_module
+    from . import workspace_gc, workspace_lifecycle
     try:
-        copy = workspace_module.load(_state_root(), workspace_id)
+        copy = workspace_gc._load_record(_state_root(), workspace_id)
+        lease = workspace_lifecycle.read(copy)
+        with workspace_lifecycle.directory(copy) as fd:
+            execution_present = workspace_lifecycle._exists(fd, 'work')
+            result = workspace_gc.read_result(copy, fd=fd, lease=lease)
     except (workspace_module.WorkspaceError, OSError):
         return None
+    if result is not None:
+        if result.get('schema') != 1:
+            return None
+        patch = result.get('patch')
+        if (not isinstance(patch, dict) or patch.get('file') != 'changes.patch'
+                or type(patch.get('bytes')) is not int
+                or not isinstance(patch.get('sha256'), str)):
+            return None
+        return {"file": "changes.patch", "workspace_id": workspace_id,
+                "sha256": patch['sha256'], "bytes": patch['bytes']}
+    if not execution_present:
+        # A cleaned workspace without a schema 1 result has no current patch;
+        # arbitrary retained bytes named changes.patch are not evidence.
+        return None
+    if isinstance(lease, dict):
+        finalization = lease.get('finalization')
+        if (lease.get('phase') in workspace_lifecycle.FINAL_PHASES
+                or (isinstance(finalization, dict)
+                    and (finalization.get('discard_result') is True
+                         or 'result_schema' in finalization
+                         or finalization.get('discarded') is not None))):
+            return None
     try:
-        descriptor = os.open(copy.path.parent / "changes.patch",
+        descriptor = os.open(copy.directory / "changes.patch",
                              os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except OSError:
         return None
@@ -2199,10 +3181,24 @@ def assignment_preparing(root: Path, task_id: str, assignment_id: str, copy) -> 
         return task
 
 
+def _preserve_assignment_attempt(row: dict) -> None:
+    row.setdefault('attempt_history', []).append({key: row.get(key) for key in (
+        'status', 'workspace_id', 'runtime', 'effort', 'started_at',
+        'finished_at', 'checks', 'disposition', 'error_kind', 'exit_code',
+        'failure_stage', 'preparation_cause', 'routing_features',
+        'routing_decision_id', 'execution_snapshot', 'worker_changes',
+        'result_summary', 'baseline_checks', 'verification_cause',
+        'prepared_input_changes', 'verification_runs', 'readiness_checks',
+        'job_id', 'attempt_id', 'check_timeout_seconds')})
+
+
 def assignment_started(root: Path, task_id: str, assignment_id: str,
                        workspace_id: str, runtime: str,
                        prepared_changes: list[str], effort: str | None = None,
-                       execution: dict | None = None, *, resume_running: bool = False) -> dict:
+                       execution: dict | None = None,
+                       check_timeout_seconds: float | None = None, *,
+                       resume_running: bool = False,
+                       attempt_id: str | None = None) -> dict:
     """Start one attempt and snapshot its original context before execution.
 
     ``execution`` is optional, bounded pre-execution evidence supplied by the
@@ -2211,8 +3207,17 @@ def assignment_started(root: Path, task_id: str, assignment_id: str,
     keys are rejected so raw prompts, credentials or model output can never be
     stored here. A resume of the same running attempt keeps its original
     snapshot; a failed explicit continuation keeps the earlier snapshot in
-    ``attempt_history``.
+    ``attempt_history``. When the managed runner has already started the
+    workspace execution attempt for its baseline, ``attempt_id`` adopts that
+    exact current attempt instead of reserving a second one.
     """
+    if check_timeout_seconds is not None:
+        from . import check_evidence
+        try:
+            check_timeout_seconds = check_evidence.validate_check_timeout(
+                check_timeout_seconds)
+        except check_evidence.CheckEvidenceError as error:
+            raise CoordinationError(error.message, error.code) from None
     if effort is not None:
         canonical_effort = normalize_effort(effort)
         if canonical_effort is None:
@@ -2221,6 +3226,11 @@ def assignment_started(root: Path, task_id: str, assignment_id: str,
     identity = None
     has_workspace = (isinstance(workspace_id, str)
                      and re.fullmatch('[0-9a-f]{32}', workspace_id))
+    if attempt_id is not None:
+        if (not has_workspace or not isinstance(attempt_id, str)
+                or not re.fullmatch('[0-9a-f]{32}', attempt_id)):
+            raise CoordinationError(
+                'An existing execution attempt requires its exact workspace and attempt identity.', 64)
     from . import workspace, workspace_lifecycle
     # Match the owner -> lifecycle fence -> ledger order used by finalization.
     # No lease is reserved until access and routing have passed under this gate.
@@ -2314,6 +3324,32 @@ def assignment_started(root: Path, task_id: str, assignment_id: str,
                             access=_effective_task_access(task, settings.resolve(root)))
                     except RoutingError as error:
                         raise CoordinationError(error.message, error.code) from None
+                if (attempt_id is not None and resume_running
+                        and row.get('attempt_id') == attempt_id):
+                    raise CoordinationError(
+                        'Explicit process resume requires a new execution attempt.', 64)
+                if attempt_id is not None:
+                    if copy is None:
+                        raise CoordinationError(
+                            'The running execution attempt is unavailable for adoption.', 73)
+                    try:
+                        workspace_lifecycle.prepare_attempt(
+                            copy, task_id, assignment_id, reuse_attempt_id=attempt_id)
+                        adopted = workspace_lifecycle.read(copy)['attempts'][-1]
+                        if adopted.get('check_timeout_seconds') != check_timeout_seconds:
+                            raise CoordinationError(
+                                'Adopted execution attempt timeout conflicts with the assignment.', 73)
+                        if correction is not None:
+                            _correction_workspace(
+                                root, task, _plan_metadata(correction, 'correction_of'),
+                                explicit_workspace=workspace_id,
+                                bound_assignment=assignment_id)
+                    except workspace.WorkspaceError as cause:
+                        raise CoordinationError(str(cause), cause.code) from None
+                    if row.get('attempt_id') != attempt_id and not resume_running:
+                        raise CoordinationError(
+                            'A running assignment cannot adopt a different execution attempt '
+                            'without explicit resume.', 64)
                 if not resume_running:
                     return task
             if row['status'] not in ('planned', 'failed') and not resume_running:
@@ -2352,15 +3388,7 @@ def assignment_started(root: Path, task_id: str, assignment_id: str,
                 row['routing_decision_id'] = decision['id']
 
         if row['status'] == 'failed' or (row['status'] == 'running' and resume_running):
-            history = row.setdefault('attempt_history', [])
-            history.append({key: row.get(key) for key in (
-                'status', 'workspace_id', 'runtime', 'effort', 'started_at',
-                'finished_at', 'checks', 'disposition', 'error_kind', 'exit_code',
-                'failure_stage', 'preparation_cause', 'routing_features',
-                'routing_decision_id', 'execution_snapshot', 'worker_changes',
-                'result_summary', 'baseline_checks', 'verification_cause',
-                'prepared_input_changes', 'verification_runs', 'readiness_checks',
-                'job_id', 'attempt_id')})
+            _preserve_assignment_attempt(row)
 
         if copy is not None:
             # Recheck immediately before reservation; a concurrent access change
@@ -2369,7 +3397,13 @@ def assignment_started(root: Path, task_id: str, assignment_id: str,
             try:
                 identity = workspace_lifecycle.prepare_attempt(
                     copy, task_id, assignment_id,
-                    replace_pending=bool(resume_running))
+                    replace_pending=bool(resume_running and attempt_id is None),
+                    reuse_attempt_id=attempt_id)
+                if attempt_id is not None:
+                    adopted = workspace_lifecycle.read(copy)['attempts'][-1]
+                    if adopted.get('check_timeout_seconds') != check_timeout_seconds:
+                        raise CoordinationError(
+                            'Adopted execution attempt timeout conflicts with the assignment.', 73)
                 if correction is not None:
                     # The predecessor and its pending/current attempt must still be
                     # the authoritative same-job binding after reservation.
@@ -2382,7 +3416,8 @@ def assignment_started(root: Path, task_id: str, assignment_id: str,
 
         now = time.time()
         snapshot = _execution_snapshot(root, task, item, workspace_id, runtime,
-                                       prepared_changes, effort, execution, started_at=now)
+                                       prepared_changes, effort, execution, started_at=now,
+                                       check_timeout_seconds=check_timeout_seconds)
         row.update(status='running', workspace_id=workspace_id, runtime=runtime,
                    effort=effort, prepared_changes=sorted(set(prepared_changes)),
                    started_at=now, disposition=None, error_kind=None, exit_code=None,
@@ -2391,6 +3426,8 @@ def assignment_started(root: Path, task_id: str, assignment_id: str,
                    prepared_input_changes=[], verification_runs=[], readiness_checks=[])
         if correction is not None:
             row['correction_of'] = dict(correction)
+        if check_timeout_seconds is not None:
+            row['check_timeout_seconds'] = check_timeout_seconds
         if identity:
             row.update(job_id=identity[0], attempt_id=identity[1])
             snapshot['execution'].update(job_id=identity[0], attempt_id=identity[1])
@@ -2478,7 +3515,8 @@ def _validate_check_evidence(rows) -> None:
     allowed = {'command', 'exit_code', 'phase', 'stdout_path', 'stderr_path',
                'stdout_truncated', 'stderr_truncated', 'diagnostic_directory',
                'duration_seconds', 'error_kind', 'launch_error', 'timed_out',
-               'launch_failed', 'stdout_sha256', 'stderr_sha256', 'reused', 'reused_from'}
+               'launch_failed', 'stdout_sha256', 'stderr_sha256', 'reused', 'reused_from',
+               'check_timeout_seconds', 'effective_timeout_seconds'}
     if not isinstance(rows, list) or len(rows) > 1000:
         raise CoordinationError('Verification evidence must be a bounded check list.', 64)
     for row in rows:
@@ -2510,6 +3548,21 @@ def _validate_check_evidence(rows) -> None:
         if 'duration_seconds' in row and (type(row['duration_seconds']) not in (int, float) or
                 not math.isfinite(row['duration_seconds']) or row['duration_seconds'] < 0):
             raise CoordinationError('Invalid verification duration.', 64)
+        if 'check_timeout_seconds' in row and (
+                isinstance(row['check_timeout_seconds'], bool)
+                or not isinstance(row['check_timeout_seconds'], (int, float))
+                or not 0 < row['check_timeout_seconds'] <= 86400):
+            raise CoordinationError('Invalid verification check timeout.', 64)
+        if 'effective_timeout_seconds' in row:
+            if 'check_timeout_seconds' not in row:
+                raise CoordinationError('Invalid effective verification check timeout.', 64)
+            from . import check_evidence
+            try:
+                check_evidence.validate_effective_timeout(
+                    row['effective_timeout_seconds'], row['check_timeout_seconds'])
+            except check_evidence.CheckEvidenceError:
+                raise CoordinationError(
+                    'Invalid effective verification check timeout.', 64) from None
         for field in ('phase', 'error_kind', 'launch_error'):
             if field in row and (not isinstance(row[field], str) or len(row[field]) > 512 or
                     any(char in row[field] for char in '\0\r\n')):
@@ -2587,7 +3640,10 @@ def assignment_preparation_failed(root: Path, task_id: str, assignment_id: str,
                                   cause: str = 'environment',
                                   baseline_checks: list[dict] | None = None,
                                   verification_cause: str | None = None,
-                                  readiness_checks: list[dict] | None = None) -> dict:
+                                  readiness_checks: list[dict] | None = None,
+                                  attempt_id: str | None = None,
+                                  check_timeout_seconds: float | None = None,
+                                  resume_after_failure: bool = False) -> dict:
     """Close a still-planned assignment that failed before any model execution.
 
     The managed runner calls this when preparation of an owned copy (sandbox,
@@ -2596,18 +3652,24 @@ def assignment_preparation_failed(root: Path, task_id: str, assignment_id: str,
     quality outcome or routing observation: the attempt stays dispositionable
     through :func:`use_result` and the task can then be completed or replanned.
 
-    The transition is atomic and only applies to a planned assignment. Any
-    running, already-failed or succeeded assignment is protected: the call is a
-    safe no-op so managed exception reconciliation can never rewrite a live or
-    previously recorded result, workspace, queue state, disposition or history.
+    The default transition applies only to a planned assignment. An explicit
+    continuation from a failed row additionally requires the exact new failed
+    lease attempt and its reviewed predecessor, preserved in attempt history.
+    A planned row records its first preparation failure through the default
+    transition, including when the caller explicitly enabled recovery.
     A runner ``environment_incompatible`` constraint is recorded on the
     deliverable in the same atomic update, except for cancellation (130); an
     already-recorded specific technical constraint is never duplicated. Admission
     refusals are infrastructure outcomes too, but grant no technical-retention
     exception: revoking permissions or timing out cannot justify bypassing policy.
+    When a baseline already owned a workspace execution attempt, its exact
+    identity and timeout are mirrored here without claiming that the assignment
+    itself started or that the model ran.
     """
     if isinstance(exit_code, bool) or not isinstance(exit_code, int):
         raise CoordinationError('Preparation failure requires an integer exit code.', 64)
+    if type(resume_after_failure) is not bool:
+        raise CoordinationError('Preparation resume flag must be boolean.', 64)
     if cause not in ('environment', 'admission'):
         raise CoordinationError('Unknown preparation failure cause.', 64)
     _validate_verification_cause(verification_cause)
@@ -2615,6 +3677,22 @@ def assignment_preparation_failed(root: Path, task_id: str, assignment_id: str,
         _validate_check_evidence(baseline_checks)
     if readiness_checks is not None:
         _validate_check_evidence(readiness_checks)
+    if (attempt_id is None) != (check_timeout_seconds is None):
+        raise CoordinationError(
+            'Preparation attempt identity and timeout must be recorded together.', 64)
+    if attempt_id is not None:
+        if (not isinstance(attempt_id, str)
+                or not re.fullmatch('[0-9a-f]{32}', attempt_id)
+                or not isinstance(workspace_id, str)
+                or not re.fullmatch('[0-9a-f]{32}', workspace_id)):
+            raise CoordinationError(
+                'Preparation attempt identity requires its exact workspace.', 64)
+        from . import check_evidence
+        try:
+            check_timeout_seconds = check_evidence.validate_check_timeout(
+                check_timeout_seconds)
+        except check_evidence.CheckEvidenceError as error:
+            raise CoordinationError(error.message, error.code) from None
     canonical_effort = None
     if effort is not None:
         canonical_effort = normalize_effort(effort)
@@ -2639,18 +3717,72 @@ def assignment_preparation_failed(root: Path, task_id: str, assignment_id: str,
                                         'assignment_id': copy.metadata.get('coord_assignment')}
                     if (lease.get('binding') == expected
                             or (lease.get('binding') is None and metadata_binding == expected)):
-                        identity = lease['job_id'], None
+                        if attempt_id is not None:
+                            attempts = lease.get('attempts', [])
+                            latest = attempts[-1] if attempts else None
+                            if (lease.get('binding') != expected
+                                    or lease.get('pending_attempt')
+                                    or not isinstance(latest, dict)
+                                    or latest.get('id') != attempt_id
+                                    or latest.get('operation') != 'execution'
+                                    or latest.get('generation') != lease['generation']
+                                    or latest.get('check_timeout_seconds')
+                                       != check_timeout_seconds
+                                    or copy.metadata.get('attempt_id') != attempt_id
+                                    or copy.metadata.get('job_id') != lease['job_id']
+                                    or copy.metadata.get('work_inode') != lease['work_inode']):
+                                raise CoordinationError(
+                                    'Preparation attempt does not match the retained workspace.',
+                                    73)
+                            identity = lease['job_id'], attempt_id
+                        else:
+                            identity = lease['job_id'], None
                     else:
                         # A refused association must not attach an unrelated
                         # standalone/predecessor copy merely from the CLI ID.
+                        if attempt_id is not None:
+                            raise CoordinationError(
+                                'Preparation attempt belongs to another assignment.', 73)
                         workspace_id = None
             except workspace.WorkspaceError as error:
                 raise CoordinationError(str(error), error.code) from None
-    with _lock(root):
+    if resume_after_failure and (attempt_id is None or identity is None):
+        raise CoordinationError('Resumed baseline failure requires its exact execution attempt.', 73)
+    fence = (workspace_lifecycle.fence(_state_root()) if resume_after_failure
+             else nullcontext())
+    with fence, _lock(root):
         task = load_task(root, task_id)
         row = _assignment(task, assignment_id)
         if row.get('status') != 'planned':
-            return task
+            if not resume_after_failure:
+                return task
+            lease = workspace_lifecycle.read(copy)
+            attempts = lease.get('attempts', [])
+            latest = attempts[-1] if attempts else {}
+            if (lease.get('binding') != {'task_id': task_id, 'assignment_id': assignment_id}
+                    or lease.get('phase') != 'review'
+                    or lease.get('pending_attempt')
+                    or latest.get('id') != attempt_id
+                    or latest.get('status') != 'failed'
+                    or latest.get('check_timeout_seconds') != check_timeout_seconds
+                    or row.get('workspace_id') != workspace_id
+                    or row.get('job_id') != lease['job_id']
+                    or row.get('job_finalization') or row.get('job_finalization_request')):
+                raise CoordinationError('Resumed baseline failure no longer owns the current job.', 75)
+            if (row.get('attempt_id') == attempt_id
+                    and row.get('status') == 'failed'
+                    and row.get('failure_stage') == 'preparation'):
+                return task
+            if (row.get('status') != 'failed' or not row.get('disposition')
+                    or len(attempts) < 2
+                    or attempts[-2].get('id') != row.get('attempt_id')):
+                raise CoordinationError('Resumed baseline failure has no reviewed predecessor.', 75)
+            _preserve_assignment_attempt(row)
+            for field in ('disposition', 'started_at', 'execution_snapshot',
+                          'routing_features', 'routing_decision_id', 'prepared_changes',
+                          'prepared_input_changes', 'verification_runs', 'baseline_checks',
+                          'verification_cause', 'readiness_checks'):
+                row.pop(field, None)
         item = assignment_deliverable(task, assignment_id)
         now = time.time()
         row.update(status='failed', queue_state='finished',
@@ -2670,6 +3802,8 @@ def assignment_preparation_failed(root: Path, task_id: str, assignment_id: str,
             row['job_id'] = identity[0]
             if identity[1]:
                 row['attempt_id'] = identity[1]
+        if check_timeout_seconds is not None:
+            row['check_timeout_seconds'] = check_timeout_seconds
         if runtime is not None:
             row['runtime'] = runtime
         if canonical_effort is not None:
@@ -2709,6 +3843,11 @@ def use_result(root: Path, task_id: str, assignment_id: str,
                     with workspace_lifecycle.fence(_state_root()):
                         owned.enter_context(workspace_gc._owner(copy))
                         lease = workspace_lifecycle.read(copy)
+                        retained = workspace_gc.read_result(copy, lease=lease)
+                        if (retained is not None and retained.get('schema') == 2
+                                and disposition in ('incorporated', 'reproduced')):
+                            raise CoordinationError(
+                                'A discarded result cannot be integrated or accepted.', 73)
                         assessment_only = bool(lease and lease['phase'] in workspace_lifecycle.FINAL_PHASES
                             and quality is not None and rework is None
                             and disposition == (row.get('disposition') or {}).get('kind'))
@@ -2823,24 +3962,49 @@ def _use_result(root: Path, task_id: str, assignment_id: str,
 
 
 def finalize_assignment(root: Path, task_id: str, assignment_id: str,
-                        evidence: str, *, cancelled=False) -> dict:
+                        evidence: str, *, cancelled=False,
+                        discard_result=False) -> dict:
     """Explicit final review of one job; parent feature completion is unrelated.
 
-    Feedback remains append-only/repeatable. Finalization separately attests that
-    integration is done and no further correction is expected for this job.
+    ``discard_result`` is cancellation-only, requires explicit non-default
+    evidence and is delegated to the workspace's closed typed-capture protocol.
+    A discarded logical job is rejected as a whole: linked corrections share the
+    same terminal publication, previous attempts/quality remain append-only and
+    no current patch is exposed.
     """
     if not isinstance(evidence, str) or not evidence.strip():
         raise CoordinationError('Final job acceptance requires evidence.', 64)
+    if type(discard_result) is not bool:
+        raise CoordinationError('discard_result must be a boolean.', 64)
+    if discard_result and not cancelled:
+        raise CoordinationError('--discard-result is valid only with --cancel.', 64)
+    if (discard_result
+            and evidence.strip().lower() in ('cancelled', 'accepted')):
+        raise CoordinationError(
+            'Explicit discard requires non-default review evidence.', 64)
     from . import workspace, workspace_gc, workspace_lifecycle
     root = _project_root(root)
     task = load_task(root, task_id)
+    _validate_retained_results(root, task_id, allow_repairable_missing=True)
     row = _assignment(task, assignment_id)
+    saved_request = row.get('job_finalization_request')
+    if isinstance(saved_request, dict) and saved_request.get('discard_result') is True:
+        discard_result = True
     if row.get('job_finalization'):
+        if discard_result and row['job_finalization'].get('discarded') is not True:
+            raise CoordinationError(
+                'A captured finalization cannot be replaced by an explicit discard.', 73)
         _publish_job_finalization(
             root, task_id, assignment_id, row['job_finalization'])
         return load_task(root, task_id)
     disposition = (row.get('disposition') or {}).get('kind')
-    if row.get('status') not in ('succeeded', 'failed') or disposition is None:
+    if row.get('status') not in ('succeeded', 'failed'):
+        raise CoordinationError('Review and disposition the finished result before finalizing.', 64)
+    if discard_result:
+        if disposition in ('incorporated', 'reproduced'):
+            raise CoordinationError(
+                'A discarded result cannot remain accepted or integrated.', 73)
+    elif disposition is None:
         raise CoordinationError('Review and disposition the finished result before finalizing.', 64)
     if disposition == 'needs-rework' and not cancelled:
         raise CoordinationError('This job still needs corrections; keep its existing workspace.', 64)
@@ -2852,40 +4016,72 @@ def finalize_assignment(root: Path, task_id: str, assignment_id: str,
         copy = workspace_gc._load_record(_state_root(), identifier)
         if copy.source.resolve() != _project_root(root):
             raise CoordinationError('Assignment workspace belongs to another project.', 78)
+
         def attest():
             with _lock(root):
                 current = load_task(root, task_id)
                 actual = _assignment(current, assignment_id)
                 decision = (actual.get('disposition') or {}).get('kind')
-                if (actual.get('workspace_id') != identifier
+                if discard_result:
+                    if (actual.get('workspace_id') != identifier
+                            or actual.get('status') not in ('succeeded', 'failed')
+                            or decision not in (None, 'rejected', 'needs-rework')
+                            or actual.get('job_finalization')):
+                        raise CoordinationError(
+                            'Final review changed before discard; execution copy preserved.', 75)
+                elif (actual.get('workspace_id') != identifier
                         or actual.get('status') not in ('succeeded', 'failed')
-                        or decision != disposition
-                        or decision is None or (decision == 'needs-rework' and not cancelled)):
-                    raise CoordinationError('Final review changed before acceptance; execution copy preserved.', 75)
-                lease, _chain, repaired = _finalization_authority(
+                        or decision != disposition or decision is None
+                        or (decision == 'needs-rework' and not cancelled)):
+                    raise CoordinationError(
+                        'Final review changed before acceptance; execution copy preserved.', 75)
+                lease, chain, repaired = _finalization_authority(
                     root, task_id, assignment_id, copy,
-                    cancelled=cancelled, recover_binding=True)
+                    cancelled=cancelled, recover_binding=True,
+                    discarding=discard_result)
                 if lease['binding'] != {'task_id': task_id, 'assignment_id': assignment_id}:
                     raise CoordinationError('Finalize the latest correction assignment of this logical job.', 64)
+                changed = False
+                existing = actual.get('job_finalization_request')
+                if existing is None:
+                    actual['job_finalization_request'] = {
+                        'at': time.time(), 'evidence': evidence[:2000],
+                        'cancelled': cancelled, 'discard_result': bool(discard_result),
+                        'project': str(root), 'task_id': task_id,
+                        'assignment_id': assignment_id,
+                        'workspace_id': identifier, 'job_id': lease['job_id']}
+                    changed = True
+                else:
+                    _finalization_request(
+                        existing, root, task_id, assignment_id, copy, lease, cancelled)
+                    if discard_result and existing.get('discard_result') is not True:
+                        actual['job_finalization_request'] = dict(
+                            existing, evidence=evidence[:2000], at=time.time(),
+                            discard_result=True)
+                        changed = True
                 if repaired:
                     workspace_lifecycle.write(copy, lease)
-                if actual.get('job_finalization_request') is None and not actual.get('job_finalization'):
-                    actual['job_finalization_request'] = {
-                        'at': time.time(), 'evidence': evidence[:2000], 'cancelled': cancelled,
-                        'project': str(root), 'task_id': task_id, 'assignment_id': assignment_id,
-                        'workspace_id': identifier, 'job_id': lease['job_id']}
+                if changed:
                     current['updated_at'] = time.time()
                     _atomic(_task_path(root, task_id), current)
-        report = workspace_gc.finalize(copy, reason=evidence[:1000],
-            cancelled=cancelled, before_finalize=attest)
+                if discard_result:
+                    _reject_discarded_chain(
+                        root, chain, evidence, request=actual['job_finalization_request'])
+
+        report = workspace_gc.finalize(
+            copy, reason=evidence[:1000], cancelled=cancelled,
+            before_finalize=attest, discard_result=discard_result)
     except (workspace.WorkspaceError, state_storage.StorageError) as cause:
         raise CoordinationError(str(cause), cause.code) from None
     lease = workspace_lifecycle.read(copy)
     request = _assignment(load_task(root, task_id), assignment_id).get('job_finalization_request')
-    publication = dict(report, at=request['at'] if request else time.time(),
+    publication = dict(
+        report, at=request['at'] if request else time.time(),
         evidence=request['evidence'] if request else evidence[:2000],
         job_id=lease['job_id'], cancelled=lease['phase'] == 'cancelled')
     _publish_job_finalization(root, task_id, assignment_id, publication)
+    if discard_result:
+        sync_routing_feedback(root, task_id)
     return load_task(root, task_id)
 
 

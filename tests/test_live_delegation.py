@@ -21,7 +21,7 @@ import threading
 import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from codex_deepseek_team import activation, coordination, development, managed, relay, sandbox, settings, worker, workspace
 from codex_deepseek_team.routing import RoutingService
@@ -225,7 +225,7 @@ class LiveDemoTests(LiveBase):
                     with self.assertRaises(worker.WorkerError):
                         managed.run(self.args('bounded work'), policy, worker, copy)
 
-    def _assert_post_start_preparation_failure_is_reconciled(self, failure_point):
+    def _assert_pre_provider_failure_is_reconciled(self, failure_point):
         settings.set_values(
             self.source / '.deepseek-team.toml',
             delegation_level='auto', access='full-access')
@@ -259,16 +259,22 @@ class LiveDemoTests(LiveBase):
         args = self.args(self.task('fix', sibling), coord_task=task['id'], coord_assignment=aid)
         real_save = copy.save
         def inject_save():
-            # Preparation saves must succeed; only the post-start execution record
-            # save fails, so the assignment reaches 'running' before the fault.
+            # Baseline execution metadata is durable before assignment start.
             if failure_point == 'save' and copy.metadata.get('operation') == 'execution':
                 raise OSError('simulated workspace save failure')
             return real_save()
-        patched = (patch.object(copy, 'begin', side_effect=workspace.WorkspaceError(
-                       'simulated post-start preparation failure'))
-                   if failure_point == 'begin'
-                   else patch.object(copy, 'save', side_effect=inject_save))
-        with patched:
+        unavailable_relay = MagicMock()
+        unavailable_relay.__enter__.side_effect = OSError('simulated relay entry failure')
+        faults = {
+            'begin': patch.object(copy, 'begin', side_effect=workspace.WorkspaceError(
+                'simulated baseline preparation failure')),
+            'save': patch.object(copy, 'save', side_effect=inject_save),
+            'relay-constructor': patch.object(relay, 'ProviderRelay', side_effect=OSError(
+                'simulated relay construction failure')),
+            'relay-entry': patch.object(relay, 'ProviderRelay', return_value=unavailable_relay),
+        }
+        with faults[failure_point], patch.object(
+                worker, 'execute', side_effect=AssertionError('model started before injected failure')):
             with self.assertRaises((worker.WorkerError, OSError)):
                 managed.run(args, policy, worker, copy)
 
@@ -276,21 +282,35 @@ class LiveDemoTests(LiveBase):
         self.assertEqual(assignment['status'], 'failed')
         self.assertEqual(assignment['error_kind'], 'environment')
         self.assertEqual(assignment['workspace_id'], copy.id)
-        self.assertEqual(assignment['routing_decision_id'], decision_id)
-        self.assertTrue(assignment['routing_feedback'][0]['recorded'])
         observations = service.observations()
-        self.assertEqual(len(observations), 1)
-        self.assertEqual(observations[0]['outcome'], 'infrastructure')
-        self.assertNotIn(observations[0]['outcome'], ('rework', 'rejected'))
+        if failure_point in ('begin', 'save'):
+            self.assertEqual(assignment['failure_stage'], 'preparation')
+            self.assertIsNone(assignment.get('started_at'))
+            self.assertNotIn('routing_decision_id', assignment)
+            self.assertEqual(assignment.get('routing_feedback', []), [])
+            self.assertEqual(observations, [])
+        else:
+            self.assertIsNotNone(assignment.get('started_at'))
+            self.assertEqual(assignment['routing_decision_id'], decision_id)
+            self.assertTrue(assignment['routing_feedback'][0]['recorded'])
+            self.assertEqual(len(observations), 1)
+            self.assertEqual(observations[0]['outcome'], 'infrastructure')
+            self.assertNotIn(observations[0]['outcome'], ('rework', 'rejected'))
         self.assertEqual(service.decision(decision_id), decision)
         self.assertEqual(service.status()['decisions'], 1)
         self.assertFalse(service.status()['admission']['active_cooldowns'])
 
-    def test_copy_begin_failure_after_assignment_start_is_reconciled(self):
-        self._assert_post_start_preparation_failure_is_reconciled('begin')
+    def test_copy_begin_failure_before_assignment_start_is_reconciled(self):
+        self._assert_pre_provider_failure_is_reconciled('begin')
 
-    def test_copy_save_failure_after_assignment_start_is_reconciled(self):
-        self._assert_post_start_preparation_failure_is_reconciled('save')
+    def test_copy_save_failure_before_assignment_start_is_reconciled(self):
+        self._assert_pre_provider_failure_is_reconciled('save')
+
+    def test_relay_construction_failure_after_assignment_start_is_reconciled(self):
+        self._assert_pre_provider_failure_is_reconciled('relay-constructor')
+
+    def test_relay_entry_failure_after_assignment_start_is_reconciled(self):
+        self._assert_pre_provider_failure_is_reconciled('relay-entry')
 
     def test_four_profiles_with_real_permissions_and_local_tests(self):
         copies = [workspace.create(self.source, self.state) for _ in range(6)]

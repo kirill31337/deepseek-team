@@ -126,9 +126,10 @@ class CacheBackedSavedCopyTests(SavedCopyFixture):
         recipe_file = self.recipe_path(self.copy)
         before = recipe_file.read_bytes()
         payload = json.loads(before)
-        self.assertEqual(payload['version'], 1)
+        self.assertEqual(payload['version'], 2)
         self.assertEqual(set(payload), {'version', 'kind', 'source_project', 'saved_at',
-                                        'tools', 'copies', 'environment', 'probes'})
+                                        'tools', 'copies', 'environment', 'probes',
+                                        'cache_dirs'})
         self.assertEqual(payload['copies'][0]['destination'], 'build/local.properties')
         self.assertNotIn(str(tool), before.decode())
         self.assertNotIn(str(source_file), before.decode())
@@ -190,7 +191,7 @@ class CacheBackedSavedCopyTests(SavedCopyFixture):
                             (cached_tool / 'bin/tool').stat().st_ino)
         self.assertNotEqual((fresh.path / 'build/local.properties').stat().st_ino,
                             (cached_copy).stat().st_ino)
-        self.assertEqual(self.reloaded(fresh).metadata['toolchain']['version'], 1)
+        self.assertEqual(self.reloaded(fresh).metadata['toolchain']['version'], 2)
         self.assertEqual(self.reloaded(fresh).metadata['prepared_paths'],
                          ['build/local.properties'])
         self.assertNotIn(str(tool), recipe_file.read_text())

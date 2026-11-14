@@ -242,6 +242,7 @@ class DeadlineTests(CheckReuseCase):
         self.assertEqual(first[0]['exit_code'], 0)
         rows = self.run_checks(deadline=time.monotonic() - 1)
         self.assertEqual(rows[0]['exit_code'], 124)
+        self.assertEqual(rows[0]['effective_timeout_seconds'], 0.0)
         self.assertFalse(rows[0]['reused'])
         self.assertEqual(self.count(), 1)
 
@@ -421,6 +422,20 @@ class InvalidationTests(CheckReuseCase):
     def test_timeout_change_misses(self):
         self.assert_miss(timeout=121)
 
+    def test_timeout_is_evidence_provenance_and_part_of_reuse_identity(self):
+        first = self.run_checks(timeout=2.5)
+        self.assertEqual(first[0]['check_timeout_seconds'], 2.5)
+        self.assertEqual(first[0]['effective_timeout_seconds'], 2.5)
+        reused = self.run_checks(timeout=2.5)
+        self.assertTrue(reused[0]['reused'])
+        self.assertEqual(reused[0]['effective_timeout_seconds'], 2.5)
+        changed = self.run_checks(timeout=3.0)
+        self.assertFalse(changed[0]['reused'])
+        self.assertEqual(changed[0]['check_timeout_seconds'], 3.0)
+        self.assertEqual(changed[0]['effective_timeout_seconds'], 3.0)
+        self.assertEqual([entry['timeout'] for entry in self.cache_entries()],
+                         [3.0, 2.5])
+
     def test_environment_change_misses(self):
         self.assert_miss(env=dict(self.env, LANG='C'))
 
@@ -587,7 +602,8 @@ class EvidenceFailureTests(CheckReuseCase):
         with self.copy.lock():
             fresh = development.run_checks(
                 [LAUNCHER], self.env, [command],
-                directory=self.evidence_directory(), copy=self.copy, reusable=False)
+                timeout=120, directory=self.evidence_directory(), copy=self.copy,
+                reusable=False)
         self.assertEqual(fresh[0]['exit_code'], 9)
         later = self.run_checks(commands=[command])
         self.assertFalse(later[0]['reused'])
@@ -905,7 +921,8 @@ class ManagedCheckReuseTests(fixtures.CoordinationCase):
         self.assertEqual(set(first['checks'][0]) - {
             'command', 'exit_code', 'phase', 'stdout_path', 'stderr_path',
             'stdout_truncated', 'stderr_truncated', 'timed_out', 'launch_failed',
-            'stdout_sha256', 'stderr_sha256', 'reused', 'reused_from'}, set())
+            'stdout_sha256', 'stderr_sha256', 'reused', 'reused_from',
+            'check_timeout_seconds', 'effective_timeout_seconds'}, set())
         self.assertTrue(first['checks'][0]['reused'])
         self.assertTrue(first['checks'][0]['reused_from'])
         self.assertFalse(self.copy.metadata['baseline_checks'][0]['reused'])

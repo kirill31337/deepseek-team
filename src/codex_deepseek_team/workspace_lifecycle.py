@@ -270,9 +270,65 @@ def validate(row, workspace_id):
         if (not isinstance(attempt, dict)
                 or not re.fullmatch('[0-9a-f]{32}', str(attempt.get('id', '')))
                 or attempt['id'] in ids or attempt.get('status') not in
-                ('running', 'succeeded', 'failed', 'interrupted')):
+                ('running', 'succeeded', 'failed', 'interrupted')
+                or ('check_timeout_seconds' in attempt and
+                    (attempt.get('operation') != 'execution'
+                     or isinstance(attempt['check_timeout_seconds'], bool)
+                     or not isinstance(attempt['check_timeout_seconds'], (int, float))
+                     or not 0 < attempt['check_timeout_seconds'] <= 86400))):
             raise error('Malformed logical job attempt history; copy preserved.')
         ids.add(attempt['id'])
+    finalization = row.get('finalization')
+    if finalization is not None:
+        allowed = {'request_id', 'at', 'cancelled', 'discard_result', 'reason',
+                   'result_schema', 'reason_code', 'discarded', 'capture'}
+        capture = finalization.get('capture') if isinstance(finalization, dict) else None
+        capture_valid = True
+        if capture is not None:
+            capture_valid = (
+                isinstance(capture, dict)
+                and set(capture) - {'bytes', 'sha256', 'attempt_id'} == set()
+                and type(capture.get('bytes')) is int and 0 <= capture['bytes'] <= 64 * 1024 * 1024
+                and isinstance(capture.get('sha256'), str)
+                and re.fullmatch('[0-9a-f]{64}', capture['sha256']) is not None
+                and (capture.get('attempt_id') is None or
+                     (isinstance(capture.get('attempt_id'), str)
+                      and re.fullmatch('[0-9a-f]{32}', capture['attempt_id']) is not None)))
+        if (not isinstance(finalization, dict) or set(finalization) - allowed
+                or not re.fullmatch('[0-9a-f]{32}', str(finalization.get('request_id', '')))
+                or type(finalization.get('at')) not in (int, float)
+                or not math.isfinite(finalization['at'])
+                or type(finalization.get('cancelled')) is not bool
+                or type(finalization.get('discard_result')) is not bool
+                or finalization['discard_result'] and not finalization['cancelled']
+                or not isinstance(finalization.get('reason'), str)
+                or not finalization['reason'].strip() or len(finalization['reason']) > 1000
+                or ('result_schema' in finalization
+                    and (type(finalization['result_schema']) is not int
+                         or finalization['result_schema'] not in (1, 2)))
+                or ('discarded' in finalization
+                    and type(finalization['discarded']) is not bool)
+                or ('discarded' in finalization and 'result_schema' not in finalization)
+                or ('reason_code' in finalization and finalization['reason_code'] not in
+                    ('git_integrity_mismatch', 'capture_too_large',
+                     'capture_unavailable', 'capture_failed'))
+                or ('reason_code' in finalization and 'result_schema' not in finalization)
+                or (finalization.get('result_schema') == 2
+                    and finalization.get('discarded') is not True)
+                or (finalization.get('result_schema') == 1
+                    and finalization.get('discarded') is not False)
+                or (finalization.get('result_schema') == 1
+                    and 'reason_code' in finalization)
+                or (finalization.get('result_schema') == 2
+                    and finalization.get('reason_code') not in
+                    ('git_integrity_mismatch', 'capture_too_large',
+                     'capture_unavailable', 'capture_failed'))
+                or (finalization.get('result_schema') == 2
+                    and finalization.get('discard_result') is not True)
+                or not capture_valid
+                or ('capture' in finalization
+                    and finalization.get('result_schema') != 1)):
+            raise error('Malformed logical job finalization request; copy preserved.')
     return row
 
 
@@ -390,13 +446,50 @@ def bind_assignment(copy, task_id, assignment_id, *, previous_binding=None):
         return row
 
 
-def prepare_attempt(copy, task_id, assignment_id, *, replace_pending=False):
-    """Reserve the same attempt identity for the ledger and workspace begin."""
+def prepare_attempt(copy, task_id, assignment_id, *, replace_pending=False,
+                    reuse_attempt_id=None):
+    """Reserve an attempt, or adopt the exact running execution attempt.
+
+    The default remains a pending reservation for callers that begin later.  A
+    baseline check may already have started the execution attempt before the
+    coordination assignment is marked running; ``reuse_attempt_id`` adopts only
+    that exact, current attempt and never reserves a second one.
+    """
     with fence(copy.directory.parent.parent):
         row = read(copy) or initialize(copy)
         if row['phase'] in FINAL_PHASES:
             raise error('Finalized logical jobs require a new workspace.', 73)
         binding = {'task_id': task_id, 'assignment_id': assignment_id}
+        if reuse_attempt_id is not None:
+            if (not isinstance(reuse_attempt_id, str)
+                    or not re.fullmatch('[0-9a-f]{32}', reuse_attempt_id)):
+                raise error('Execution attempt identity is invalid; copy preserved.', 64)
+            if row.get('pending_attempt'):
+                raise error('An execution attempt is reserved; reconcile it before adoption.', 75)
+            if row.get('binding') != binding:
+                raise error('Execution attempt belongs to another assignment; copy preserved.', 73)
+            attempts = row.get('attempts', [])
+            attempt = attempts[-1] if attempts else None
+            if (not isinstance(attempt, dict)
+                    or attempt.get('id') != reuse_attempt_id
+                    or attempt.get('operation') != 'execution'
+                    or attempt.get('status') != 'running'
+                    or attempt.get('generation') != row['generation']
+                    or row.get('phase') != 'running'):
+                raise error('The requested execution attempt is not current and running.', 73)
+            metadata_binding = {'task_id': copy.metadata.get('coord_task'),
+                                'assignment_id': copy.metadata.get('coord_assignment')}
+            if (metadata_binding != binding
+                    or copy.metadata.get('job_id') != row['job_id']
+                    or copy.metadata.get('attempt_id') != reuse_attempt_id
+                    or copy.metadata.get('attempt') != len(attempts)
+                    or copy.metadata.get('operation') != 'execution'
+                    or copy.metadata.get('status') != 'running'
+                    or copy.metadata.get('work_inode') != row['work_inode']
+                    or copy.metadata.get('check_timeout_seconds')
+                       != attempt.get('check_timeout_seconds')):
+                raise error('Workspace metadata conflicts with the running execution attempt.', 73)
+            return row['job_id'], reuse_attempt_id
         if replace_pending and row.get('pending_attempt'):
             pending = row.pop('pending_attempt')
             row['attempts'].append({'id': pending['id'], 'operation': 'execution',
@@ -443,7 +536,56 @@ def renew(copy, owner=None, *, recover=False):
         return row
 
 
-def begin(copy, operation):
+def execution_check_timeout(copy):
+    """Return the timeout mirror of the last started execution attempt.
+
+    A verification observation never creates an execution attempt, so an
+    explicit verification timeout cannot become the next inheritance source.
+    A copy with no execution history starts fresh at the current default; a
+    legacy execution attempt without the field keeps its historical 120 seconds.
+    """
+    from . import check_evidence
+    row = read(copy)
+    attempts = row.get('attempts', []) if row is not None else []
+    latest = next((attempt for attempt in reversed(attempts)
+                   if attempt.get('operation') == 'execution'
+                   and attempt.get('started_at') is not None), None)
+    if latest is not None and 'check_timeout_seconds' in latest:
+        try:
+            authoritative = check_evidence.validate_check_timeout(
+                latest['check_timeout_seconds'])
+        except check_evidence.CheckEvidenceError:
+            raise error('Execution attempt has an invalid check timeout; copy preserved.', 73) from None
+    elif latest is not None:
+        authoritative = check_evidence.LEGACY_CHECK_TIMEOUT
+    else:
+        authoritative = check_evidence.DEFAULT_CHECK_TIMEOUT
+    mirror = copy.metadata.get('check_timeout_seconds')
+    if mirror is not None:
+        try:
+            mirror = check_evidence.validate_check_timeout(mirror)
+        except check_evidence.CheckEvidenceError:
+            raise error('Workspace check timeout metadata is invalid; copy preserved.', 73) from None
+        if latest is None:
+            raise error('Workspace check timeout metadata conflicts with the execution attempt history; '
+                        'copy preserved.', 73)
+        if mirror != authoritative:
+            raise error('Workspace check timeout metadata conflicts with the execution attempt; '
+                        'copy preserved.', 73)
+    return authoritative
+
+
+def begin(copy, operation, *, check_timeout_seconds=None):
+    from . import check_evidence
+    if check_timeout_seconds is not None:
+        if operation != 'execution':
+            raise error('Check timeout belongs only to an execution attempt.', 64)
+        try:
+            check_timeout_seconds = check_evidence.validate_check_timeout(
+                check_timeout_seconds)
+        except check_evidence.CheckEvidenceError as cause:
+            raise error(cause.message, cause.code) from None
+
     with fence(copy.directory.parent.parent):
         row = read(copy) or initialize(copy)
         if row['phase'] in FINAL_PHASES:
@@ -458,6 +600,8 @@ def begin(copy, operation):
         attempt = {'id': pending['id'] if pending else uuid.uuid4().hex,
                    'operation': operation, 'status': 'running',
                    'started_at': time.time(), 'generation': row['generation']}
+        if check_timeout_seconds is not None:
+            attempt['check_timeout_seconds'] = check_timeout_seconds
         row['attempts'].append(attempt)
         row.update(phase='running', heartbeat=time.time())
         write(copy, row)

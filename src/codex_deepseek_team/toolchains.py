@@ -3,7 +3,7 @@
 A coordinator selects host software directories and explicit non-secret files or
 build caches. ``prepare`` copies them into the owned copy (``.deepseek-tools/NAME``
 and the declared destinations), materializes symlinks that stay inside the
-selected source roots, records private version-1 metadata on the copy and
+selected source roots, records private versioned metadata on the copy and
 optionally saves a private per-project recipe for replay into a later copy.
 
 Nothing here reads the provider credential, executes a host command, mounts a
@@ -29,7 +29,9 @@ import uuid
 from . import preparation_guard, workspace
 
 TOOLCHAIN_KEY = 'toolchain'
-TOOLCHAIN_VERSION = 1
+TOOLCHAIN_VERSION = 2
+LEGACY_TOOLCHAIN_VERSION = 1
+TOOLCHAIN_VERSIONS = frozenset({LEGACY_TOOLCHAIN_VERSION, TOOLCHAIN_VERSION})
 RECIPE_KIND = 'toolchain-recipe'
 TOOLS_DIRNAME = '.deepseek-tools'
 RECIPES_DIRNAME = 'toolchain-recipes'
@@ -200,6 +202,222 @@ def _normalize_copies(copies) -> list[tuple[object, str]]:
     return normalized
 
 
+def _cache_dir_value(value) -> str:
+    """Validate one declared mutable cache root lexically inside the copy."""
+    if isinstance(value, os.PathLike):
+        value = os.fspath(value)
+    if (not isinstance(value, str) or not value or '\0' in value
+            or '\n' in value or '\r' in value):
+        raise ToolchainError('Cache directories must be non-empty relative paths without '
+                             'NUL, carriage-return or newline characters.')
+    pure = PurePosixPath(value)
+    parts = pure.parts
+    if (not parts or pure.is_absolute() or '..' in parts
+            or any(part in ('', '.') for part in parts)):
+        raise ToolchainError(f'Cache directory cannot escape the owned copy: {_display(value)}.')
+    if pure.as_posix() != value:
+        raise ToolchainError(f'Cache directory must be a normalized relative path: '
+                             f'{_display(value)}.')
+    if TOOLS_DIRNAME in parts:
+        raise ToolchainError('Cache directories cannot overlap the private tool area '
+                             f'{TOOLS_DIRNAME}/: {_display(value)}.')
+    if '.git' in parts:
+        raise ToolchainError(f'Cache directory cannot touch Git metadata: {_display(value)}.')
+    if any(workspace._credential_like(Path(*parts[:index + 1]))
+           for index in range(len(parts))):
+        raise ToolchainError(f'Refusing credential-like cache directory: {_display(value)}.')
+    return pure.as_posix()
+
+
+def _normalize_cache_dirs(cache_dirs) -> list[str]:
+    """Return a sorted minimal set of safe workspace-relative cache roots."""
+    if cache_dirs is None:
+        return []
+    if not isinstance(cache_dirs, (list, tuple)):
+        raise ToolchainError('cache_dirs must be a list of workspace-relative directories.')
+    normalized = {_cache_dir_value(value) for value in cache_dirs}
+    minimal = []
+    for value in normalized:
+        if any(other != value and value.startswith(other + '/') for other in normalized):
+            continue
+        minimal.append(value)
+    return sorted(minimal)
+
+
+def _cache_directory_state(copy, relative: str) -> str:
+    """Inspect a cache path without following any component symlink."""
+    current = copy.path
+    for part in PurePosixPath(relative).parts:
+        current = current / part
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            return 'missing'
+        except OSError:
+            raise ToolchainError(f'Cache directory cannot be inspected safely: '
+                                 f'{_display(current)}.') from None
+        if stat.S_ISLNK(info.st_mode):
+            raise ToolchainError(f'Cache directory has a symlink component and was not '
+                                 f'created: {_display(current)}.')
+        if not stat.S_ISDIR(info.st_mode):
+            raise ToolchainError(f'Cache directory path is not an ordinary directory: '
+                                 f'{_display(current)}.')
+    return 'directory'
+
+
+def _validate_cache_root_tracked(copy, relative: str) -> None:
+    tracked = workspace.git(copy.path, 'ls-files', '-z', '--', relative)
+    if tracked:
+        first = os.fsdecode(tracked.split(b'\0', 1)[0])
+        raise ToolchainError(f'Cache directory contains tracked source: {_display(first)}. '
+                             'Choose a new or empty cache path; tracked files are never hidden.')
+
+
+def _declared_cache_coverage(copy, previous_destinations, copy_sources):
+    """Classify prepared destinations that may already own cache-root contents."""
+    directories = set()
+    files = set()
+    for destination in previous_destinations:
+        path = copy.path / destination
+        try:
+            info = os.lstat(path)
+        except OSError:
+            files.add(destination)
+            continue
+        if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+            directories.add(destination)
+        else:
+            files.add(destination)
+    for source, destination in copy_sources:
+        if source.is_dir():
+            directories.add(destination)
+        else:
+            files.add(destination)
+    return directories, files
+
+
+def _covered_by_cache_declaration(relative: str, directories, files) -> bool:
+    return (relative in files
+            or any(relative == directory or relative.startswith(directory + '/')
+                   for directory in directories))
+
+
+def _reject_unprepared_cache_data(copy, relative: str, directories, files) -> None:
+    """Refuse to hide pre-existing files that this preparation did not create."""
+    root = copy.path / relative
+
+    def visit(path: Path, current: str) -> None:
+        try:
+            with os.scandir(path) as iterator:
+                entries = list(iterator)
+        except OSError:
+            raise ToolchainError(f'Cache directory cannot be inspected safely: '
+                                 f'{_display(current)}. No data was removed.') from None
+        for entry in entries:
+            child = current + '/' + entry.name
+            child_path = Path(entry.path)
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError:
+                raise ToolchainError(f'Cache directory entry cannot be inspected safely: '
+                                     f'{_display(child)}. No data was removed.') from None
+            relative_path = Path(child)
+            if '.git' in relative_path.parts:
+                raise ToolchainError(f'Cache directory contains Git metadata: {_display(child)}. '
+                                     'No data was removed; use a new workspace copy.')
+            if workspace._credential_like(relative_path):
+                raise ToolchainError(f'Cache directory contains a credential-like entry: '
+                                     f'{_display(child)}. No data was removed; use a new '
+                                     'workspace copy.')
+            if stat.S_ISLNK(info.st_mode):
+                raise ToolchainError(f'Cache directory contains a symlink: {_display(child)}. '
+                                     'No data was removed; use a new workspace copy.')
+            if stat.S_ISDIR(info.st_mode):
+                visit(child_path, child)
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                raise ToolchainError(f'Cache directory contains a special file: '
+                                     f'{_display(child)}. No data was removed; use a new '
+                                     'workspace copy.')
+            if not _covered_by_cache_declaration(child, directories, files):
+                raise ToolchainError(
+                    f'Cache directory contains existing data that is not a declared prepared '
+                    f'copy destination: {_display(child)}. No data was removed; create a new '
+                    'workspace copy instead.')
+
+    visit(root, relative)
+
+
+def _validate_cache_declarations(copy, cache_dirs, *, previous_cache_dirs,
+                                 previous_destinations, copy_sources,
+                                 execution_started: bool) -> list[str]:
+    """Validate the mutable cache set before any filesystem publication."""
+    normalized = _normalize_cache_dirs(cache_dirs)
+    previous = set(previous_cache_dirs)
+    if execution_started and set(normalized) != previous:
+        raise ToolchainError(
+            'Cache directories are fixed after the first execution. Previous roots: '
+            f'{sorted(previous)}; requested roots: {normalized}. Create a new workspace copy '
+            'to declare a different mutable cache set; no cache data was removed.')
+
+    directories, files = _declared_cache_coverage(copy, previous_destinations, copy_sources)
+    directories.update(previous)
+    declared_file_destinations = {destination for source, destination in copy_sources
+                                  if not source.is_dir()}
+    for relative in normalized:
+        state = _cache_directory_state(copy, relative)
+        _validate_cache_root_tracked(copy, relative)
+        for destination in declared_file_destinations:
+            if relative == destination or relative.startswith(destination + '/'):
+                raise ToolchainError(
+                    f'Cache directory would overlap a prepared file destination: '
+                    f'{_display(relative)} -> {_display(destination)}.')
+        if state == 'missing':
+            continue
+        if any(relative == old or relative.startswith(old + '/') for old in previous):
+            continue
+        _reject_unprepared_cache_data(copy, relative, directories, files)
+    return normalized
+
+
+def _workspace_execution_started(copy) -> bool:
+    """True once an execution attempt was begun or reserved for this copy."""
+    if copy.metadata.get('operation') == 'execution':
+        return True
+    from . import workspace_lifecycle
+    try:
+        lease = workspace_lifecycle.read(copy)
+    except workspace.WorkspaceError as error:
+        raise ToolchainError(str(error), error.code) from None
+    if lease is None:
+        return False
+    if lease.get('pending_attempt') is not None:
+        return True
+    return any(attempt.get('operation') == 'execution'
+               for attempt in lease.get('attempts', ()))
+
+
+def _future_preparation_directories(copy, copy_sources, cache_dirs) -> set[Path]:
+    """Directories publication will create, including file-target parents."""
+    root = Path(copy.path)
+    future = set()
+
+    def add_with_parents(path: Path) -> None:
+        current = Path(os.path.normpath(path))
+        while current != root and current.is_relative_to(root):
+            future.add(current)
+            current = current.parent
+
+    for source, destination in copy_sources:
+        final = root / destination
+        if source.is_dir():
+            add_with_parents(final)
+        add_with_parents(final.parent)
+    for cache_dir in cache_dirs:
+        add_with_parents(root / cache_dir)
+    return future
+
+
 def _validate_destination(copy, destination) -> str:
     if (not isinstance(destination, str) or not destination or '\0' in destination
             or '\n' in destination or '\r' in destination):
@@ -333,11 +551,15 @@ def _validate_toolchain_metadata(copy, raw, *, check_tools: bool) -> dict:
     if not isinstance(raw, dict):
         raise ToolchainError('Prepared toolchain metadata is malformed; recreate or recover the copy.')
     version = raw.get('version')
-    if version != TOOLCHAIN_VERSION:
+    if type(version) is not int or version not in TOOLCHAIN_VERSIONS:
         raise ToolchainError(f'Unsupported prepared toolchain metadata version: {_display(version)}. '
                              'This package cannot interpret it safely.')
-    expected = {'version', 'prepared_at', 'source_project', 'tools', 'copies', 'environment', 'probes'}
-    if set(raw) != expected:
+    required = {'version', 'prepared_at', 'source_project', 'tools', 'copies', 'environment',
+                'probes'}
+    if version == TOOLCHAIN_VERSION:
+        required.add('cache_dirs')
+    allowed = required | {'exclude_ownership'}
+    if required - set(raw) or set(raw) - allowed:
         raise ToolchainError('Prepared toolchain metadata has unknown fields; refusing to interpret it.')
     if not isinstance(raw.get('prepared_at'), (int, float)) or isinstance(raw.get('prepared_at'), bool):
         raise ToolchainError('Prepared toolchain metadata has an invalid timestamp.')
@@ -379,9 +601,25 @@ def _validate_toolchain_metadata(copy, raw, *, check_tools: bool) -> dict:
         checked_copies.append({'source': entry['source'], 'destination': destination})
     environment = _validate_declared_environment(raw.get('environment'))
     probes = _validate_probes(raw.get('probes'))
-    return {'version': TOOLCHAIN_VERSION, 'prepared_at': raw['prepared_at'],
+    if version == TOOLCHAIN_VERSION:
+        raw_cache_dirs = raw.get('cache_dirs')
+        if not isinstance(raw_cache_dirs, list):
+            raise ToolchainError('Prepared toolchain metadata has an invalid cache directory list.')
+        cache_dirs = _normalize_cache_dirs(raw_cache_dirs)
+    else:
+        cache_dirs = []
+    ownership = None
+    if 'exclude_ownership' in raw:
+        ownership = _validate_exclude_ownership(raw['exclude_ownership'])
+        declared = set(_exclude_patterns(
+            checked_tools, {entry['destination'] for entry in checked_copies}, cache_dirs))
+        if set(ownership) - declared:
+            raise ToolchainError(
+                'Prepared toolchain metadata has inconsistent exclude ownership.')
+    return {'version': version, 'prepared_at': raw['prepared_at'],
             'source_project': raw['source_project'], 'tools': checked_tools,
-            'copies': checked_copies, 'environment': environment, 'probes': probes}
+            'copies': checked_copies, 'environment': environment, 'probes': probes,
+            'cache_dirs': cache_dirs, 'exclude_ownership': ownership}
 
 
 def _load_toolchain(copy) -> dict | None:
@@ -393,8 +631,44 @@ def _load_toolchain(copy) -> dict | None:
     return metadata
 
 
-def _validate_environment_paths(copy, environment: dict[str, str], *, staged=()) -> None:
-    root = os.path.realpath(copy.path)
+def _workspace_directory_state(copy, expanded: str) -> str:
+    """Classify an expanded workspace path without following symlink components."""
+    root = Path(copy.path)
+    root_real = os.path.realpath(root)
+    lexical = Path(os.path.normpath(expanded))
+    real = os.path.realpath(expanded)
+    if not real.startswith(root_real + os.sep):
+        raise ToolchainError('Prepared environment path must resolve strictly inside the '
+                             'owned copy.')
+    try:
+        relative = lexical.relative_to(root)
+    except ValueError:
+        raise ToolchainError('Prepared environment path must resolve strictly inside the '
+                             'owned copy.') from None
+    if not relative.parts:
+        raise ToolchainError('Prepared environment path must resolve strictly inside the '
+                             'owned copy.')
+    current = root
+    for part in relative.parts:
+        current = current / part
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            return 'missing'
+        except OSError:
+            raise ToolchainError(f'Prepared environment path cannot be inspected safely: '
+                                 f'{_display(current)}.') from None
+        if stat.S_ISLNK(info.st_mode):
+            raise ToolchainError(f'Prepared environment path has a symlink component: '
+                                 f'{_display(current)}.')
+        if not stat.S_ISDIR(info.st_mode):
+            return 'other'
+    return 'directory'
+
+
+def _validate_environment_paths(copy, environment: dict[str, str], *, staged=(),
+                                future=()) -> None:
+    future = {Path(os.path.normpath(path)) for path in future}
     for name, value in environment.items():
         if name == 'PATH':
             elements = value.split(':')
@@ -405,16 +679,25 @@ def _validate_environment_paths(copy, environment: dict[str, str], *, staged=())
             if '\0' in expanded or not os.path.isabs(expanded):
                 raise ToolchainError(f'Prepared variable {_display(name)} must resolve to an absolute '
                                      'workspace path.')
-            real = os.path.realpath(expanded)
-            if not real.startswith(root + os.sep):
-                raise ToolchainError(f'Prepared variable {_display(name)} must resolve strictly inside '
-                                     'the owned copy.')
-            if os.path.isdir(expanded):
+            lexical = Path(os.path.normpath(expanded))
+            try:
+                state = _workspace_directory_state(copy, expanded)
+            except ToolchainError as error:
+                raise ToolchainError(f'Prepared variable {_display(name)}: {error}') from None
+            if state == 'directory':
                 continue
-            if _staged_directory_exists(expanded, staged):
+            if state == 'missing' and (lexical in future
+                                       or _staged_directory_exists(expanded, staged)):
                 continue
-            raise ToolchainError(f'Prepared variable {_display(name)} does not resolve to an existing '
-                                 f'workspace directory: {_display(expanded)}.')
+            if state == 'missing':
+                raise ToolchainError(
+                    f'Prepared variable {_display(name)} does not resolve to an existing '
+                    f'workspace directory or a declared preparation target: {_display(expanded)}. '
+                    'Declare its parent with --copy/--cache-dir or use a fresh copy; missing '
+                    'descendants and unrelated paths are never created implicitly.')
+            raise ToolchainError(
+                f'Prepared variable {_display(name)} exists but is not an ordinary workspace '
+                f'directory: {_display(expanded)}.')
 
 
 def _staged_directory_exists(expanded: str, staged) -> bool:
@@ -799,14 +1082,30 @@ def _ensure_directory_chain(copy, parts: tuple[str, ...], *, create: bool = True
             raise ToolchainError(f'Preparation destination parent is unsafe: {_display(current)}.')
 
 
-def _existing_patterns(copy) -> tuple[set[str], set[str]]:
+def _validate_exclude_ownership(value) -> dict[str, int]:
+    """Validate the private durable record of exclusion lines prepared by us."""
+    if not isinstance(value, dict):
+        raise ToolchainError('Prepared toolchain metadata has an invalid exclude ownership record.')
+    result = {}
+    for pattern, count in value.items():
+        if (not isinstance(pattern, str) or not pattern.startswith('/')
+                or any(character in pattern for character in '\r\n\0')
+                or type(count) is not int or count <= 0):
+            raise ToolchainError(
+                'Prepared toolchain metadata has an invalid exclude ownership record.')
+        result[pattern] = count
+    return result
+
+
+def _existing_patterns(copy) -> tuple[set[str], set[str], set[str], dict[str, int] | None]:
     raw = copy.metadata.get(TOOLCHAIN_KEY)
     if raw is None:
-        return set(), set()
+        return set(), set(), set(), None
     metadata = _validate_toolchain_metadata(copy, raw, check_tools=False)
     tools = set(metadata['tools'])
     destinations = {entry['destination'] for entry in metadata['copies']}
-    return tools, destinations
+    return (tools, destinations, set(metadata.get('cache_dirs', [])),
+            metadata['exclude_ownership'])
 
 
 def _exclude_pattern(relative: str) -> str:
@@ -821,50 +1120,163 @@ def _exclude_pattern(relative: str) -> str:
     return '/' + escaped
 
 
-def _write_excludes(copy, patterns: list[str]) -> None:
+def _exclude_patterns(tools, destinations, cache_dirs) -> list[str]:
+    patterns = []
+    if tools:
+        patterns.append(_exclude_pattern(TOOLS_DIRNAME) + '/')
+    for destination in sorted(set(destinations)):
+        patterns.append(_exclude_pattern(destination))
+    for cache_dir in sorted(set(cache_dirs)):
+        patterns.append(_exclude_pattern(cache_dir))
+    result = []
+    seen = set()
+    for pattern in patterns:
+        if pattern in seen:
+            continue
+        seen.add(pattern)
+        result.append(pattern)
+    return result
+
+
+def _split_lf_lines(content: bytes) -> list[bytes]:
+    """Split only at LF and retain each line's original terminator bytes."""
+    if not content:
+        return []
+    parts = content.split(b'\n')
+    lines = [part + b'\n' for part in parts[:-1]]
+    if parts[-1]:
+        lines.append(parts[-1])
+    return lines
+
+
+def _exclude_line_body(line: bytes) -> bytes:
+    return line[:-1] if line.endswith(b'\n') else line
+
+
+def _write_excludes(copy, patterns: list[str], *, owned) -> tuple[bool, dict[str, int]]:
+    """Publish generated excludes and return the exact lines preparation owns.
+
+    ``owned`` is the previous durable ownership record, or ``None`` for an
+    unrecorded legacy declaration.  Without a record no existing line is ever
+    removed: declarations alone do not prove that preparation inserted it.
+    """
     git_dir = copy.path / '.git'
     info = os.lstat(git_dir)
     if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
         raise ToolchainError('Owned copy Git metadata is unsafe; preparation refused.')
     info_dir = git_dir / 'info'
-    try:
-        os.mkdir(info_dir, 0o755)
-    except FileExistsError:
-        pass
-    info = os.lstat(info_dir)
-    if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
-        raise ToolchainError('Owned copy Git exclude directory is unsafe; preparation refused.')
     exclude = info_dir / 'exclude'
-    existing: list[str] = []
+    existing = b''
+    existing_mode = 0o644
+    info_exists = False
+    exclude_exists = False
     try:
-        fd = os.open(exclude, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        info = os.lstat(info_dir)
     except FileNotFoundError:
         pass
     else:
-        with os.fdopen(fd, 'rb') as stream:
-            stat_info = os.fstat(stream.fileno())
-            if (not stat.S_ISREG(stat_info.st_mode) or stat_info.st_nlink != 1
-                    or stat_info.st_uid != os.geteuid()):
-                raise ToolchainError('Owned copy Git exclude file is unsafe; preparation refused.')
-            existing = stream.read().decode('utf-8', 'replace').splitlines()
-    present = set(existing)
-    additions = [pattern for pattern in patterns if pattern not in present]
-    if not additions:
-        return
-    content = ('\n'.join(existing + additions) + '\n').encode('utf-8')
-    temporary = info_dir / ('exclude.tmp-' + uuid.uuid4().hex)
-    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
-    try:
-        with os.fdopen(fd, 'wb') as stream:
-            stream.write(content)
-            stream.flush()
-            os.fsync(stream.fileno())
-        _replace(temporary, exclude)
-    finally:
+        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+            raise ToolchainError('Owned copy Git exclude directory is unsafe; preparation refused.')
+        info_exists = True
         try:
-            os.unlink(temporary)
+            fd = os.open(exclude, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         except FileNotFoundError:
             pass
+        else:
+            exclude_exists = True
+            with os.fdopen(fd, 'rb') as stream:
+                stat_info = os.fstat(stream.fileno())
+                if (not stat.S_ISREG(stat_info.st_mode) or stat_info.st_nlink != 1
+                        or stat_info.st_uid != os.geteuid()):
+                    raise ToolchainError(
+                        'Owned copy Git exclude file is unsafe; preparation refused.')
+                existing = stream.read()
+                existing_mode = stat.S_IMODE(stat_info.st_mode)
+    lines = _split_lf_lines(existing)
+    desired = list(dict.fromkeys(patterns))
+    wanted = set(desired)
+    removals = {}
+    if owned is not None:
+        for pattern, count in owned.items():
+            if pattern not in wanted:
+                removals[pattern.encode('utf-8') + b'\n'] = count
+    remaining = []
+    removed = False
+    for line in lines:
+        budget = removals.get(line, 0)
+        if budget:
+            removals[line] = budget - 1
+            removed = True
+            continue
+        remaining.append(line)
+    present = {_exclude_line_body(line) for line in remaining}
+    additions = []
+    for pattern in desired:
+        encoded = pattern.encode('utf-8')
+        if encoded in present:
+            continue
+        additions.append(pattern)
+        present.add(encoded)
+    changed = removed or bool(additions)
+    if changed:
+        # Refuse to publish while the pre-change evidence is stale: ownership of
+        # the exclude file is the only Git metadata this path may attest.
+        try:
+            copy.verify()
+        except workspace.WorkspaceError as error:
+            raise ToolchainError(str(error), error.code) from None
+        if not info_exists:
+            try:
+                os.mkdir(info_dir, 0o755)
+            except FileExistsError:
+                current = os.lstat(info_dir)
+                if not stat.S_ISDIR(current.st_mode) or stat.S_ISLNK(current.st_mode):
+                    raise ToolchainError(
+                        'Owned copy Git exclude directory is unsafe; preparation refused.')
+        content = b''.join(remaining)
+        if additions:
+            if content and not content.endswith(b'\n'):
+                content += b'\n'
+            content += b''.join(pattern.encode('utf-8') + b'\n' for pattern in additions)
+        temporary = info_dir / ('exclude.tmp-' + uuid.uuid4().hex)
+        publish_mode = existing_mode if exclude_exists else 0o644
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     publish_mode)
+        try:
+            with os.fdopen(fd, 'wb') as stream:
+                os.fchmod(stream.fileno(), publish_mode)
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            _replace(temporary, exclude)
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+        from . import git_integrity
+        try:
+            evidence = git_integrity.snapshot(copy.path)
+            legacy = workspace._git_digest(copy.path)
+        except (git_integrity.GitIntegrityError, workspace.WorkspaceError) as error:
+            raise ToolchainError(str(error), error.code) from None
+        copy.metadata['git_integrity'] = evidence
+        copy.metadata['git_digest'] = legacy
+    occurrences = {}
+    for line in remaining:
+        if line.endswith(b'\n'):
+            body = line[:-1]
+            occurrences[body] = occurrences.get(body, 0) + 1
+    ownership = {}
+    for pattern in desired:
+        if pattern in additions:
+            count = 1
+        else:
+            count = min((owned or {}).get(pattern, 0),
+                        occurrences.get(pattern.encode('utf-8'), 0))
+        if count:
+            ownership[pattern] = count
+    return changed, ownership
 
 
 @contextmanager
@@ -963,7 +1375,8 @@ def _save_recipe(copy, metadata: dict, *, cache_max_bytes: int, cache_max_inodes
         payload = {'version': TOOLCHAIN_VERSION, 'kind': RECIPE_KIND,
                    'source_project': metadata['source_project'], 'saved_at': saved_at,
                    'tools': {}, 'copies': [],
-                   'environment': metadata['environment'], 'probes': metadata['probes']}
+                   'environment': metadata['environment'], 'probes': metadata['probes'],
+                   'cache_dirs': list(metadata.get('cache_dirs', []))}
         with _recipe_lock(copy) as (directory, key):
             _atomic_private_write(directory / (key + '.json'),
                                   (json.dumps(payload, indent=2, ensure_ascii=True) + '\n').encode())
@@ -991,7 +1404,8 @@ def _save_recipe(copy, metadata: dict, *, cache_max_bytes: int, cache_max_inodes
             payload = {'version': TOOLCHAIN_VERSION, 'kind': RECIPE_KIND,
                        'source_project': metadata['source_project'], 'saved_at': saved_at,
                        'tools': stable_tools, 'copies': stable_copies,
-                       'environment': metadata['environment'], 'probes': metadata['probes']}
+                       'environment': metadata['environment'], 'probes': metadata['probes'],
+                       'cache_dirs': list(metadata.get('cache_dirs', []))}
             batch.publish()
             _atomic_private_write(directory / (key + '.json'),
                                   (json.dumps(payload, indent=2, ensure_ascii=True) + '\n').encode())
@@ -1096,11 +1510,13 @@ def _validate_recipe(copy, payload) -> dict:
     if not isinstance(payload, dict):
         raise ToolchainError('Private toolchain recipe is malformed.')
     version = payload.get('version')
-    if version != TOOLCHAIN_VERSION:
+    if type(version) is not int or version not in TOOLCHAIN_VERSIONS:
         raise ToolchainError(f'Unsupported toolchain recipe version: {_display(version)}. '
                              'This package never guesses an unknown recipe format.')
     expected = {'version', 'kind', 'source_project', 'saved_at', 'tools', 'copies',
                 'environment', 'probes'}
+    if version == TOOLCHAIN_VERSION:
+        expected.add('cache_dirs')
     if set(payload) != expected:
         raise ToolchainError('Private toolchain recipe has unknown fields; refusing to replay it.')
     if payload.get('kind') != RECIPE_KIND:
@@ -1134,11 +1550,19 @@ def _validate_recipe(copy, payload) -> dict:
                 or not Path(entry['source']).is_absolute() or '\0' in entry['source']):
             raise ToolchainError('Private toolchain recipe has a malformed copy declaration.')
         checked_copies.append(dict(entry))
-    return {'source_project': payload['source_project'],
+    if version == TOOLCHAIN_VERSION:
+        raw_cache_dirs = payload.get('cache_dirs')
+        if not isinstance(raw_cache_dirs, list):
+            raise ToolchainError('Private toolchain recipe has an invalid cache directory list.')
+        cache_dirs = _normalize_cache_dirs(raw_cache_dirs)
+    else:
+        cache_dirs = []
+    return {'version': version, 'source_project': payload['source_project'],
             'tools': {name: entry['source'] for name, entry in checked_tools.items()},
             'copies': [(entry['source'], entry['destination']) for entry in checked_copies],
             'environment': _validate_declared_environment(payload.get('environment')),
-            'probes': _validate_probes(payload.get('probes'))}
+            'probes': _validate_probes(payload.get('probes')),
+            'cache_dirs': cache_dirs}
 
 
 def _materialize(copy, declarations: dict, *, recover: bool) -> dict:
@@ -1146,6 +1570,11 @@ def _materialize(copy, declarations: dict, *, recover: bool) -> dict:
     copies = declarations['copies']
     environment = declarations['environment']
     probes = declarations['probes']
+    cache_dirs = _normalize_cache_dirs(declarations.get('cache_dirs'))
+    metadata_version = declarations.get('version', TOOLCHAIN_VERSION)
+    if type(metadata_version) is not int or metadata_version not in TOOLCHAIN_VERSIONS:
+        raise ToolchainError(f'Unsupported toolchain metadata version: '
+                             f'{_display(metadata_version)}.')
 
     from . import toolchain_cache
     tool_sources = {}
@@ -1171,7 +1600,14 @@ def _materialize(copy, declarations: dict, *, recover: bool) -> dict:
                                          allow_workspace_input=True)
         copy_sources.append((resolved, normalized))
 
-    previous_tools, previous_destinations = _existing_patterns(copy)
+    (previous_tools, previous_destinations, previous_cache_dirs,
+     previous_ownership) = _existing_patterns(copy)
+    cache_dirs = _validate_cache_declarations(
+        copy, cache_dirs,
+        previous_cache_dirs=previous_cache_dirs,
+        previous_destinations=previous_destinations,
+        copy_sources=copy_sources,
+        execution_started=_workspace_execution_started(copy))
     tools_root = copy.path / TOOLS_DIRNAME
     declared_destinations = {destination for _, destination in copy_sources}
     removed_tools = sorted(set(previous_tools) - set(tool_sources))
@@ -1272,7 +1708,9 @@ def _materialize(copy, declarations: dict, *, recover: bool) -> dict:
                         _copy_file(source, staged, {'files': 0, 'bytes': 0})
                     staged_map.append((copy.path / destination, staged))
 
-                _validate_environment_paths(copy, environment, staged=staged_map)
+                _validate_environment_paths(
+                    copy, environment, staged=staged_map,
+                    future=_future_preparation_directories(copy, copy_sources, cache_dirs))
 
                 for name in tool_sources:
                     final = tools_root / name
@@ -1296,6 +1734,8 @@ def _materialize(copy, declarations: dict, *, recover: bool) -> dict:
                     if not os.path.lexists(stale):
                         continue
                     _remove(stale)
+                for relative in cache_dirs:
+                    _ensure_directory_chain(copy, PurePosixPath(relative).parts)
             finally:
                 if stage_root is not None:
                     try:
@@ -1308,7 +1748,7 @@ def _materialize(copy, declarations: dict, *, recover: bool) -> dict:
                     except OSError:
                         pass
 
-    metadata = {'version': TOOLCHAIN_VERSION, 'prepared_at': time.time(),
+    metadata = {'version': metadata_version, 'prepared_at': time.time(),
                 'source_project': str(_canonical_source(copy)),
                 'tools': {name: {'source': str(tool_sources[name]),
                                  'files': tool_stats[name]['files'],
@@ -1318,14 +1758,12 @@ def _materialize(copy, declarations: dict, *, recover: bool) -> dict:
                 'copies': [{'source': str(source), 'destination': destination}
                            for source, destination in copy_sources],
                 'environment': dict(environment), 'probes': list(probes)}
-    patterns = []
-    if tool_sources:
-        patterns.append(_exclude_pattern(TOOLS_DIRNAME) + '/')
-    for _, destination in copy_sources:
-        patterns.append(_exclude_pattern(destination))
-    if patterns:
-        _write_excludes(copy, patterns)
-        copy.metadata['git_digest'] = workspace._git_digest(copy.path)
+    if metadata_version == TOOLCHAIN_VERSION:
+        metadata['cache_dirs'] = list(cache_dirs)
+    patterns = _exclude_patterns(tool_sources, declared_destinations, cache_dirs)
+    changed, ownership = _write_excludes(copy, patterns, owned=previous_ownership)
+    if metadata_version == TOOLCHAIN_VERSION:
+        metadata['exclude_ownership'] = ownership
     registered = set(copy.metadata.get('prepared_paths', []))
     registered.difference_update(previous_destinations)
     registered.update(entry['destination'] for entry in metadata['copies'])
@@ -1343,6 +1781,7 @@ def _result(copy, metadata: dict, *, recipe_saved: bool) -> dict:
              for name, entry in sorted(metadata['tools'].items())]
     return {'id': copy.id, 'tools': tools,
             'copies': [dict(entry) for entry in metadata['copies']],
+            'cache_dirs': list(metadata.get('cache_dirs', [])),
             'environment': dict(metadata['environment']), 'probes': list(metadata['probes']),
             'read_only_roots': [str(copy.path / TOOLS_DIRNAME / name)
                                 for name in sorted(metadata['tools'])],
@@ -1377,18 +1816,20 @@ def _unattested_recipe_source(copy, declarations: dict) -> str | None:
 
 
 def prepare(copy, *, tools=None, copies=None, environment=None, probes=None,
+            cache_dirs=None,
             save_project: bool = False, recover: bool = False,
             recheck_environment: bool = False,
             cache_max_bytes: int | None = None,
             cache_max_inodes: int | None = None) -> dict:
-    """Own the copy lock, publish declared preparation and record version-1 metadata."""
+    """Own the copy lock, publish declared preparation and record version-2 metadata."""
     cache_max_bytes, cache_max_inodes = _prepare_cache_limits(
         save_project, cache_max_bytes, cache_max_inodes)
     with copy.lock(recover=recover):
         try:
             declarations = {'tools': _normalize_tools(tools), 'copies': _normalize_copies(copies),
                             'environment': _validate_declared_environment(environment),
-                            'probes': _validate_probes(probes)}
+                            'probes': _validate_probes(probes),
+                            'cache_dirs': _normalize_cache_dirs(cache_dirs)}
         except ToolchainError as error:
             copy.begin('preparation')
             _record_failure(copy, error.code)

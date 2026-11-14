@@ -16,7 +16,7 @@ import time
 import uuid
 
 from .settings import git_environment, project_root, SettingsError
-from . import state_storage, workspace_lifecycle
+from . import git_integrity, state_storage, workspace_lifecycle
 
 SCHEMA = 'deepseek-team-workspace-v1'
 DEFAULT_STATE = Path.home() / '.local/state/codex-deepseek'
@@ -57,33 +57,24 @@ def _atomic(path: Path, content: bytes) -> None:
             os.close(fd)
 
 
-def git(root: Path, *args: str, ok=(0,)) -> bytes:
+def git(root: Path, *args: str, ok=(0,), env: dict | None = None) -> bytes:
     result = subprocess.run(
         ['git', '--no-pager', '-c', 'core.fsmonitor=false', '-c', 'core.filemode=true',
          '-c', 'core.hooksPath=' + os.devnull, '-c', 'core.attributesFile=' + os.devnull,
          '-c', 'core.ignoreStat=false', '-c', 'diff.autoRefreshIndex=false', '-C', str(root), *args],
-        env=git_environment(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        env=git_environment() if env is None else env,
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     if result.returncode not in ok:
         raise WorkspaceError('Git preparation/verification failed; the owned copy is retained.')
     return result.stdout
 
 
 def _git_digest(path: Path) -> str:
-    """Protect administrative state; immutable objects are not rehashed each run."""
-    metadata = path / '.git'
-    if metadata.is_symlink() or not metadata.is_dir():
-        raise WorkspaceError('Git metadata is not an ordinary directory; copy retained.', 73)
-    digest = hashlib.sha256()
-    for directory, dirs, files in os.walk(metadata, followlinks=False):
-        dirs[:] = sorted(name for name in dirs if name != 'objects')
-        for name in dirs:
-            if (Path(directory) / name).is_symlink():
-                raise WorkspaceError('Symlinked Git metadata; copy retained.', 73)
-        for name in sorted(files):
-            item = Path(directory) / name
-            digest.update(os.fsencode(str(item.relative_to(metadata))) + b'\0')
-            digest.update(_read(item))
-    return digest.hexdigest()
+    """Compatibility adapter for the pre-versioned raw administrative digest."""
+    try:
+        return git_integrity.legacy_digest(path)
+    except git_integrity.GitIntegrityError as error:
+        raise WorkspaceError(str(error), error.code) from None
 
 
 SUBMODULE_REASON = 'submodule needs a coordinator-prepared standalone source copy'
@@ -213,14 +204,37 @@ class Workspace:
         _atomic(self.directory / 'record.json',
                 (json.dumps(self.metadata, indent=2, ensure_ascii=True) + '\n').encode())
 
-    def verify(self) -> None:
+    def verify(self, *, upgrade: bool = False) -> None:
         if (self.path.is_symlink() or not self.path.is_dir()
                 or self.path.stat().st_ino != self.metadata.get('work_inode')):
             raise WorkspaceError('Workspace directory was replaced; foreign work is never adopted.', 73)
-        if not self.metadata.get('base_head') or not self.metadata.get('git_digest'):
+        if not self.metadata.get('base_head'):
             raise WorkspaceError(INCOMPLETE_PREPARATION, 73)
-        if _git_digest(self.path) != self.metadata.get('git_digest'):
-            raise WorkspaceError('Worker Git metadata changed; result rejected and copy retained.', 73)
+        evidence = self.metadata.get('git_integrity')
+        if evidence is not None:
+            try:
+                git_integrity.verify(self.path, evidence)
+            except git_integrity.GitIntegrityError as error:
+                raise WorkspaceError(str(error), error.code) from None
+        elif self.metadata.get('git_digest'):
+            try:
+                matched = git_integrity.legacy_matches(
+                    self.path, self.metadata['git_digest'])
+            except git_integrity.GitIntegrityError as error:
+                raise WorkspaceError(str(error), error.code) from None
+            if not matched:
+                raise WorkspaceError('Worker Git metadata changed; result rejected and copy retained.', 73)
+            if not upgrade:
+                pass
+            else:
+                try:
+                    evidence = git_integrity.snapshot(self.path)
+                except git_integrity.GitIntegrityError as error:
+                    raise WorkspaceError(str(error), error.code) from None
+                self.metadata['git_integrity'] = evidence
+                self.save()
+        else:
+            raise WorkspaceError(INCOMPLETE_PREPARATION, 73)
         if git(self.path, 'rev-parse', 'HEAD').strip().decode('ascii') != self.metadata['base_head']:
             raise WorkspaceError('Worker changed its baseline commit; copy retained.', 73)
 
@@ -240,7 +254,7 @@ class Workspace:
                 lease = workspace_lifecycle.read(self)
                 if lease and lease['phase'] in workspace_lifecycle.FINAL_PHASES:
                     raise WorkspaceError('Job was finalized; create a new workspace for new execution.', 73)
-                self.verify()
+                self.verify(upgrade=True)
                 if self.metadata['status'] not in ('ready', 'succeeded') and not recover:
                     raise WorkspaceError('Copy has failed/interrupted or partial work. Inspect workspace show/diff, '
                                          'then explicitly use --resume-after-failure; no automatic retry.')
@@ -252,15 +266,18 @@ class Workspace:
             if fd is not None:
                 os.close(fd)
 
-    def begin(self, kind: str) -> None:
+    def begin(self, kind: str, *, check_timeout_seconds: float | None = None) -> None:
         if not self._locked:
             raise WorkspaceError('An exclusive workspace lock is required.')
-        attempt_id = workspace_lifecycle.begin(self, kind)
+        attempt_id = workspace_lifecycle.begin(
+            self, kind, check_timeout_seconds=check_timeout_seconds)
         lease = workspace_lifecycle.read(self)
         self.metadata.update(status='running', operation=kind, job_id=lease['job_id'],
                              attempt_id=attempt_id,
                              attempt=self.metadata.get('attempt', 0) + 1,
                              started_at=time.time(), error_kind=None, exit_code=None)
+        if check_timeout_seconds is not None:
+            self.metadata['check_timeout_seconds'] = check_timeout_seconds
         self.save()
 
     def changes(self) -> tuple[list[str], int]:
@@ -268,14 +285,14 @@ class Workspace:
             with self.lock(recover=True):
                 return self.changes()
         self.verify()
-        # --name-only can report stat-only differences when index refresh is
-        # disabled. --numstat compares content while keeping the index intact.
-        rows = git(self.path, 'diff', '--no-ext-diff', '--no-textconv', '--no-renames',
-                   '--numstat', '-z', 'HEAD', '--')
-        names = b''.join(row.split(b'\t', 2)[2] + b'\0'
-                         for row in rows.split(b'\0') if row)
-        names += git(self.path, 'ls-files', '--others', '--exclude-standard', '-z')
-        ignored = git(self.path, 'ls-files', '--others', '--ignored', '--exclude-standard', '-z')
+        with self._trusted_index() as env:
+            rows = git(self.path, 'diff', '--no-ext-diff', '--no-textconv', '--no-renames',
+                       '--numstat', '-z', self.metadata['base_head'], '--', env=env)
+            names = b''.join(row.split(b'\t', 2)[2] + b'\0'
+                             for row in rows.split(b'\0') if row)
+            names += git(self.path, 'ls-files', '--others', '--exclude-standard', '-z', env=env)
+            ignored = git(self.path, 'ls-files', '--others', '--ignored', '--exclude-standard', '-z',
+                          env=env)
         return sorted({os.fsdecode(n) for n in names.split(b'\0') if n}), sum(bool(n) for n in ignored.split(b'\0'))
 
     def diff_bytes(self) -> bytes:
@@ -283,13 +300,29 @@ class Workspace:
             with self.lock(recover=True):
                 return self.diff_bytes()
         self.verify()
-        patch = git(self.path, 'diff', '--binary', '--full-index', '--no-ext-diff',
-                    '--no-textconv', '--no-renames', 'HEAD', '--')
-        for raw_name in git(self.path, 'ls-files', '--others', '--exclude-standard', '-z').split(b'\0'):
+        with self._trusted_index() as env:
+            patch = git(self.path, 'diff', '--binary', '--full-index', '--no-ext-diff',
+                        '--no-textconv', '--no-renames', self.metadata['base_head'], '--', env=env)
+            untracked = git(self.path, 'ls-files', '--others', '--exclude-standard', '-z', env=env)
+        for raw_name in untracked.split(b'\0'):
             if raw_name:
                 patch += git(self.path, 'diff', '--no-index', '--binary', '--no-ext-diff',
                              '--no-textconv', '--', '/dev/null', os.fsdecode(raw_name), ok=(0, 1))
         return patch
+
+    @contextmanager
+    def _trusted_index(self):
+        evidence = self.metadata.get('git_integrity')
+        object_format = (evidence.get('object_format')
+                         if isinstance(evidence, dict) else None)
+        if object_format not in (None, 'sha1', 'sha256'):
+            raise WorkspaceError('Trusted Git index evidence is unavailable; copy retained.', 73)
+        try:
+            with git_integrity.temporary_index(
+                    self.path, self.metadata['base_head'], object_format=object_format) as env:
+                yield env
+        except git_integrity.GitIntegrityError as error:
+            raise WorkspaceError(str(error), error.code) from None
 
     def diff(self) -> str:
         return self.diff_bytes().decode('utf-8', errors='replace')
@@ -317,7 +350,8 @@ class Workspace:
 def content_snapshot(copy: Workspace) -> dict[str, str]:
     """Hash visible tracked/untracked project content for worker attribution."""
     copy.verify()
-    names = git(copy.path, 'ls-files', '--cached', '--others', '--exclude-standard', '-z')
+    with copy._trusted_index() as env:
+        names = git(copy.path, 'ls-files', '--cached', '--others', '--exclude-standard', '-z', env=env)
     result = {}
     for raw in names.split(b'\0'):
         if not raw:
@@ -403,8 +437,14 @@ def _create_owned(source, head, state, *, on_created=None):
         _check_source_tree(work, fetched)           # defense before any checkout of the tree
         git(work, 'reset', '--soft', 'FETCH_HEAD')  # only this newly-created, owned repository
         git(work, 'reset', '--hard', 'HEAD')       # never used when reopening a copy
+        git(work, 'update-index', '--index-version', '2')
         (work / '.git/FETCH_HEAD').unlink(missing_ok=True)
-        metadata.update(base_head=head, git_digest=_git_digest(work), status='ready',
+        try:
+            evidence = git_integrity.snapshot(work)
+        except git_integrity.GitIntegrityError as error:
+            raise WorkspaceError(str(error), error.code) from None
+        metadata.update(base_head=head, git_digest=_git_digest(work),
+                        git_integrity=evidence, status='ready',
                         changed_files=[], ignored_artifacts=0)
         copy.save()
         lease = workspace_lifecycle.read(copy)
@@ -610,7 +650,7 @@ def _publish_verifications(copy: Workspace) -> None:
 
 
 def verify_checks(copy: Workspace, commands: list[str] | None = None,
-                  *, timeout: float = 120, reuse_checks: bool = False,
+                  *, timeout: float | None = None, reuse_checks: bool = False,
                   force: bool = False) -> dict:
     """Run explicit checks in the original boundary, without a model or secrets.
 
@@ -618,13 +658,21 @@ def verify_checks(copy: Workspace, commands: list[str] | None = None,
     attempt or replace the original status, diff, checks or quality feedback.
     """
     from . import (check_evidence, check_reuse, coordination, development, prepared_inputs,
-                   runtime_preflight, toolchains, verification, worker)
+                   runtime_preflight, toolchains, verification, worker, workspace_lifecycle)
     import uuid
-    if not isinstance(timeout, (int, float)) or not 0 < timeout < float('inf'):
-        raise WorkspaceError('Verification timeout must be a positive finite number.', 64)
+    try:
+        timeout = check_evidence.validate_check_timeout(timeout, allow_none=True)
+    except check_evidence.CheckEvidenceError as error:
+        raise WorkspaceError(error.message, error.code) from None
     if type(reuse_checks) is not bool or type(force) is not bool:
         raise WorkspaceError('Verification reuse and force must be booleans.', 64)
     with copy.lock(recover=True):
+        try:
+            inherited_check_timeout = workspace_lifecycle.execution_check_timeout(copy)
+        except WorkspaceError:
+            raise
+        check_timeout = inherited_check_timeout if timeout is None else timeout
+        probe_timeout = check_evidence.PROBE_CHECK_TIMEOUT if timeout is None else timeout
         selected = copy.metadata.get('verification_commands', []) if commands is None else commands
         if not isinstance(selected, list) or not selected:
             raise WorkspaceError('No declared checks; pass at least one --check COMMAND.', 64)
@@ -671,10 +719,10 @@ def verify_checks(copy: Workspace, commands: list[str] | None = None,
             directory = copy.directory / 'diagnostics'
             before = prepared_inputs.input_snapshot(copy)
             probes = development.run_checks(layout, env, toolchains.probes_for(copy),
-                timeout, directory=directory, phase='verify-probe')
+                timeout=probe_timeout, directory=directory, phase='verify-probe')
             checks = []
             if not any(row['exit_code'] for row in probes):
-                checks = development.run_checks(layout, env, selected, timeout,
+                checks = development.run_checks(layout, env, selected, timeout=check_timeout,
                     directory=directory, phase='verify', copy=copy,
                     reusable=reuse_checks, force=force)
             baseline = copy.metadata.get('baseline_checks', [])

@@ -56,6 +56,13 @@ def _cache_limit(value, flag):
     return number
 
 
+def _check_timeout(value):
+    try:
+        return check_evidence.parse_check_timeout(value)
+    except check_evidence.CheckEvidenceError as error:
+        raise argparse.ArgumentTypeError(error.message) from None
+
+
 def _state_root(value):
     try:
         return state_storage.state_root(value)
@@ -92,13 +99,17 @@ def _retained_patch(value, identifier, inspection):
     from . import workspace_gc, workspace_lifecycle
     state = _state_root(value)
     copy = workspace_gc._load_record(state, identifier)
+    result = inspection.get('result') or {}
+    patch = result.get('patch') if isinstance(result, dict) else None
+    if result.get('schema') != 1:
+        raise workspace.WorkspaceError(
+            'This cleaned workspace has no current result patch; discarded history is '
+            'not a replacement.', 73)
     with workspace_lifecycle.directory(copy) as fd:
         raw = workspace_lifecycle.read_file(
             fd, 'changes.patch', maximum=workspace_gc.MAX_PATCH_BYTES)
     if raw is None:
         raise workspace.WorkspaceError('This cleaned workspace has no retained result patch.', 73)
-    result = inspection.get('result') or {}
-    patch = result.get('patch') if isinstance(result, dict) else None
     if (not isinstance(patch, dict) or patch.get('file') != 'changes.patch'
             or patch.get('bytes') != len(raw)
             or patch.get('sha256') != hashlib.sha256(raw).hexdigest()):
@@ -114,7 +125,14 @@ def _show_inspection(inspection):
     print(json.dumps(inspection['metadata'], indent=2))
     result = inspection.get('result')
     if result:
-        print('Result patch: ' + json.dumps(result.get('patch', {}), sort_keys=True))
+        if result.get('schema') == 2:
+            capture = result.get('capture') or {}
+            print('Result: discarded (' + str(capture.get('reason_code') or '-') + ')')
+            print('Discard reason: ' + str(capture.get('reason') or '-'))
+            print('Historical artifacts: ' +
+                  json.dumps(result.get('historical_artifacts', []), sort_keys=True))
+        else:
+            print('Result patch: ' + json.dumps(result.get('patch', {}), sort_keys=True))
 
 
 def _show_history(inspection):
@@ -134,7 +152,14 @@ def _show_history(inspection):
             print('Event: {} {}'.format(event.get('event', '-'), event.get('at', '-')))
     result = inspection.get('result')
     if result:
-        print('Result patch: ' + json.dumps(result.get('patch', {}), sort_keys=True))
+        if result.get('schema') == 2:
+            capture = result.get('capture') or {}
+            print('Result: discarded (' + str(capture.get('reason_code') or '-') + ')')
+            print('Discard reason: ' + str(capture.get('reason') or '-'))
+            print('Historical artifacts: ' +
+                  json.dumps(result.get('historical_artifacts', []), sort_keys=True))
+        else:
+            print('Result patch: ' + json.dumps(result.get('patch', {}), sort_keys=True))
 
 
 def _show_action(report):
@@ -143,6 +168,8 @@ def _show_action(report):
     print('Reason: ' + str(report.get('reason') or '-'))
     print('Allocated bytes: ' + str(report.get('allocated_bytes', 0)))
     print('Inodes: ' + str(report.get('inodes', 0)))
+    if report.get('discarded'):
+        print('Result: discarded (' + str(report.get('reason_code') or '-') + ')')
 
 
 def _set_project(root, target, **options):
@@ -214,7 +241,11 @@ def main(argv):
                         'cancel', 'recover', 'resume'):
                 sub.add_argument('--json', action='store_true')
             if name in ('finalize', 'cancel'):
-                sub.add_argument('--reason', default='accepted' if name == 'finalize' else 'cancelled')
+                sub.add_argument('--reason', default='accepted' if name == 'finalize' else None)
+                sub.add_argument(
+                    '--discard-result', action='store_true',
+                    help='Cancellation only: after a typed capture failure, durably discard the '
+                         'uncapturable result. Requires an explicit non-default reason.')
             if name == 'prepare':
                 sub.add_argument('--resume-after-failure', action='store_true')
                 sub.add_argument('--recheck-environment', action='store_true',
@@ -223,6 +254,9 @@ def main(argv):
                                       'it never bypasses recovery, admission or sandbox policy.')
                 for option in ('tool', 'copy', 'env'):
                     sub.add_argument('--' + option, action='append', default=[], metavar='NAME=VALUE')
+                sub.add_argument('--cache-dir', action='append', default=[], metavar='REL_DIR',
+                                 help='Declare a mutable cache root strictly inside the owned '
+                                      'copy; repeat as needed.')
                 sub.add_argument('--probe', action='append', default=[], metavar='COMMAND')
                 sub.add_argument('--save-project', action='store_true')
                 sub.add_argument('--cache-max-bytes', metavar='BYTES',
@@ -233,8 +267,12 @@ def main(argv):
                                       '(default 200000).')
             if name == 'verify':
                 sub.add_argument('--check', action='append', metavar='COMMAND')
-                sub.add_argument('--timeout', type=float, default=120,
-                                 help='Per-command ceiling in seconds (default 120).')
+                sub.add_argument('--timeout', type=_check_timeout, default=None,
+                                 metavar='SECONDS',
+                                 help='Per-command ceiling for checks and toolchain probes: '
+                                      '0 < SECONDS <= 86400. Omit to inherit the execution '
+                                      'attempt timeout for checks (fresh jobs 1800, legacy 120); '
+                                      'probes stay at 120 unless this flag is explicit.')
                 sub.add_argument('--reuse-checks', action='store_true',
                                  help='Attest deterministic local checks may reuse validated '
                                       'successful evidence while all inputs are unchanged.')
@@ -340,6 +378,11 @@ def main(argv):
             if args.command == 'diff':
                 from . import workspace_gc
                 inspection = workspace_gc.inspect_workspace(args.state_dir, args.id)
+                result = inspection.get('result')
+                if result is not None and result.get('schema') != 1:
+                    raise workspace.WorkspaceError(
+                        'This workspace has no current result patch; discarded history is '
+                        'not a replacement.', 73)
                 if inspection['execution_present']:
                     copy = workspace.load(_state_root(args.state_dir), args.id)
                     print(copy.diff(), end='')
@@ -350,9 +393,23 @@ def main(argv):
                 from . import workspace_gc
                 copy = workspace_gc._load_record(_state_root(args.state_dir), args.id)
                 if args.command == 'finalize':
+                    if args.discard_result:
+                        raise workspace.WorkspaceError(
+                            '--discard-result is valid only for workspace cancel.', 64)
                     report = workspace_gc.finalize(copy, reason=args.reason)
                 elif args.command == 'cancel':
-                    report = workspace_gc.cancel(copy, reason=args.reason)
+                    reason = args.reason
+                    if reason is None:
+                        if args.discard_result:
+                            raise workspace.WorkspaceError(
+                                'Explicit discard requires --reason with a non-default explanation.', 64)
+                        reason = 'cancelled'
+                    if (args.discard_result
+                            and (not reason.strip() or reason.strip().lower() == 'cancelled')):
+                        raise workspace.WorkspaceError(
+                            'Explicit discard requires a non-default reason.', 64)
+                    report = workspace_gc.cancel(
+                        copy, reason=reason, discard_result=args.discard_result)
                 elif args.command == 'recover':
                     report = workspace_gc.recover(copy)
                 else:
@@ -373,7 +430,8 @@ def main(argv):
             copy = (workspace.create(args.path, args.state_dir) if args.command == 'create'
                     else workspace.load(args.state_dir, args.id))
             if args.command == 'prepare':
-                declarative = bool(args.tool or args.copy or args.env or args.probe or args.save_project)
+                declarative = bool(args.tool or args.copy or args.env or args.cache_dir
+                                   or args.probe or args.save_project)
                 if declarative:
                     def pairs(values):
                         result = []
@@ -389,6 +447,7 @@ def main(argv):
                     environment = dict(pairs(args.env))
                     copies = pairs(args.copy)
                     toolchains.prepare(copy, tools=tools, copies=copies, environment=environment,
+                        cache_dirs=args.cache_dir,
                         probes=args.probe, save_project=args.save_project,
                         recover=args.resume_after_failure,
                         recheck_environment=args.recheck_environment,

@@ -248,6 +248,50 @@ class RecipeRecoveryDiagnosticsTests(RecipeRecoveryFixture):
         self.assertEqual(source_file.read_text(), 'sdk.dir=prepared\n')
         self.assertFalse((fresh.path / 'build/local.properties').exists())
 
+    def test_v2_cache_dirs_replay_and_failed_replay_preserves_recipe(self):
+        tool = self.software()
+        source_file = self.input_file()
+        toolchains.prepare(
+            self.copy, tools={'sdk': tool},
+            copies=[(source_file, 'gradle-home/local.properties')],
+            cache_dirs=['gradle-home', 'gradle-home/caches'],
+            environment={'GRADLE_USER_HOME': '{workspace}/gradle-home'},
+            save_project=True)
+        recipe_file = self.recipe_path(self.copy)
+        before = recipe_file.read_bytes()
+        payload = json.loads(before)
+        self.assertEqual(payload['version'], 2)
+        self.assertEqual(payload['cache_dirs'], ['gradle-home'])
+
+        fresh = self.fresh_copy()
+        with fresh.lock():
+            replay = toolchains.apply_saved_recipe(fresh)
+        self.assertTrue(replay['applied'])
+        self.assertEqual(replay['cache_dirs'], ['gradle-home'])
+        self.assertTrue((fresh.path / 'gradle-home').is_dir())
+        self.assertEqual((fresh.path / 'gradle-home/local.properties').read_text(),
+                         'sdk.dir=prepared\n')
+        self.assertEqual(
+            toolchains.environment_for(fresh, {'PATH': '/usr/bin'})['GRADLE_USER_HOME'],
+            str(fresh.path / 'gradle-home'))
+        exclude = (fresh.path / '.git/info/exclude').read_text().splitlines()
+        self.assertIn('/gradle-home', exclude)
+
+        cached = Path(payload['tools']['sdk']['source'])
+        changed = cached / 'lib/data.txt'
+        original_mode = stat.S_IMODE(changed.stat().st_mode)
+        changed.chmod(0o600)
+        changed.write_bytes(b'evil\n')
+        changed.chmod(original_mode)
+        failed = self.fresh_copy()
+        with self.assertRaises(toolchains.ToolchainError) as caught:
+            with failed.lock():
+                toolchains.apply_saved_recipe(failed)
+        self.assertIn('content does not match its manifest', str(caught.exception))
+        self.assertEqual(recipe_file.read_bytes(), before)
+        self.assertFalse((failed.path / 'gradle-home').exists())
+        self.assertNotIn('toolchain', self.reloaded(failed).metadata)
+
     def test_replay_wrapper_preserves_capacity_and_security_error_codes(self):
         toolchains.prepare(self.copy, tools={'sdk': self.software()}, save_project=True)
         fresh = self.fresh_copy()

@@ -142,7 +142,7 @@ Use a clean `dist` directory for each release. The script creates private tempor
 
 This local build validates a *candidate*. For an already-tagged release, publish the downloaded release artifacts with the reusable procedure above instead of a fresh local build.
 
-The CI installer matrix covers Python 3.11 and 3.13; the unit/build matrix also covers 3.12. These checks validate package lifecycle, not provider credentials or complete host sandbox installation. Use `deepseek-team setup` on a supported Linux host for local readiness.
+The CI unit/build matrix covers Python 3.11 through 3.14; the installer-lifecycle job exercises pip, pipx and uv. These checks validate package lifecycle, not provider credentials or complete host sandbox installation. Use `deepseek-team setup` on a supported Linux host for local readiness.
 
 ## TestPyPI rehearsal
 

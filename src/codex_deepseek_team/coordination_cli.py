@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 import sys
 
-from . import coordination
+from . import coordination, settings
 
 
 MAX_FEEDBACK_BYTES = 64 * 1024
@@ -114,12 +114,23 @@ def main(argv):
         '--confirmed-stopped', action='store_true', required=True,
         help='Attest that remaining worker processes were stopped and verified stopped.')
 
+    cancel = subs.add_parser(
+        'cancel', help='Cancel one planned assignment before allocation; live launches return 75.')
+    cancel.add_argument('--path', type=Path, default=Path.cwd())
+    cancel.add_argument('--task', required=True)
+    cancel.add_argument('--assignment', required=True)
+    cancel.add_argument('--evidence', required=True)
+
     finalize = subs.add_parser('finalize', help='Finalize one reviewed job and immediately remove its execution copy.')
     finalize.add_argument('--path', type=Path, default=Path.cwd())
     finalize.add_argument('--task', required=True)
     finalize.add_argument('--assignment', required=True)
     finalize.add_argument('--evidence', required=True)
     finalize.add_argument('--cancel', action='store_true', help='Explicitly cancel/reject this stopped job.')
+    finalize.add_argument(
+        '--discard-result', action='store_true',
+        help='Cancellation only: after a typed capture failure, durably discard the '
+             'uncapturable result. Requires --cancel and explicit non-default evidence.')
 
     complete = subs.add_parser(
         'complete', help='Close a task whose distribution and recorded outcomes are terminal.')
@@ -163,8 +174,12 @@ def main(argv):
             print(coordination.summary(task))
             return 0
         if args.command == 'finalize':
-            task = coordination.finalize_assignment(args.path, args.task, args.assignment,
-                                                    args.evidence, cancelled=args.cancel)
+            if args.discard_result and not args.cancel:
+                raise coordination.CoordinationError(
+                    '--discard-result is valid only with --cancel.', 64)
+            task = coordination.finalize_assignment(
+                args.path, args.task, args.assignment, args.evidence,
+                cancelled=args.cancel, discard_result=args.discard_result)
             print(coordination.summary(task))
             return 0
         if args.command == 'result':
@@ -176,6 +191,11 @@ def main(argv):
             task = coordination.abandon_assignment(
                 args.path, args.task, args.assignment, args.evidence,
                 confirmed_stopped=args.confirmed_stopped)
+            print(coordination.summary(task))
+            return 0
+        if args.command == 'cancel':
+            task = coordination.cancel_unstarted_assignment(
+                args.path, args.task, args.assignment, args.evidence)
             print(coordination.summary(task))
             return 0
         if args.command == 'complete':
@@ -190,6 +210,7 @@ def main(argv):
                 raise coordination.CoordinationError('No coordination task for that session.', 66)
         else:
             raise coordination.CoordinationError('status requires --task or --session.', 64)
+        coordination._validate_retained_results(args.path, task['id'])
         coordination.sync_routing_feedback(args.path, task['id'])
         coordination.sync_lessons_feedback(args.path, task['id'])
         if args.json:
@@ -203,6 +224,9 @@ def main(argv):
                 for issue in issues:
                     print('- ' + issue)
         return 0
+    except settings.SettingsError as error:
+        print(str(error), file=sys.stderr)
+        return 78
     except coordination.CoordinationError as error:
         message = (_INVALID_TASK_ID
                    if error.message == "Invalid coordination task id."

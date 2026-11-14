@@ -137,6 +137,8 @@ class CheckEvidenceTests(unittest.TestCase):
                                 directory=directory)
             self.assertEqual(rows[0]['exit_code'], 124)
             self.assertTrue(rows[0]['timed_out'])
+            self.assertEqual(rows[0]['check_timeout_seconds'], 1800.0)
+            self.assertEqual(rows[0]['effective_timeout_seconds'], 0.0)
             self.assertIsNone(rows[0]['stdout_path'])
             self.assertIsNone(rows[0]['stderr_path'])
             self.assertFalse(marker.exists())
@@ -158,6 +160,8 @@ class CheckEvidenceTests(unittest.TestCase):
             self.assertFalse(row['stderr_truncated'])
             self.assertFalse(row['timed_out'])
             self.assertFalse(row['launch_failed'])
+            self.assertEqual(row['check_timeout_seconds'], 1800.0)
+            self.assertEqual(row['effective_timeout_seconds'], 1800.0)
             for key in ('stdout_path', 'stderr_path'):
                 value = row[key]
                 self.assertIsInstance(value, str)
