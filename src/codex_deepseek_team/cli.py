@@ -53,9 +53,14 @@ def main(argv=None):
     if sys.platform != 'linux':
         print('This release supports Linux with Python 3.11+ and Codex and/or Claude Code.', file=sys.stderr)
         return 78
+    from . import hook_refresh
+    hook_refresh.refresh_for_cli(argv)
     if argv and argv[0] == 'gc':
         from . import gc_cli
         return gc_cli.main(argv[1:])
+    if argv and argv[0] == 'update':
+        from . import updates
+        return updates.main(argv[1:])
     from . import activation, claude_config, config, doctor, sandbox, settings, worker
     if argv and argv[0] == 'coordinator-hook':
         from . import coordinator_hooks
@@ -115,6 +120,13 @@ def main(argv=None):
         hook_action = hooks_commands.add_parser(name)
         hook_action.add_argument('--runtime', choices=['codex', 'claude', 'both', 'auto'], default='codex',
                                  help='Coordinator hooks to manage; default codex.')
+    refresh = hooks_commands.add_parser(
+        'refresh', help='Refresh already configured hooks; never installs a new integration.')
+    refresh.add_argument('--runtime', choices=['codex', 'claude', 'both', 'auto'], default='auto',
+                         help='Existing coordinator hooks to refresh; default auto.')
+    refresh.add_argument('--notify', action='store_true',
+                         help='Always report restart and native /hooks review guidance.')
+    refresh.add_argument('--json', action='store_true', help='Print one JSON report to stdout.')
     sandbox_cmd = commands.add_parser('sandbox', help='Inspect or manage Linux Bubblewrap/AppArmor isolation.')
     sandbox_commands = sandbox_cmd.add_subparsers(dest='sandbox_command', required=True)
     sandbox_commands.add_parser('status', help='Probe Bubblewrap and the effective AppArmor/userns backend.')
@@ -124,6 +136,7 @@ def main(argv=None):
     commands.add_parser('coordination', help='Persistent coordination task state; use coordination --help.')
     commands.add_parser('lessons', help='Inspect the private rework journal and apply reviewed delegation lessons.')
     commands.add_parser('gc', help='Explain or apply safe cleanup of owned workspace copies; use gc --help.')
+    commands.add_parser('update', help='Upgrade the installed package and refresh configured coordinator hooks; use update --help.')
     commands.add_parser('workspace', help='Prepare and inspect owned development copies; use workspace --help.')
     commands.add_parser('doctor', help='Check local setup; use doctor --help for runtime/live options.')
     commands.add_parser('worker', help='Run a worker; use worker --help for runtime/read/write options.')
@@ -183,6 +196,13 @@ def main(argv=None):
                 print('Key available; value omitted.' if present else 'No key configured.')
                 return 0 if present else 78
         elif args.command == 'hooks':
+            if args.hooks_command == 'refresh':
+                refresh_argv = ['--runtime', args.runtime]
+                if args.notify:
+                    refresh_argv.append('--notify')
+                if args.json:
+                    refresh_argv.append('--json')
+                return hook_refresh.main(refresh_argv)
             healthy = True
             for runtime in _runtimes(args.runtime):
                 if runtime == 'claude':

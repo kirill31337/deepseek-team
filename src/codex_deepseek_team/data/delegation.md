@@ -13,6 +13,31 @@ inspect their results before integration. Check again before every new assignmen
 deepseek-team config show --effective --instructions --runtime {runtime}
 ```
 
+### Package updates and required actions
+
+When `deepseek-team update` is available, prefer it for package upgrades. It
+replaces the package through its existing manager and refreshes already configured
+hooks from the new package in a fresh process. An installation that predates that
+command must first upgrade once through pipx, uv or its virtual environment's pip.
+The command becomes available only after that package upgrade.
+
+After any direct pip, pipx or uv package-manager update, run the new package's fresh
+check before reporting completion, including in noninteractive and JSON work.
+
+```bash
+deepseek-team hooks refresh --runtime auto --notify --json
+```
+
+Wheels have no standard post-install callback, so the direct manager's own output
+cannot carry a DeepSeek Team notice. Read the refresh report and relay every entry
+in `required_actions` faithfully to the user in their language. Explain the exit
+code. Exit `3` with `status: "action_required"` means the package or local refresh
+completed with pending user actions. `0` means complete and `78` means failure. A
+`--notify` refresh and every changed hook definition require the user to start a new
+session and review DeepSeek Team in `/hooks`, approving native trust if prompted.
+State that native review and user confirmation remain pending until the user acts. Surface these actions even when the update
+was automated or its streams were redirected.
+
 The session/prompt bootstrap checks private worker storage before opening a
 coordination task. Before the first worker in a session, confirm local readiness
 with `deepseek-team doctor --runtime {runtime} --offline`, including read-only

@@ -432,15 +432,31 @@ These checks make no provider requests. Local readiness does not validate the ke
 
 ## Update and uninstall
 
-Upgrade the released package through the same manager, then run `setup` once for each coordinator runtime you installed:
+From 0.12.0 onward, `deepseek-team update` upgrades the installed package through the same manager and then refreshes already configured coordinator hooks from the new package in a fresh process:
+
+```bash
+deepseek-team update --runtime auto
+deepseek-team update --json          # one JSON report on stdout; notices on stderr
+deepseek-team update --manager uv --version 0.12.0 --runtime both
+```
+
+It supports pip inside a virtual environment, pipx and uv, and accepts `--manager auto|pip|pipx|uv`, `--runtime auto|codex|claude|both` (default `auto`), `--version VERSION` and `--json`. Ambiguous, editable or local-source installations, and a conflicting explicit manager, are refused before replacement with recovery guidance. Exit status `0` means the package update and hook refresh completed; `3` means they completed with `status` `action_required` and entries in `required_actions`; `78` means failure, including an incomplete post-upgrade refresh. The report includes `schema_version`, `version`, `status`, `hooks`, `required_actions` and `requires_user_action`.
+
+Existing installations must upgrade once through the manager they already use, because the `update` command appears only with the new package:
 
 ```bash
 pipx upgrade deepseek-team
-deepseek-team setup --runtime codex --no-key   # or claude / both
+# or: uv tool upgrade deepseek-team
+# or, inside an activated venv: python -m pip install --upgrade deepseek-team
+
+deepseek-team hooks refresh --runtime auto --notify --json
+deepseek-team setup --runtime codex --no-key   # optional full setup/hook refresh
 deepseek-team doctor --runtime codex --offline
 ```
 
-Upgrading from 0.8.7 or 0.8.8 uses the same steps. `setup` updates the selected user-level hooks and refreshes both managed instruction files (`AGENTS.md` and `CLAUDE.md`) in the repository you run it from when they are already attached. Every other attached project refreshes its own blocks automatically on its next session or prompt, so repeating `init` in each existing project is no longer required; run `init` only to attach a project for the first time or to deliberately repair its managed blocks. Only the package-owned blocks are rewritten, so your own instruction text and saved settings are preserved. Installing or upgrading with pip, pipx or uv does not run setup automatically. Run `setup` to update hook definitions; native trust is reviewed separately in the coordinator. A project that stays closed refreshes when you next open it. With uv, use `uv tool upgrade deepseek-team`. In a virtual environment, use its `python -m pip install --upgrade deepseek-team`. Keep one install channel per machine; a local-clone pipx installation is refreshed with `pipx install --force .` from the updated clone.
+A wheel has no standard post-install callback, so pip, pipx or uv output alone cannot print a DeepSeek Team notice. Direct-manager upgrades are followed by a first-use refresh the next time DeepSeek Team runs, but scripts and AI agents must run the explicit `deepseek-team hooks refresh --runtime auto --notify --json` from the newly installed package before reporting completion, even when noninteractive or using `--json`. Relay every pending `required_actions` entry and state that user confirmation remains pending; JSON stdout stays one valid object while notices may also be written to stderr. A `--notify` refresh, and any changed hook definition, asks you to start a new session and review DeepSeek Team in `/hooks`, approving native trust if prompted. DeepSeek Team cannot grant that trust for you, and trust remains pending until you review it.
+
+`setup` updates the selected user-level hooks and refreshes both managed instruction files (`AGENTS.md` and `CLAUDE.md`) in the repository you run it from when they are already attached. Every other attached project refreshes its own blocks automatically on its next session or prompt, so repeating `init` in each existing project is no longer required; run `init` only to attach a project for the first time or to deliberately repair its managed blocks. Only the package-owned blocks are rewritten, so your own instruction text and saved settings are preserved. Installing or upgrading with pip, pipx or uv does not run setup automatically; the new package refreshes already configured hooks on first use. Run `setup` when you want a full setup pass. A project that stays closed refreshes when you next open it. Keep one install channel per machine; a local-clone pipx installation is refreshed with `pipx install --force .` from the updated clone.
 
 To remove DeepSeek Team, detach each project before uninstalling. If you also want to delete the saved DeepSeek key, run `deepseek-team auth remove` while the command is still installed.
 

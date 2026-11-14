@@ -199,9 +199,12 @@ def run(runtimes, *, no_key=False, with_sandbox=False):
     print('Fresh Auto access is read-only: workers inspect and report, they do not change the project.')
     print('To let them implement inside an isolated copy, opt in explicitly from that project:')
     print('deepseek-team config set --project --access full-access')
-    print('After upgrading the package, rerun setup once per installed runtime to refresh the '
-          'user-level hook definitions. New sessions then refresh the managed blocks in each '
-          'attached project automatically.')
+    print('After upgrading, run deepseek-team update to replace the package and refresh '
+          'configured hooks together, or rerun setup once per installed runtime. If you '
+          'upgraded directly with a package manager, run deepseek-team hooks refresh --runtime '
+          'auto --notify --json from the new package, then start a new session and review '
+          'DeepSeek Team in /hooks; setup cannot grant native trust. New sessions then refresh '
+          'the managed blocks in each attached project automatically.')
     print('Use init only for a first attachment: '
           f'deepseek-team init --coordinator {runtime_arg} /path/to/project')
     return 0

@@ -118,8 +118,13 @@ def _read(home):
         raise ConfigError('Claude settings.json is invalid; existing content was preserved.') from None
     if not isinstance(data, dict) or not isinstance(data.get('hooks', {}), dict):
         raise ConfigError('Claude settings.json and its hooks section must be objects.')
-    if any(not isinstance(groups, list) for groups in data.get('hooks', {}).values()):
-        raise ConfigError('Claude hook event entries must be arrays; existing content was preserved.')
+    for groups in data.get('hooks', {}).values():
+        if not isinstance(groups, list):
+            raise ConfigError('Claude hook event entries must be arrays; existing content was preserved.')
+        for group in groups:
+            if not isinstance(group, dict) or not isinstance(group.get('hooks'), list):
+                raise ConfigError('Claude hook groups and handlers must be arrays; '
+                                  'existing content was preserved.')
     return path, raw, data
 
 
@@ -221,6 +226,43 @@ def _absolute_owned_command(handler):
     except OSError:
         return None
     return command
+
+
+def owned(home=None):
+    """Whether any package-owned handler exists, including a stale definition."""
+    _, _, data = _read(claude_home() if home is None else home)
+    hooks = data.get('hooks', {})
+    return any(_owned(handler) for groups in hooks.values()
+               for group in groups for handler in group.get('hooks', []))
+
+
+def disabled(home=None):
+    """The explicit native ``disableAllHooks`` state, preserved by refresh."""
+    _, _, data = _read(claude_home() if home is None else home)
+    return bool(data.get('disableAllHooks'))
+
+
+def owned_entrypoints(home=None):
+    """Executable absolute entrypoints recorded by package-owned handlers.
+
+    This is ownership evidence only: it neither resolves PATH nor adopts a
+    foreign command. It lets an already configured refresh migrate a stale
+    definition when the console script is still available but not on PATH.
+    """
+    _, _, data = _read(claude_home() if home is None else home)
+    found = []
+    for groups in data.get('hooks', {}).values():
+        for group in groups:
+            for handler in group.get('hooks', []):
+                if not _owned(handler):
+                    continue
+                command = _absolute_owned_command(handler)
+                if command is None:
+                    continue
+                entrypoint = Path(shlex.split(command)[0])
+                if entrypoint not in found:
+                    found.append(entrypoint)
+    return tuple(found)
 
 
 def status(home=None, executable=None):

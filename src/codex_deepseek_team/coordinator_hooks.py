@@ -12,7 +12,7 @@ import uuid
 
 from . import (activation, coordination, coordinator_activity, coordinator_context,
                  lessons, overhead_contract, project, scope_matching, settings,
-                 state_storage)
+                 state_storage, upgrade_notices)
 from .shell_mutation import classify_shell_mutation_scoped
 
 
@@ -290,7 +290,7 @@ def _unbound_event(payload: dict, event: str, resolution, runtime: str) -> dict:
     return _deny(problem) if problem else {}
 
 
-def handle(payload: dict, runtime: str = 'codex') -> dict:
+def _handle(payload: dict, runtime: str = 'codex') -> dict:
     if runtime not in ('codex', 'claude'):
         raise ValueError('Unsupported coordinator runtime.')
     # Claude also invokes user hooks inside native subagents. The main thread
@@ -607,6 +607,62 @@ def handle(payload: dict, runtime: str = 'codex') -> dict:
     return {}
 
 
+def _hook_refresh_notice(payload, runtime: str) -> str:
+    """Lifecycle-only first-use refresh for the runtime that delivered the hook."""
+    if not isinstance(payload, dict):
+        return ''
+    event = payload.get('hook_event_name')
+    if event not in ('SessionStart', 'UserPromptSubmit'):
+        return ''
+    # Claude invokes user hooks in native subagents too; only the main thread
+    # may touch the coordinator's user-level integration.
+    if runtime == 'claude' and payload.get('agent_id'):
+        return ''
+    from . import hook_refresh
+    try:
+        report = hook_refresh.refresh_installed(runtime)
+    except Exception as error:
+        action = hook_refresh._repair_action(runtime, error)
+        return hook_refresh.render_required_actions({'required_actions': [action]})
+    # Explicit CLI refresh explains how to create a missing integration. A
+    # lifecycle hook, by contrast, refreshes only an integration that already
+    # exists and remains inert when the runtime was never configured.
+    report = dict(
+        report,
+        hooks=[row for row in report.get('hooks', [])
+               if row.get('status') != 'missing'],
+        required_actions=[action for action in report.get('required_actions', [])
+                          if not (action.get('runtime') == runtime
+                                  and action.get('code') == 'install_hooks')],
+    )
+    return hook_refresh.render_required_actions(report)
+
+
+def _merge_hook_refresh_notice(result, notice: str, event: str):
+    if not notice:
+        return result
+    if not isinstance(result, dict):
+        return result
+    specific = result.get('hookSpecificOutput')
+    if isinstance(specific, dict):
+        existing = specific.get('additionalContext')
+        specific['additionalContext'] = (
+            notice + ('\n' + existing if isinstance(existing, str) and existing else ''))
+        return result
+    if result:
+        # Keep non-context decisions/protocol objects byte-for-byte equivalent.
+        return result
+    return _context(notice, event)
+
+
+def handle(payload: dict, runtime: str = 'codex') -> dict:
+    """Run the coordination gate, then add lifecycle-only hook refresh notices."""
+    result = _handle(payload, runtime)
+    event = payload.get('hook_event_name') if isinstance(payload, dict) else None
+    notice = _hook_refresh_notice(payload, runtime)
+    return _merge_hook_refresh_notice(result, notice, event)
+
+
 _CLAUDE_EVENTS = frozenset({
     'SessionStart', 'UserPromptSubmit', 'PreToolUse', 'Stop', 'SubagentStop',
 })
@@ -627,6 +683,25 @@ def _error_detail(error) -> str:
 def _codex_hook_error(error) -> int:
     print(json.dumps({"systemMessage": f"DeepSeek Team hook error: {type(error).__name__}"}))
     return 1
+
+
+def _upgrade_receipt_diagnostic(error) -> str:
+    detail = ' '.join(str(error).split())
+    if len(detail) > 300:
+        detail = detail[:297] + '...'
+    return ('DeepSeek Team could not record the in-session upgrade notice receipt: '
+            + detail + '. The native response above was already delivered; the notice '
+            'remains pending and will be retried on a later hook event. Do not retry '
+            'this hook manually or print a second JSON response.')
+
+
+def _upgrade_notice_diagnostic(runtime: str) -> str:
+    return ('DeepSeek Team in-session upgrade notice check failed for ' + runtime
+            + '. The normal hook response was preserved. Run '
+              '`deepseek-team hooks refresh --runtime ' + runtime + ' --notify --json` '
+              'in a fresh process, relay every required user action faithfully, and '
+              'report its results to the user; native hook review/trust remains pending. '
+              'Do not print a second JSON response.')
 
 
 def _claude_input_error(error) -> int:
@@ -693,8 +768,24 @@ def main(argv=None) -> int:
                 return _claude_processing_error(
                     ValueError('unsupported or missing hook event'), payload)
         result = handle(payload, runtime=args.runtime)
+        notice = None
+        try:
+            notice = upgrade_notices.prepare_notice(payload, args.runtime)
+            if notice is not None:
+                result = upgrade_notices.annotate_result(
+                    result, payload, args.runtime, notice)
+        except Exception:
+            # A receipt/annotation problem must never replace an existing tool
+            # decision or prevent its one native response from being published.
+            notice = None
+            print(_upgrade_notice_diagnostic(args.runtime), file=sys.stderr, flush=True)
         if result:
-            print(json.dumps(result))
+            print(json.dumps(result), flush=True)
+        if notice is not None and result:
+            try:
+                upgrade_notices.mark_delivered(notice)
+            except Exception as error:
+                print(_upgrade_receipt_diagnostic(error), file=sys.stderr, flush=True)
         return 0
     except Exception as error:
         return (_claude_processing_error(error, payload) if args.runtime == 'claude'

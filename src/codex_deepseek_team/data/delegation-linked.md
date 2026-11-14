@@ -15,6 +15,8 @@ deepseek-team status
 deepseek-team config show --effective --instructions --runtime {runtime}
 ```
 
+After upgrades run `deepseek-team hooks refresh --runtime auto --notify --json`. Relay all `required_actions`, including pending `/hooks` review.
+
 The session/prompt bootstrap also checks private worker storage. Before the first
 worker, run `deepseek-team doctor --runtime {runtime} --offline`, even for read-only
 work. If storage is a symbolic link, has a foreign owner or unsafe permissions,

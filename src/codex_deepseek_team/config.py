@@ -165,6 +165,50 @@ def _owned_codex_hook(handler):
     return isinstance(handler, dict) and handler.get('command') == CODEX_HOOK_COMMAND
 
 
+def _read_codex_hooks(home):
+    """Read hooks.json for ownership inspection without repairing or writing it."""
+    raw = read_regular(Path(home) / 'hooks.json')
+    if raw is None:
+        return None
+    try:
+        data = json.loads(raw.decode('utf-8'))
+    except (ValueError, UnicodeError):
+        raise ConfigError('Codex hooks.json is invalid; existing content was preserved.') from None
+    if not isinstance(data, dict):
+        raise ConfigError('Codex hooks.json must contain an object.')
+    hooks = data.get('hooks')
+    if hooks is None:
+        hooks = {}
+    if not isinstance(hooks, dict):
+        raise ConfigError('Codex hooks.json hooks must be an object.')
+    for groups in hooks.values():
+        if not isinstance(groups, list):
+            raise ConfigError('Codex hooks.json event entries must be arrays.')
+        for group in groups:
+            if not isinstance(group, dict):
+                raise ConfigError('Codex hooks.json hook groups must be objects.')
+            handlers = group.get('hooks')
+            if not isinstance(handlers, list):
+                raise ConfigError('Codex hooks.json hook handlers must be arrays.')
+    return data
+
+
+def codex_hooks_owned(home):
+    """Whether hooks.json contains any package-owned record, stale or current.
+
+    Ownership is deliberately independent of the current matcher/handler shape so
+    refresh can migrate older definitions. Missing or foreign-only files are not
+    owned; malformed and unsafe files raise ``ConfigError`` without modification.
+    """
+    data = _read_codex_hooks(home)
+    if data is None:
+        return False
+    hooks = data.get('hooks') or {}
+    return any(_owned_codex_hook(handler)
+               for groups in hooks.values() for group in groups
+               for handler in group.get('hooks', []))
+
+
 def _strip_codex_hooks(data):
     hooks = data.get('hooks', {})
     if hooks is None:
