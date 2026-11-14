@@ -66,9 +66,9 @@ Files are `README.md`, `README.ru.md`, `src/codex_deepseek_team/data/delegation.
 - [x] Exercise normal public commands in isolated homes, including code 3, JSON/stderr, disabled hooks, malformed config, repeat updates and a real old-to-new wheel replacement with each manager.
 - [x] Run `PYTHONPATH=src python3 -m unittest discover -s tests -v` and required available native Codex/Claude controls. Diagnose and fix recoverable failures through routed correction work.
 - [x] Build wheel/sdist, run strict metadata checks and real pip/pipx/uv install/replacement verification. Review artifact contents and user-change preservation.
-- [ ] Commit only accepted scoped files, push and wait for relevant CI. Create the immutable version tag after green verification.
-- [ ] Monitor tagged publication, publish exact verified release artifacts to PyPI and verify GitHub/PyPI digests and a clean registry install.
-- [ ] Finalize owned worker copies, record all terminal outcomes and close coordination. Report release links, usage, required user actions and accepted contributions.
+- [x] Commit only accepted scoped files, push and wait for relevant CI. Create the immutable version tag after green verification.
+- [x] Monitor tagged publication, publish exact verified release artifacts to PyPI and verify GitHub/PyPI digests and a clean registry install.
+- [x] Finalize owned worker copies, record all terminal outcomes and close coordination. Report release links, usage, required user actions and accepted contributions.
 
 ## Task 5 — In-session upgrade notices
 
@@ -97,3 +97,15 @@ Files are `src/codex_deepseek_team/upgrade_notices.py`, a bounded post-input/pre
 - Real pip, pipx and uv installation, replacement and uninstall checks passed with external sentinels preserved. All three managers passed direct 0.11.0-to-0.12.0 upgrades and fresh-process updater transitions from a private prerelease fixture. Installed-wheel malformed-config and missing-entrypoint controls retained user data, returned 78 and kept notified recovery guidance.
 - Final wheel/sdist build and strict Twine checks passed. All 67 installed package files match the reviewed source, and all 188 sdist package/test files match the integration tree. Publication will use the exact tagged CI assets, not these local candidates or the private fixture.
 - All seven DeepSeek assignments have accepted reviewed outcomes and their four logical jobs plus the review job are finalized with safe capture and cleaned execution trees. Original rework/quality history remains intact. The coordinator reviewed lessons and added the bounded maintenance-failure contract rule.
+
+## Release acceptance — 2026-11-14
+
+- Accepted implementation commit `946ffaec5310c3a37170949e9352481f840a2ec2` contains exactly the 20 reviewed paths. Preexisting `AGENTS.md`, private attachments and concurrent legacy-cancellation work were excluded and preserved.
+- Exact main CI passed Tests `43618614934` across Python 3.11–3.14, Delegation verification `43618614975` and Release verification `43618614855` before the annotated immutable tag `v0.12.0` was created.
+- Tag publication `43619481364`, tagged Tests `43619481404` and tagged Delegation verification `43619481410` all passed on the same commit. Publisher discovery ran 2226 tests with 94 environment-dependent skips; Python 3.14 ran 2226 tests with 31 skips. Required real native and Gradle checks are separately covered by the full host and exact-current verification recorded above.
+- GitHub release `445459373` is public at https://github.com/kirill31337/deepseek-team/releases/tag/v0.12.0. PyPI OIDC was disabled, so the coordinator uploaded the exact verified GitHub assets through the existing private-token configuration to the official PyPI endpoint. No candidate or private fixture was uploaded, and the tag was not moved.
+- Wheel `deepseek_team-0.12.0-py3-none-any.whl` is 424018 bytes with SHA256 `6d4ef2261e9f94a0b28590459368b9e3bfb608c16d52e6529b41b8b10d021b81`. Sdist `deepseek_team-0.12.0.tar.gz` is 960755 bytes with SHA256 `d1e4f8f743ced6d43e23db272a20e405ca532fc68447767e2a01c712d58a4e45`.
+- GitHub REST digests, official PyPI metadata hashes and sizes agree. All 67 wheel package files and 232 tracked sdist files match the exact tagged commit. Strict Twine checks passed on those downloaded assets.
+- A clean virtual environment installed 0.12.0 from the official PyPI index, checked every installed package file against the release wheel, exercised version/help and notified refresh JSON, then completed a real unified pip update. An initial Simple-index propagation delay briefly exposed the old version list while version JSON was already available; after the index exposed 0.12.0, the same isolated verification completed successfully without package changes or another upload.
+- Both coordinator-owned verification worktrees were removed normally after proving source reachability and retaining private manifests, patches and verification evidence. Foreign worktree registrations were preserved. All DeepSeek worker jobs were safely finalized, and the native GitHub observer confirmed exact tag identity, green workflows and public asset metadata.
+- User-required restart/session and native `/hooks` review remain explicit actions in notified update/refresh output, including AI and noninteractive paths. No user confirmation is inferred or granted by the package.
