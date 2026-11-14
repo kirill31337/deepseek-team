@@ -219,12 +219,12 @@ version declarations/release note только на разрешённом эт�
   сохранение user config/AGENTS и отсутствие secrets/raw logs/unrelated product code.
 - [x] Обновить shipped guidance/help/docs, сохранив unrelated инструкции; явно описать
   destructive discard и запрет его автоматического выбора агентом.
-- [ ] Полный unittest discovery, CI supported matrix+3.14, native Codex/Claude fixtures;
+- [x] Полный unittest discovery, CI supported matrix+3.14, native Codex/Claude fixtures;
   обязательный skip покрыть coordinator execution.
 - [x] Real namespace capture/cleanup, Java/JDK и подготовленный offline Gradle fixture
   с закреплёнными dependencies; результат не приписывать чужому проекту.
 - [x] Независимое review, устранение подтверждённых дефектов, quality/rework ledger.
-- [ ] Только при разрешённом выпуске: wheel/sdist→strict Twine→pip/pipx/uv lifecycle→CI→
+- [x] Только при разрешённом выпуске: wheel/sdist→strict Twine→pip/pipx/uv lifecycle→CI→
   tag/release→registry hashes→clean install. Версию выбрать при исполнении.
 - [ ] Принятые/cancelled owned jobs финализировать, чужие/непринятые сохранить;
   GC сначала dry-run. Закрыть все coordination outcomes.
@@ -472,3 +472,24 @@ T1–T6 принимаются отдельно по reproducer, negative contro
   Production hashing сохраняет действующий формат. Host check-reuse65 и
   Python3.14 ineligible13 прошли. Исправление относится к minor fixture rework
   внутри зарегистрированного T4 scope. Новый main CI выполняет полную матрицу.
+- Main `0b46c3be` прошёл Tests на Python 3.11–3.14, Delegation verification и
+  Release verification. Tag `v0.11.0` также прошёл Tests и Delegation verification.
+  Его Publish job остановился в saved-copy fixture на Ubuntu24 при недоступном
+  Bubblewrap. Старый контроль искал текст namespace ошибки вместо нового
+  структурированного CaptureFailure reason_code. Production сохраняет копию.
+- Для 0.11.0 использован successful Release verification artifact ID 14114917290
+  того же exact tagged commit. Проверены ZIP digest и соответствие package bytes
+  в wheel и 225 source files в sdist исходному тегу. Оба файла прошли strict Twine
+  и повторный pip/pipx/uv lifecycle. GitHub release создан координатором вручную
+  с описанием provenance. Затем те же файлы загружены Twine в официальный PyPI.
+- GitHub и PyPI SHA-256 совпали. Wheel имеет
+  `3592d6394396cf19c8e8cd98743533fb1fb357a06867533700464a4abd1bd23f`, sdist имеет
+  `56513fa7d60f3ac8a6d562f382530699b20bd23cadd769ddcb2727c51e4fec96`.
+  Чистая установка из official PyPI проверила все package bytes против release
+  wheel, version/help/resources и оба установленных coordinator-hook protocols.
+- [GitHub 0.11.0](https://github.com/kirill31337/deepseek-team/releases/tag/v0.11.0)
+  и [PyPI 0.11.0](https://pypi.org/project/deepseek-team/0.11.0/) опубликованы.
+- Follow-up fixture использует CaptureFailure/capture_unavailable и сохраняет
+  прежние assertions об execution tree/history. Добавлен отдельный unavailable
+  backend control. Контролируемое воспроизведение прошло RED/GREEN, host17 и
+  Python3.14 focused control прошли. Final main CI проверяет этот test-only follow-up.

@@ -117,6 +117,14 @@ class SavedCopyFixture(unittest.TestCase):
 
 class CacheBackedSavedCopyTests(SavedCopyFixture):
     def test_all_prepared_sources_are_cached_and_replay_after_host_and_copy_loss(self):
+        self.assert_cached_sources_replay()
+
+    def test_cached_sources_replay_when_capture_backend_is_unavailable(self):
+        with mock.patch.object(workspace_gc, '_capture', side_effect=workspace_gc.CaptureFailure(
+                'capture_unavailable', 'fixture capture backend unavailable')):
+            self.assert_cached_sources_replay()
+
+    def assert_cached_sources_replay(self):
         tool = self.software(content=b'#!/bin/sh\necho original\n')
         source_file = self.input_file()
         toolchains.prepare(
@@ -155,10 +163,11 @@ class CacheBackedSavedCopyTests(SavedCopyFixture):
         try:
             finalized = workspace_gc.finalize(self.copy, reason='focused saved-copy test')
         except workspace.WorkspaceError as error:
-            if 'unprivileged namespace' not in str(error):
+            if (not isinstance(error, workspace_gc.CaptureFailure)
+                    or error.reason_code != 'capture_unavailable'):
                 raise
-            # The worker sandbox cannot run result capture. The failed finalization
-            # must preserve the execution tree, not delete durable history to pass.
+            # An unavailable capture backend preserves the owned execution tree
+            # and its durable history for explicit recovery.
             self.assertTrue(self.copy.path.is_dir())
             history = workspace_gc.inspect_workspace(self.state, self.copy.id)
             self.assertTrue(history['execution_present'])
