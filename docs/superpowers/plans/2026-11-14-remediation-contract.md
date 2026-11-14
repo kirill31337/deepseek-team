@@ -11,7 +11,7 @@ cache declarations; check-timeout; отмена неначатой работы;
 **Tech Stack:** Python 3.11+, standard library, unittest, Git, Bubblewrap, native fixtures.
 **Spec:** [контракт C1–C7](../specs/2026-11-14-remediation-contract-design.md).
 База: `ffc48b354f2a5d7bb2b8d067b119f824714bb3ed` / 0.10.5.
-Статус: принят к исполнению пользователем 2026-11-14 вместе с публикацией релиза.
+Статус: выполнен 2026-11-14, релиз 0.11.0 опубликован и проверен.
 
 ## Global Constraints
 
@@ -226,7 +226,7 @@ version declarations/release note только на разрешённом эт�
 - [x] Независимое review, устранение подтверждённых дефектов, quality/rework ledger.
 - [x] Только при разрешённом выпуске: wheel/sdist→strict Twine→pip/pipx/uv lifecycle→CI→
   tag/release→registry hashes→clean install. Версию выбрать при исполнении.
-- [ ] Принятые/cancelled owned jobs финализировать, чужие/непринятые сохранить;
+- [x] Принятые/cancelled owned jobs финализировать, чужие/непринятые сохранить;
   GC сначала dry-run. Закрыть все coordination outcomes.
 
 ## Определение готовности
@@ -493,3 +493,16 @@ T1–T6 принимаются отдельно по reproducer, negative contro
   прежние assertions об execution tree/history. Добавлен отдельный unavailable
   backend control. Контролируемое воспроизведение прошло RED/GREEN, host17 и
   Python3.14 focused control прошли. Final main CI проверяет этот test-only follow-up.
+- Main fixture follow-up `ff9064f13b3503de57f508b39253a062c95a2e80` прошёл всю
+  Python 3.11–3.14 matrix, installer/sandbox, Delegation verification и Release
+  verification. Это test/journal follow-up после immutable release tag `0b46c3be`.
+  [Tests](https://github.com/kirill31337/deepseek-team/actions/runs/43599896887),
+  [Delegation](https://github.com/kirill31337/deepseek-team/actions/runs/43599896928),
+  [Release verification](https://github.com/kirill31337/deepseek-team/actions/runs/43599896847).
+- Принятые worker jobs финализированы с сохранением compact patches/history.
+  Собственный preflight worktree удалён после проверки 45 owned paths, clean status
+  и reachability принятого commit. Пользовательские AGENTS.md и attachments сохранены.
+  Нативный агент выполнил только authenticated GitHub monitoring. Архитектура,
+  security corrections, интеграция, финальная проверка bytes/registry и публикация
+  выполнены координатором. DeepSeek подготовил принятые реализации, fixtures, docs
+  и независимые reviews, включая явно записанные corrections и provider failures.
