@@ -1,8 +1,14 @@
-"""Idempotent managed blocks for Codex and Claude Code project guidance.
+"""Idempotent managed blocks for Codex, Claude Code and Qwen (DSH) guidance.
 
 The module writes delegation guidance into a clearly marked, unique block in the
 coordinator-native root instruction file. Every byte outside the owned region is
 preserved verbatim: line endings are not normalized and user text is not dropped.
+
+Qwen (the DeepSeek Harness coordinator) reads ``AGENTS.md`` natively, so it
+shares that target with Codex. One file holds one managed block: the first
+runtime in a selection owns the shared target's rendering, and each coordinator's
+lifecycle hooks still inject the complete current policy for their own runtime,
+so a stale shared snapshot never governs a session.
 """
 import os
 from pathlib import Path
@@ -21,7 +27,7 @@ DATA_FILE = Path(__file__).resolve().parent / "data" / "delegation.md"
 LINKED_DATA_FILE = Path(__file__).resolve().parent / "data" / "delegation-linked.md"
 LINKED_GUIDE = ("docs", "agents", "delegation.md")
 DEFAULT_MODE = 0o644
-TARGETS = {'codex': 'AGENTS.md', 'claude': 'CLAUDE.md'}
+TARGETS = {'codex': 'AGENTS.md', 'claude': 'CLAUDE.md', 'qwen': 'AGENTS.md'}
 
 
 class ProjectError(Exception):
@@ -84,8 +90,10 @@ def _linked_guidance(runtime, root):
         contract = overhead_contract.instructions().encode('utf-8')
     except overhead_contract.OverheadContractError as error:
         raise ProjectError(str(error)) from error
+    from . import settings
     return (LINKED_MARKER + b"\n"
-            + body.replace(b'{runtime}', runtime.encode('ascii')).strip(b"\n")
+            + body.replace(b'{runtime}', runtime.encode('ascii'))
+            .replace(b'{worker_runtime}', settings.worker_runtime(runtime).encode('ascii')).strip(b"\n")
             + b'\n\n' + contract.strip(b"\n"))
 
 
@@ -109,7 +117,9 @@ def _guidance(runtime='codex', root=None, policy=None):
         dynamic = settings.instructions(policy, runtime).encode('utf-8')
     except overhead_contract.OverheadContractError as error:
         raise ProjectError(str(error)) from error
-    return body.replace(b'{runtime}', runtime.encode('ascii')).strip(b"\n") + b'\n\n' + dynamic
+    return (body.replace(b'{runtime}', runtime.encode('ascii'))
+            .replace(b'{worker_runtime}', settings.worker_runtime(runtime).encode('ascii')).strip(b"\n")
+            + b'\n\n' + dynamic)
 
 
 def _block_bytes(state, runtime='codex', root=None, policy=None, *, linked=False):
@@ -221,9 +231,28 @@ def _write_atomic(target, original, mode, content):
 def _coordinators(value):
     if value == 'both':
         return ('codex', 'claude')
+    if value == 'all':
+        return ('codex', 'claude', 'qwen')
     if value in TARGETS:
         return (value,)
-    raise ProjectError("coordinator must be codex, claude or both")
+    raise ProjectError("coordinator must be codex, claude, qwen, both or all")
+
+
+def _distinct_targets(runtimes):
+    """Deduplicate shared instruction files, keeping the first runtime's rendering.
+
+    Codex and Qwen both target AGENTS.md; one file holds one managed block, so a
+    multi-runtime selection renders the shared file once, for its first runtime.
+    """
+    seen = set()
+    selected = []
+    for runtime in runtimes:
+        target = TARGETS[runtime]
+        if target in seen:
+            continue
+        seen.add(target)
+        selected.append(runtime)
+    return tuple(selected)
 
 
 def _prepare_attach_from(target, original, mode, runtime, repository, policy=None):
@@ -278,7 +307,7 @@ def owns_block(root, runtime='codex'):
     raises :class:`ProjectError` instead of being silently skipped.
     """
     if runtime not in TARGETS:
-        raise ProjectError("coordinator must be codex or claude")
+        raise ProjectError("coordinator must be codex, claude or qwen")
     content, _mode = _read_agents(Path(root) / TARGETS[runtime])
     if not content:
         return False
@@ -293,7 +322,7 @@ def owns_block(root, runtime='codex'):
 def is_attached(root, runtime='codex'):
     """Return whether this package owns a managed block for the coordinator."""
     if runtime not in TARGETS:
-        raise ProjectError("coordinator must be codex or claude")
+        raise ProjectError("coordinator must be codex, claude or qwen")
     repository = _repository_root(root)
     content, _mode = _read_agents(repository / TARGETS[runtime])
     if content is None:
@@ -308,7 +337,7 @@ def is_attached(root, runtime='codex'):
 
 def attach(root, coordinator='codex', *, policy=None):
     """Add or refresh managed blocks; return True when any target changed."""
-    runtimes = _coordinators(coordinator)
+    runtimes = _distinct_targets(_coordinators(coordinator))
     repository = _repository_root(root)
     prepared = [_prepare_attach(repository, runtime, policy) for runtime in runtimes]
     changed = False
@@ -333,12 +362,13 @@ def prepare_refresh(root, policy, coordinator='both'):
     """Validate and render refreshes for managed blocks that already exist.
 
     Every target is read and validated before the caller writes anything, so a
-    symlink, a non-regular file or a malformed owned block in either runtime file
+    symlink, a non-regular file or a malformed owned block in any runtime file
     aborts the whole refresh. Missing files and files without a managed block are
-    skipped and never created. Returns atomic (target, original, mode, updated)
-    tuples in runtime order.
+    skipped and never created. Shared targets (Codex/Qwen AGENTS.md) are rendered
+    once, for the first selected runtime. Returns atomic (target, original, mode,
+    updated) tuples in runtime order.
     """
-    runtimes = _coordinators(coordinator)
+    runtimes = _distinct_targets(_coordinators(coordinator))
     repository = _repository_root(root)
     prepared = []
     for runtime in runtimes:
@@ -434,7 +464,7 @@ def refresh_attached(root, policy, coordinator='both'):
 
 def detach(root, coordinator='codex'):
     """Remove managed blocks; return True when any target changed."""
-    runtimes = _coordinators(coordinator)
+    runtimes = _distinct_targets(_coordinators(coordinator))
     repository = _repository_root(root)
     prepared = [_prepare_detach(repository, runtime) for runtime in runtimes]
     changed = False

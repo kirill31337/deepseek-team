@@ -37,6 +37,8 @@ class HookRefreshCase(unittest.TestCase):
         subprocess.run(['git', 'init', '-q', str(self.repo)], check=True)
         environment = mock.patch.dict(os.environ, {
             'HOME': str(self.home),
+            'DSH_HOME': str(self.root / 'dsh-home'),
+            'DEEPSEEK_TEAM_DSH_PROFILE': '',
             'CODEX_HOME': str(self.codex),
             'CLAUDE_CONFIG_DIR': str(self.claude),
             'XDG_CONFIG_HOME': str(self.root / 'xdg-config'),

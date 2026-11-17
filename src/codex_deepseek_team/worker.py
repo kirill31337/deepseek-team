@@ -8,7 +8,6 @@ import random
 import re
 import shutil
 import signal
-import stat
 import subprocess
 import sys
 import tempfile
@@ -72,38 +71,34 @@ def codex_home():
     return Path(os.environ.get('CODEX_HOME', str(Path.home() / '.codex'))).resolve()
 
 
+def credential_search_hint():
+    """Where a provider credential was searched; paths only, never key material."""
+    from . import config
+    return config.credential_search_hint()
+
+
 def load_api_key():
-    """Prefer explicit environment; otherwise read the user's private credential."""
+    """Prefer explicit environment; otherwise read the shared private credential file."""
     if 'DEEPSEEK_API_KEY' in os.environ:
         key = os.environ['DEEPSEEK_API_KEY']
         if key and (len(key) > 4096 or not re.fullmatch(r'[!-~]+', key)):
             raise WorkerError(78, 'DEEPSEEK_API_KEY must be a single ASCII value without whitespace, up to 4096 characters; review it locally.')
         return key
-    directory = Path.home() / '.config/codex-deepseek'
+    from . import config
     try:
-        parent = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-        try:
-            info = os.fstat(parent)
-            if info.st_uid != os.geteuid() or info.st_mode & 0o077:
-                raise ValueError('Unsafe credential directory')
-            fd = os.open('api-key', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
-            with os.fdopen(fd, 'rb') as source:
-                info = os.fstat(source.fileno())
-                if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
-                    raise ValueError('Unsafe credential file')
-                raw = source.read(4097)
-                if len(raw) > 4096:
-                    raise ValueError('Oversized credential')
-                key = raw.decode('ascii').rstrip('\r\n')
-                if not re.fullmatch(r'[!-~]+', key):
-                    raise ValueError('Invalid credential')
-                return key
-        finally:
-            os.close(parent)
-    except FileNotFoundError:
-        return ''
-    except (OSError, ValueError):
-        raise WorkerError(78, 'Saved DeepSeek credential is invalid or not private; review ~/.config/codex-deepseek/api-key (directory 700, file 600, current user owner).') from None
+        return config.read_credential() or ''
+    except config.ConfigError as error:
+        raise WorkerError(78, str(error)) from None
+
+
+def require_api_key():
+    """Load the provider credential or fail with an operator-actionable message."""
+    key = load_api_key()
+    if not key.strip():
+        raise WorkerError(78, 'DEEPSEEK_API_KEY and saved credential are absent or empty; '
+                              'configure locally, never in chat or project files. '
+                              f'Searched {credential_search_hint()}.')
+    return key
 
 
 def provider_config(home):
@@ -156,6 +151,11 @@ def child_environment(home, key, runtime='codex', effort=DEFAULT_EFFORT):
     env.update(HOME=str(home), RUST_LOG='off', RUST_BACKTRACE='0', NO_COLOR='1')
     if runtime == 'codex':
         env.update(CODEX_HOME=str(home), DEEPSEEK_API_KEY=key)
+        return env
+    if runtime == 'qwen':
+        # The native loop receives its endpoint on argv (direct HTTPS or the
+        # namespace-local relay); only the credential travels in the env.
+        env.update(DEEPSEEK_API_KEY=key)
         return env
     if runtime == 'claude':
         env.update(
@@ -227,6 +227,19 @@ def _claude_command(binary, effort=DEFAULT_EFFORT):
     ]
 
 
+def qwen_command(binary, script, effort=DEFAULT_EFFORT, *, mode='read',
+                 endpoint='https://api.deepseek.com'):
+    """Argv for the self-contained native DeepSeek loop (the qwen harness).
+
+    ``script`` is the copied ``native_worker.py``: the temporary worker HOME on
+    the direct read-only path, or the private control directory inside the
+    managed sparse namespace. No external coordinator CLI is involved.
+    """
+    effort = effort_level(effort)
+    return [str(binary), '-I', str(script), '--mode', mode, '--effort', effort,
+            '--endpoint', endpoint, '--model', MODEL]
+
+
 def command(binary, runtime='codex', effort=DEFAULT_EFFORT):
     if runtime == 'codex':
         return _codex_command(binary, effort)
@@ -235,13 +248,28 @@ def command(binary, runtime='codex', effort=DEFAULT_EFFORT):
     raise WorkerError(64, f'Unsupported worker runtime: {runtime}.')
 
 
-def resolve_runtime(requested, codex='codex', claude='claude'):
-    candidates = [('codex', codex), ('claude', claude)] if requested == 'auto' else [(requested, codex if requested == 'codex' else claude)]
+def resolve_runtime(requested, codex='codex', claude='claude', qwen=None):
+    if qwen is None:
+        qwen = str(Path(sys.executable).resolve())
+    if requested == 'auto':
+        candidates = [('codex', codex), ('claude', claude), ('qwen', qwen)]
+    elif requested == 'qwen':
+        candidates = [('qwen', qwen)]
+    else:
+        candidates = [(requested, codex if requested == 'codex' else claude)]
     for runtime, executable in candidates:
+        if runtime == 'qwen':
+            # The native harness is the running interpreter itself; it is
+            # always available, so Qwen+DeepSeek needs no Codex/Claude CLI.
+            if Path(executable).is_file() and os.access(executable, os.X_OK):
+                return runtime, executable
+            continue
         binary = shutil.which(executable)
         if binary:
             return runtime, binary
-    label = 'Codex or Claude Code' if requested == 'auto' else ('Codex' if requested == 'codex' else 'Claude Code')
+    label = {'auto': 'Codex, Claude Code or the native Qwen harness',
+             'codex': 'Codex', 'claude': 'Claude Code',
+             'qwen': 'The native Qwen worker interpreter'}.get(requested, requested)
     raise WorkerError(78, f'{label} executable is unavailable.')
 
 
@@ -326,19 +354,32 @@ def result_events(raw):
 
 
 def claude_result(raw):
+    return _result_object(raw, 'Claude Code')
+
+
+def qwen_result(raw):
+    # A killed/timed-out native loop may leave no stdout at all; treat that as
+    # an incomplete turn so the runner keeps the real exit code (124/130/78)
+    # and prints the stderr diagnostics, exactly like an empty Codex stream.
+    if not raw.strip():
+        return '', '', False
+    return _result_object(raw, 'The native Qwen worker')
+
+
+def _result_object(raw, label):
     try:
         value = json.loads(raw)
     except (ValueError, RecursionError):
-        raise WorkerError(70, 'Claude Code returned malformed JSON; no answer was accepted.') from None
+        raise WorkerError(70, f'{label} returned malformed JSON; no answer was accepted.') from None
     if not isinstance(value, dict):
-        raise WorkerError(70, 'Claude Code returned an invalid result object.')
+        raise WorkerError(70, f'{label} returned an invalid result object.')
     kind = value.get('type', 'result')
     is_error = value.get('is_error')
     result = value.get('result')
     if kind != 'result' or type(is_error) is not bool or not isinstance(result, str):
-        raise WorkerError(70, 'Claude Code returned an incomplete result object.')
+        raise WorkerError(70, f'{label} returned an incomplete result object.')
     if is_error:
-        return '', result or 'Claude Code worker turn failed.', False
+        return '', result or f'{label} worker turn failed.', False
     return result, '', True
 
 
@@ -347,6 +388,8 @@ def runtime_result(runtime, raw):
         return result_events(raw)
     if runtime == 'claude':
         return claude_result(raw)
+    if runtime == 'qwen':
+        return qwen_result(raw)
     raise WorkerError(64, f'Unsupported worker runtime: {runtime}.')
 
 
@@ -391,7 +434,8 @@ def run(args):
 def run_worker(args):
     requested_effort = getattr(args, 'effort', None)
     effort = DEFAULT_EFFORT if requested_effort in (None, 'auto') else effort_level(requested_effort)
-    runtime, binary = resolve_runtime(args.runtime, args.codex, args.claude)
+    runtime, binary = resolve_runtime(args.runtime, args.codex, args.claude,
+                                      getattr(args, 'qwen', None))
     sandbox, backend = resolve_os_sandbox(args.os_sandbox)
     if runtime == 'codex':
         provider_config(codex_home())
@@ -403,9 +447,7 @@ def run_worker(args):
     deadline = args.job_deadline
     try:
         args.validate_admission()
-        key = load_api_key()
-        if not key.strip():
-            raise WorkerError(78, 'DEEPSEEK_API_KEY and saved credential are absent or empty; configure locally, never in chat or project files.')
+        key = require_api_key()
         with tempfile.TemporaryDirectory(prefix='session-', dir=args.state_dir) as directory:
             home = Path(directory)
             if runtime == 'codex':
@@ -416,8 +458,14 @@ def run_worker(args):
                     env = sandbox.prepare_codex_environment(home, env, backend)
                 except sandbox.SandboxError as error:
                     raise WorkerError(error.code, error.message) from None
-            base_command = command(binary, runtime, effort)
-            if runtime == 'claude':
+            if runtime == 'qwen':
+                from . import native_worker
+                script = home / 'native_worker.py'
+                shutil.copyfile(native_worker.__file__, script)
+                base_command = qwen_command(binary, script, effort, mode='read')
+            else:
+                base_command = command(binary, runtime, effort)
+            if runtime in ('claude', 'qwen'):
                 try:
                     base_command = sandbox.wrap_command(
                         base_command, cwd=Path.cwd(), session_home=home,
@@ -461,8 +509,10 @@ def parse_args():
     from . import settings
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('task', nargs='?', help='Task; stdin is preferred for private content.')
-    parser.add_argument('--runtime', choices=['codex', 'claude', 'auto'], default='codex',
-                        help='CLI harness for the DeepSeek worker; default: codex.')
+    parser.add_argument('--runtime', choices=['codex', 'claude', 'qwen', 'auto'], default='codex',
+                        help='CLI harness for the DeepSeek worker; default: codex. '
+                             'qwen is the package-native DeepSeek loop (no Codex/Claude CLI '
+                             'needed); auto tries codex, claude, then qwen.')
     parser.add_argument('--os-sandbox', choices=['required'], default='required',
                         help='Enforce the required Bubblewrap/AppArmor containment.')
     parser.add_argument('--effort', choices=EFFORT_LEVELS,
@@ -499,6 +549,8 @@ def parse_args():
                              'sandbox and failed-copy recovery rules still apply.')
     parser.add_argument('--codex', help='Codex executable to use; an explicit value is pinned.')
     parser.add_argument('--claude', help='Claude Code executable to use; an explicit value is pinned.')
+    parser.add_argument('--qwen', help='Python interpreter for the native qwen worker loop; '
+                                       'an explicit value is pinned. Defaults to the running interpreter.')
     parser.add_argument('--state-dir', type=Path,
                         help='Private shared state root; overrides DEEPSEEK_TEAM_STATE_DIR '
                              'and ~/.local/state/codex-deepseek. Use the same root for all workers.')
@@ -510,10 +562,13 @@ def parse_args():
         raise WorkerError(error.code, str(error)) from None
     args.codex_explicit = args.codex is not None
     args.claude_explicit = args.claude is not None
+    args.qwen_explicit = args.qwen is not None
     if args.codex is None:
         args.codex = 'codex'
     if args.claude is None:
         args.claude = 'claude'
+    if args.qwen is None:
+        args.qwen = str(Path(sys.executable).resolve())
     args.attempts_explicit = args.attempts is not None
     if bool(args.coord_task) != bool(args.coord_assignment):
         parser.error('--coord-task and --coord-assignment must be supplied together')

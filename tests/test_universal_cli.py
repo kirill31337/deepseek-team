@@ -23,7 +23,7 @@ class UniversalCliTests(unittest.TestCase):
         self.home.mkdir()
         self.bin = self.root / 'bin'
         self.bin.mkdir()
-        self.env = dict(os.environ, HOME=str(self.home), CODEX_HOME=str(self.home / 'codex'),
+        self.env = dict(os.environ, HOME=str(self.home), DSH_HOME=str(self.home / 'dsh-home'), DEEPSEEK_TEAM_DSH_PROFILE='', CODEX_HOME=str(self.home / 'codex'),
                         CLAUDE_CONFIG_DIR=str(self.home / '.claude'),
                         XDG_CONFIG_HOME=str(self.home / 'config'),
                         PYTHONPATH=str(Path(__file__).resolve().parents[1] / 'src'))

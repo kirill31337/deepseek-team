@@ -44,9 +44,9 @@ EXEMPT_FILENAMES = frozenset({'AGENTS.md', 'CLAUDE.md', '.deepseek-team.toml'})
 EXEMPT_PREFIXES = frozenset({'.git', '.deepseek-team', '.codex', '.claude'})
 
 SHELL_TOOLS = frozenset({'Bash', 'bash', 'sh', 'exec_command', 'shell_command',
-                         'run_command', 'run_shell'})
+                         'run_command', 'run_shell', 'terminal_send'})
 READ_TOOLS = frozenset({'Read', 'read', 'read_file', 'read_text_file', 'view_file',
-                        'open_file'})
+                        'open_file', 'read_image', 'lsp'})
 SEARCH_TOOLS = frozenset({'Grep', 'grep', 'search', 'search_text', 'code_search'})
 LIST_TOOLS = frozenset({'Glob', 'glob', 'list_dir', 'list_files', 'find_files'})
 CONTROL_TOOLS = frozenset({'wait', 'wait_agent', 'wait_for', 'wait_tool'})
@@ -275,6 +275,10 @@ def classify_inspection(tool_name, tool_input, root, *, cwd=None) -> str:
             if isinstance(candidate, str) and candidate.strip():
                 command = candidate
                 break
+        if command is None and name == 'terminal_send':
+            candidate = data.get('text')
+            if isinstance(candidate, str) and candidate.strip():
+                command = candidate
         return _shell_verdict(command, root, cwd)
     return 'none'
 

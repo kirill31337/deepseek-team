@@ -2,7 +2,7 @@
 
 Before delegating, check `deepseek-team status` and resolve the CURRENT policy.
 The user can request `deepseek-team off` or `deepseek-team on` for this project;
-these commands persist across sessions for both Codex and Claude Code. They preserve
+these commands persist across sessions for Codex, Claude Code and Qwen (DSH). They preserve
 instructions, credentials and delegation/access/effort settings. Never turn delegation
 back on without the user's request. If disabled, continue locally: the delegation and
 coordination-plan requirements below do not apply. Existing workers are not cancelled;
@@ -257,7 +257,7 @@ rework; substantive corrections normally return to DeepSeek. Under a saved manua
 `executor: "worker"` explicitly instead. Use the assignment id returned by the plan:
 
 ```bash
-deepseek-team worker --runtime {runtime} --effort high \
+deepseek-team worker --runtime {worker_runtime} --effort high \
   --coord-task TASK_ID --coord-assignment ASSIGNMENT_ID <<'TASK'
 Implement the assigned deliverable and satisfy its registered acceptance criteria.
 TASK
@@ -478,11 +478,11 @@ bypass or infer it. Hooks are a coordinator-process guardrail, not a replacement
 the worker Bubblewrap/AppArmor security boundary.
 
 The parent launch/message gate covers only the events the runtime actually delivers, not
-every possible write. Codex and Claude coverage is verified separately, so universal hook
-coverage must never be claimed; where the runtime cannot intercept an action these
-instructions remain authoritative. The mandatory worker OS sandbox is unchanged.
+every possible write. Each coordinator runtime's coverage is verified separately, so
+universal hook coverage must never be claimed; where the runtime cannot intercept an action
+these instructions remain authoritative. The mandatory worker OS sandbox is unchanged.
 
-For both runtimes, an unplanned turn with no recorded work closes without requiring
+For every runtime, an unplanned turn with no recorded work closes without requiring
 a distribution plan or claiming implementation completion. Status prompts retain
 existing unfinished tasks. Stop requests continuation for unfinished assignments,
 undisposed worker results and missing coordinator/native outcomes. A repeated Stop
@@ -505,6 +505,24 @@ can disable them. DeepSeek child workers retain their isolated HOME and `--bare`
 In Claude plan mode, native Markdown plan files can be edited before registering the
 distribution. The plan directory comes from the default or user/project/local
 `plansDirectory` setting. Stop leaves the task open during planning.
+
+Qwen (DeepSeek Harness): after `setup --runtime qwen` and project attachment, the
+package-owned DSH bridge plugin in the active profile translates `agent/created`,
+`agent/pre-step`, `tools/pre-execute` and `agent/turn-stopping` events into the same
+coordination hooks (`coordinator-hook --runtime qwen`). It covers recognized read,
+edit/write, bash and native-dispatch tool calls, not every possible action; a hook
+failure on a recognized mutation denies the call. The Qwen coordinator runs inside
+DSH and is not a worker CLI: DeepSeek workers use the package-native DeepSeek loop
+(`worker --runtime qwen`) inside the same mandatory Bubblewrap/AppArmor sandbox, so
+no Codex or Claude Code installation is required. Native DSH subagents and team
+members never open or complete the coordinator ledger; their dispatch needs the same
+`[deepseek-team:TASK_ID:DELIVERABLE_ID]` binding. Stop requests continuation for
+unfinished assignments/results; on a repeated Stop it warns and keeps the task
+unfinished. Check the bridge with `deepseek-team hooks status --runtime qwen`; the
+DSH profile must load the plugin (profile reload or restart). Qwen shares the
+`AGENTS.md` managed block with Codex; each session's hooks inject the complete
+current policy for their own runtime, so the shared file snapshot never governs
+alone. DSH plan mode has no native plan-file exception: mutations stay gated.
 
 Coordinator-native subagents run under the coordinator runtime's own native agent model,
 permissions and sandboxing; they are not placed inside the DeepSeek Team worker sandbox.

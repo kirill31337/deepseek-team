@@ -1,4 +1,4 @@
-"""Explicit one-project coordinator context for the Codex and Claude hooks.
+"""Explicit one-project coordinator context for the Codex, Claude and Qwen hooks.
 
 A lifecycle hook normally serves the Git repository that contains the session
 working directory.  The optional ``DEEPSEEK_TEAM_PROJECT_ROOT`` environment
@@ -35,7 +35,7 @@ from .shell_mutation import classify_shell_mutation_scoped
 SELECTION_VARIABLE = 'DEEPSEEK_TEAM_PROJECT_ROOT'
 _PATH_KEYS = ('file_path', 'notebook_path', 'path')
 _DIRECTORY_KEYS = ('workdir', 'cwd')
-_RUNTIMES = {'codex': 'Codex', 'claude': 'Claude Code'}
+_RUNTIMES = {'codex': 'Codex', 'claude': 'Claude Code', 'qwen': 'Qwen (DSH)'}
 _APPLY_PATCH_TARGET = re.compile(
     r'^\*\*\* (?:(?:Update|Add|Delete) File|Move to): (.+)$', re.M)
 
@@ -94,7 +94,7 @@ def apply_patch_paths(command: str) -> list[str]:
     return _APPLY_PATCH_TARGET.findall(command)
 
 
-def _shell_command_text(data) -> str:
+def _shell_command_text(data, tool='') -> str:
     """The command text a shell tool call carries, mirroring the hook payload."""
     if isinstance(data, str):
         return data
@@ -105,6 +105,10 @@ def _shell_command_text(data) -> str:
         return command
     for key in ('cmd', 'shell', 'script'):
         value = data.get(key)
+        if isinstance(value, str) and value:
+            return value
+    if tool == 'terminal_send':
+        value = data.get('text')
         if isinstance(value, str) and value:
             return value
     return ''
@@ -154,7 +158,7 @@ def explicit_targets(payload: dict, event_cwd: Path) -> tuple[Target, ...]:
         # The scoped classifier resolves one proved absolute ``cd`` prefix and
         # returns no path at all when the real working directory is uncertain.
         mutation, paths, _cwd_uncertain = classify_shell_mutation_scoped(
-            _shell_command_text(data))
+            _shell_command_text(data, tool))
         if mutation:
             for raw in paths:
                 add(_absolute(raw, working), False)

@@ -468,7 +468,7 @@ FINAL_REPORTING_GUIDANCE = (
 
 
 def final_reporting_guidance() -> str:
-    """Shared coordinator final-summary contract for both runtimes."""
+    """Shared coordinator final-summary contract for every runtime."""
     return FINAL_REPORTING_GUIDANCE
 
 
@@ -507,16 +507,29 @@ REWORK_GUIDANCE = (
 )
 
 
+def worker_runtime(runtime: str = 'codex') -> str:
+    """The worker harness a coordinator runtime launches.
+
+    Codex and Claude coordinators use their own CLI as the worker harness. The
+    Qwen coordinator runs inside the DeepSeek Harness, which is not a launchable
+    worker CLI, so its workers use the package-native DeepSeek loop
+    (``--runtime qwen``): no Codex or Claude Code installation is required.
+    """
+    if runtime not in ('codex', 'claude', 'qwen'):
+        raise SettingsError('Instruction runtime must be codex, claude or qwen.')
+    return runtime
+
+
 def rework_guidance(runtime: str = 'codex') -> str:
-    """Shared graded-review and corrective-work contract for both runtimes."""
-    if runtime not in ('codex', 'claude'):
-        raise SettingsError('Instruction runtime must be codex or claude.')
+    """Shared graded-review and corrective-work contract for every runtime."""
+    if runtime not in ('codex', 'claude', 'qwen'):
+        raise SettingsError('Instruction runtime must be codex, claude or qwen.')
     return REWORK_GUIDANCE
 
 
 def instructions(policy: Policy, runtime: str = 'codex') -> str:
-    if runtime not in ('codex', 'claude'):
-        raise SettingsError('Instruction runtime must be codex or claude.')
+    if runtime not in ('codex', 'claude', 'qwen'):
+        raise SettingsError('Instruction runtime must be codex, claude or qwen.')
 
     if not policy.enabled:
         from .activation import DISABLED_GUIDANCE
@@ -692,7 +705,7 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
             'widens the resolved access.\n'
         )
 
-    coordinator = 'Claude' if runtime == 'claude' else 'Codex'
+    coordinator = {'codex': 'Codex', 'claude': 'Claude', 'qwen': 'Qwen (DSH)'}[runtime]
     process = (
             f'{coordinator} process integration: after project init and enabling hooks in the runtime, SessionStart/'
             'UserPromptSubmit provide the current coordination task id. Plan and route every delegated '
@@ -701,7 +714,7 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
             'source edits, submit a concrete JSON distribution with '
             'deepseek-team coordination plan --task TASK_ID; include deliverable id/kind/scope, '
             'executor, acceptance criteria, dependencies and checks. Run each worker assignment with '
-            f'deepseek-team worker --runtime {runtime} --effort {effort_example} '
+            f'deepseek-team worker --runtime {worker_runtime(runtime)} --effort {effort_example} '
             '--coord-task TASK_ID --coord-assignment ASSIGNMENT_ID. '
             + effort_note +
             'The runner records start/result/workspace/checks automatically. One job_id owns one '
@@ -731,8 +744,8 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
             f'a revised plan. {coordinator} PreToolUse blocks recognized source edits while the distribution '
             'is missing/noncompliant, blocks unplanned scope, and blocks duplicate work owned by a '
             'pending worker assignment. This parent launch/message gate covers only the events the '
-            'runtime actually delivers, not every possible write; Codex and Claude coverage is verified '
-            'separately and universal hook coverage must never be claimed. Where the runtime cannot '
+            'runtime actually delivers, not every possible write; each coordinator runtime\'s coverage '
+            'is verified separately and universal hook coverage must never be claimed. Where the runtime cannot '
             'intercept an action, these instructions remain authoritative. Hooks do not replace the '
             'mandatory, unchanged worker OS sandbox. '
             'An unplanned turn without recorded work closes without a distribution plan; status '
@@ -748,13 +761,26 @@ def instructions(policy: Policy, runtime: str = 'codex') -> str:
     if runtime == 'codex':
         process += (
             'Native hook trust is controlled by Codex and is not inferred by this package.\n')
-    else:
+    elif runtime == 'claude':
         process += (
             'Claude hooks cover Edit, Write, NotebookEdit and recognized mutating Bash commands. '
             'Stop requests a continuation for pending/undispositioned results; if stop_hook_active '
             'is already true, it warns the user and leaves the task unfinished in the ledger '
             'instead of blocking again. Native subagent hook events do not change the coordinator ledger. '
             'Check enabled hooks through Claude /hooks; --bare or native settings can disable them.\n')
+    else:
+        process += (
+            'Qwen coordinates inside the DeepSeek Harness (DSH). The package-owned DSH bridge plugin '
+            'translates agent/created, agent/pre-step, tools/pre-execute and agent/turn-stopping events '
+            'into the same coordination hooks; it covers recognized read/edit/write/bash and native '
+            'dispatch tools, never every possible action. Workers use the package-native DeepSeek loop '
+            '(--runtime qwen) in the same mandatory OS sandbox; no Codex or Claude Code installation '
+            'is required. Stop requests a continuation for '
+            'pending/undispositioned results; if stop_hook_active is already true, it warns and leaves '
+            'the task unfinished instead of blocking again. Native DSH subagents and team members do '
+            'not change the coordinator ledger. Check the bridge with deepseek-team hooks status '
+            '--runtime qwen; the DSH profile must load the plugin (profile reload or restart), and '
+            'deepseek-team init --coordinator qwen manages the shared AGENTS.md block.\n')
 
     label = 'auto (adaptive)' if policy.adaptive else f'{policy.delegation_level}%'
     return (

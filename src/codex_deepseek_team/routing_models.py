@@ -34,7 +34,7 @@ FEATURE_VALUES = {
     'clarity': ('clear', 'partial', 'unknown'),
     'risk': ('low', 'medium', 'high', 'protected', 'unknown'),
     'scope_size': ('small', 'medium', 'large', 'unknown'),
-    'runtime': ('codex', 'claude'),
+    'runtime': ('codex', 'claude', 'qwen'),
     'effort': CANONICAL_EFFORTS + tuple(LEGACY_EFFORT_ALIASES),
 }
 REQUIRED_SEMANTIC_FIELDS = ('domain', 'operation', 'localization', 'coupling',

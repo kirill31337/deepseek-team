@@ -1,7 +1,8 @@
 """Sparse, network-isolated development boundary for managed working copies.
 
-Managed copies use this external boundary for BOTH runtimes; an inner CLI
-permission is not treated as an isolation boundary.
+Managed copies use this external boundary for EVERY runtime (Codex, Claude and
+the native qwen loop); an inner CLI permission is not treated as an isolation
+boundary.
 """
 from __future__ import annotations
 
@@ -64,10 +65,30 @@ def runtime_command(binary: str, runtime: str, *, writable: bool,
                 '--disallowedTools', 'mcp__*', '--disable-slash-commands',
                 '--setting-sources', '', '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}',
                 '--append-system-prompt', instructions]
+    if runtime == 'qwen':
+        # The native loop is a copied self-contained stdlib script; the sparse
+        # namespace and the fixed provider relay surround it exactly like the
+        # CLI harnesses. The interpreter is the pinned qwen binary.
+        from . import worker
+        return worker.qwen_command(binary, '/run/deepseek-team/native_worker.py', effort,
+                                   mode='full' if writable else 'read',
+                                   endpoint='@DEEPSEEK_TEAM_ENDPOINT@')
     raise DevelopmentError('Unsupported managed development runtime: ' + runtime)
 
 
 def check_runtime(binary: str, runtime: str) -> str:
+    if runtime == 'qwen':
+        try:
+            result = subprocess.run([binary, '-I', '-c',
+                                     'import sys, json, urllib.request, http.client; '
+                                     'assert sys.version_info >= (3, 11); print(sys.version)'],
+                                    text=True, capture_output=True, timeout=15, check=False)
+        except (OSError, subprocess.SubprocessError):
+            raise DevelopmentError('Preparation: qwen native interpreter check failed.') from None
+        if result.returncode:
+            raise DevelopmentError('Preparation: the qwen native worker needs Python 3.11+ '
+                                   'with stdlib JSON/HTTP support; no access fallback occurred.')
+        return result.stdout
     flags = (['--strict-config', '--sandbox', '--ephemeral', '--json', '--ignore-rules', 'danger-full-access']
              if runtime == 'codex' else
              ['--bare', '--tools', '--allowedTools', '--disallowedTools', '--permission-mode',
@@ -190,9 +211,11 @@ def prepared_context(copy, backend, home: Path, control: Path, binary: str,
     env = api.child_environment(home, relay.LOCAL_CREDENTIAL, runtime, effort)
     if runtime == 'codex':
         api.transient_config(home)
-    else:
+    elif runtime == 'claude':
         env['ANTHROPIC_BASE_URL'] = '@DEEPSEEK_TEAM_ENDPOINT@/anthropic'
         env['ANTHROPIC_API_KEY'] = relay.LOCAL_CREDENTIAL
+    # qwen: the native loop takes its relay endpoint on argv; the isolated
+    # credential is already in DEEPSEEK_API_KEY.
     env['PATH'] = ':'.join(str(p) for p in (
         copy.path / '.venv/bin', copy.path / 'node_modules/.bin',
         Path(binary).parent, Path(api.sys.executable).parent)) + ':/usr/local/bin:/usr/bin:/bin'
@@ -224,6 +247,10 @@ def write_launch(control: Path, binary: str, runtime: str, env: dict[str, str], 
                  writable: bool, effort: str = 'high') -> None:
     shutil.copyfile(Path(relay.__file__), control / 'bridge.py')
     (control / 'bridge.py').chmod(0o400)
+    if runtime == 'qwen':
+        from . import native_worker
+        shutil.copyfile(Path(native_worker.__file__), control / 'native_worker.py')
+        (control / 'native_worker.py').chmod(0o400)
     command = runtime_command(binary, runtime, writable=writable, path=env['PATH'],
                               effort=effort, environment=env)
     (control / 'launch.json').write_text(json.dumps({'command': command, 'env': env}))

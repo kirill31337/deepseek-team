@@ -20,7 +20,7 @@ import stat
 import sys
 import time
 
-from . import __version__, claude_config, config, worker
+from . import __version__, claude_config, config, dsh_config, worker
 
 
 SCHEMA_VERSION = 1
@@ -57,6 +57,8 @@ def receipt_path(runtime):
         return worker.codex_home() / RECEIPT_NAME
     if runtime == 'claude':
         return Path(claude_config.claude_home()) / RECEIPT_NAME
+    if runtime == 'qwen':
+        return dsh_config.dsh_home() / RECEIPT_NAME
     raise ValueError('Unsupported coordinator runtime.')
 
 
@@ -124,8 +126,19 @@ def _owned_claude_integration():
     return False
 
 
+def _owned_qwen_integration():
+    try:
+        return dsh_config.owned()
+    except (config.ConfigError, OSError, ValueError):
+        return False
+
+
 def _has_owned_integration(runtime):
-    return _owned_codex_integration() if runtime == 'codex' else _owned_claude_integration()
+    if runtime == 'codex':
+        return _owned_codex_integration()
+    if runtime == 'qwen':
+        return _owned_qwen_integration()
+    return _owned_claude_integration()
 
 
 def _session_key(session):
@@ -365,7 +378,7 @@ def prepare_notice(payload, runtime) -> dict | None:
     PreToolUse/Stop with no session observation remains conservative even when a
     different session already recorded the current global package version.
     """
-    if not isinstance(payload, dict) or runtime not in ('codex', 'claude'):
+    if not isinstance(payload, dict) or runtime not in ('codex', 'claude', 'qwen'):
         return None
     event = payload.get('hook_event_name')
     if event not in _SUPPORTED_EVENTS or _is_native_subagent(payload, runtime):
@@ -482,7 +495,7 @@ def mark_delivered(notice) -> None:
     if not isinstance(notice, dict):
         raise ReceiptError('notice is not a mapping')
     runtime = notice.get('runtime')
-    if runtime not in ('codex', 'claude'):
+    if runtime not in ('codex', 'claude', 'qwen'):
         raise ReceiptError('notice has no supported runtime')
     version = notice.get('version')
     key = notice.get('session_key')

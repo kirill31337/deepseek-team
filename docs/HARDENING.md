@@ -113,4 +113,38 @@ Coordination state and routing state live outside Git. Routing uses format 3 in 
 
 The DeepSeek key remains at `~/.config/codex-deepseek/api-key`, with a private directory and mode 600 file; `DEEPSEEK_API_KEY` can supply it instead. Never commit credentials, local configuration or raw model logs. Preserve the primary coordinator model, authentication and unrelated settings during setup and removal.
 
+### Credential location and fail-closed checks
+
+One resolution order applies to every command: `DEEPSEEK_API_KEY` first, then the file named by `DEEPSEEK_TEAM_CREDENTIAL_FILE`, then `~/.config/codex-deepseek/api-key`. A `DEEPSEEK_API_KEY` that is present but empty or malformed is an error (exit code `78`) and is never replaced by a file: an operator must not believe one key is in use when another value decides the run. An empty or unset `DEEPSEEK_TEAM_CREDENTIAL_FILE` selects the HOME default; a non-empty malformed value is rejected. `DEEPSEEK_TEAM_CREDENTIAL_FILE` must be the absolute path of the key file itself, not a directory. It fully replaces the HOME default for reads, for `auth set` and for `auth remove`, so a key is never written to one location and read from another. A relative path, a path containing `..` or a path without a final component is rejected before anything is opened. The override exists for services, containers and CI where HOME is unset, read-only or reset on upgrade.
+
+The file checks are enforced on opened descriptors rather than on path text, and they fail closed:
+
+- the parent directory must be a directory owned by the current effective user with no group or other permission bits (mode `700`);
+- the file must be a regular file owned by the same user with mode `600`, holding one nonempty printable-ASCII value without whitespace, at most 4096 bytes;
+- the directory and the file are opened with `O_NOFOLLOW`, so a symlinked directory or file is rejected instead of followed, and a FIFO or device never blocks or absorbs a read;
+- with the override set, an unsafe, foreign-owned, shared or unreadable location raises a configuration error naming the path and the reason, never the stored value, and **no fallback** to the HOME default happens. A missing file inside a valid directory means "no key configured" (`auth status` exits `78`) and is likewise not replaced by the HOME key.
+
+`auth status` prints the effective source and the searched locations - the override path and the effective HOME - and never the key. Workers receive a minimal environment built from an allowlist: `DEEPSEEK_TEAM_CREDENTIAL_FILE` is never forwarded into the sandbox, the parent's `DEEPSEEK_API_KEY` is never inherited, and the child receives only the credential resolved for that run.
+
+A service must pin a stable path instead of depending on HOME:
+
+```ini
+# /etc/systemd/system/deepseek-team.service
+[Service]
+User=deepseek
+Group=deepseek
+# The service home is explicit and distinct from any interactive user's home.
+Environment=HOME=/var/lib/deepseek
+Environment=DEEPSEEK_TEAM_CREDENTIAL_FILE=/var/lib/deepseek/api-key
+```
+
+```bash
+# The directory must be owned by the service user with mode 700: /etc at 0755 fails the check.
+sudo install -d -o deepseek -g deepseek -m 0700 /var/lib/deepseek
+sudo -u deepseek env DEEPSEEK_TEAM_CREDENTIAL_FILE=/var/lib/deepseek/api-key \
+  deepseek-team auth set --stdin < /run/secrets/deepseek-api-key
+```
+
+`auth set` creates a missing directory with mode `700` itself, and `auth remove` deletes the file at the same overridden path, so cleaning up the service never touches the interactive user's key. Do not point the variable at a symlink, and never pass the key as a command-line argument.
+
 These controls are not a complete confidentiality boundary for hostile repositories or coordinator binaries. Repository files available to the model can contain secrets. Use a dedicated OS user, container or VM when stronger isolation is required. Offline fixtures verify local behavior; only an explicitly authorized live provider check exercises real inference.

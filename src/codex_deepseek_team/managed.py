@@ -26,6 +26,11 @@ _UNCERTAIN_READINESS_MARKERS = (
 )
 
 
+def _credential_absent_message(api):
+    return ('Provider credential is absent; configure it locally. Workspace retained. '
+            f'Searched {api.credential_search_hint()}.')
+
+
 def _uncertain_readiness(error) -> bool:
     message = str(getattr(error, 'message', error)).lower()
     return any(marker in message for marker in _UNCERTAIN_READINESS_MARKERS)
@@ -170,6 +175,8 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
                     runtime=args.runtime, codex=args.codex, claude=args.claude,
                     codex_explicit=getattr(args, 'codex_explicit', False),
                     claude_explicit=getattr(args, 'claude_explicit', False),
+                    qwen=getattr(args, 'qwen', str(Path(api.sys.executable).resolve())),
+                    qwen_explicit=getattr(args, 'qwen_explicit', False),
                     state=args.state_dir,
                     declarations=_guard_declarations(source, coord_task, coord_assignment),
                     copy=copy)
@@ -274,6 +281,8 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
                         args.claude, context_factory,
                         explicit_codex=getattr(args, 'codex_explicit', args.codex != 'codex'),
                         explicit_claude=getattr(args, 'claude_explicit', args.claude != 'claude'),
+                        qwen=getattr(args, 'qwen', str(Path(api.sys.executable).resolve())),
+                        explicit_qwen=getattr(args, 'qwen_explicit', False),
                         deadline=args.job_deadline)
                 except runtime_preflight.RuntimePreflightError as error:
                     if error.code == 78:
@@ -291,7 +300,7 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
                     directory=diagnostics, phase='probe')
                 copy.metadata.update(runtime=runtime, runtime_binary=binary,
                     runtime_explicit=(getattr(args, runtime + '_explicit',
-                        getattr(args, runtime) != runtime)), readiness_checks=probe_checks,
+                        getattr(args, runtime, runtime) != runtime)), readiness_checks=probe_checks,
                     baseline_checks=[], verification_cause=None,
                     coord_task=coord_task, coord_assignment=coord_assignment,
                     delegation_level=policy.delegation_level, requested_access=policy.access,
@@ -394,7 +403,7 @@ def run(args, policy: settings.Policy, api, copy=None) -> int:
                     preparation_cause = 'environment'
                     key = api.load_api_key()
                     if not key.strip():
-                        raise api.WorkerError(78, 'Provider credential is absent; configure it locally. Workspace retained.')
+                        raise api.WorkerError(78, _credential_absent_message(api))
                     if coord_task:
                         # Bounded pre-execution evidence for the lessons journal: the
                         # prompt digest plus a redacted brief, the workspace baseline and

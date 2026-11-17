@@ -6,9 +6,9 @@
 
 [![PyPI version](https://img.shields.io/pypi/v/deepseek-team?cacheSeconds=300)](https://pypi.org/project/deepseek-team/) [![Tests on main](https://img.shields.io/github/actions/workflow/status/kirill31337/deepseek-team/test.yml?branch=main&label=tests)](https://github.com/kirill31337/deepseek-team/actions/workflows/test.yml) [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue)](#prerequisites) [![Linux](https://img.shields.io/badge/platform-Linux-lightgrey)](#prerequisites) [![MIT license](https://img.shields.io/badge/license-MIT-green)](https://github.com/kirill31337/deepseek-team/blob/main/LICENSE)
 
-**DeepSeek Flash subagents inside your Codex or Claude Code session.**
+**DeepSeek Flash subagents inside your Codex, Claude Code or Qwen (DSH) session.**
 
-Delegate implementation, tests and documentation from your existing Codex or Claude Code session. The coordinator plans bounded assignments, reviews worker changes and checks, and integrates accepted results.
+Delegate implementation, tests and documentation from your existing Codex, Claude Code or Qwen (DeepSeek Harness) session. The coordinator plans bounded assignments, reviews worker changes and checks, and integrates accepted results.
 
 The coordinator assesses worker quality separately from problems in the brief, context or environment. A private lessons journal helps improve later assignments.
 
@@ -34,7 +34,7 @@ Fresh installations use **read-only** access: workers inspect the project and re
 
 - **Linux.** Native Windows and macOS are not supported.
 - **Python 3.11 or newer** and **Git** on `PATH`.
-- **Codex CLI and/or Claude Code CLI** on `PATH`, normally configured. Install whichever coordinator you intend to use; `both` covers both.
+- **Codex CLI and/or Claude Code CLI** on `PATH`, normally configured. Install whichever coordinator you intend to use; `both` covers both. For the **Qwen (DSH)** coordinator, a DeepSeek Harness installation with an existing profile (`$DSH_HOME/profiles`, default `~/.dsh`) is enough: its workers use the package-native DeepSeek loop, so no Codex/Claude CLI is required; see the [DSH guide](https://github.com/kirill31337/deepseek-team/blob/main/docs/DSH.md). `all` prepares all three coordinators.
 - **Bubblewrap** (`bwrap`) and a working Linux OS sandbox. Every worker needs it before any credential is read, and it cannot be turned off.
 
 On Ubuntu, `setup --with-sandbox` can install the required system components (see below). On other distributions, install Bubblewrap and any AppArmor prerequisites with your own package manager first, then check `deepseek-team sandbox status`.
@@ -97,8 +97,8 @@ A few notes:
 - `--no-key` deliberately defers authentication so `setup` never prompts for or reads a secret. Store the key separately with `deepseek-team auth set`, or omit `--no-key` on a terminal when you are ready.
 - Fresh access defaults are **read-only**. Step 4 lets Auto delegate implementation by explicitly granting write access. Full-access means a private, owned development copy, not the host system. When `setup` finishes it explains this and prints the opt-in command; the notice changes nothing by itself.
 - On Ubuntu, the very first setup may need to install the sandbox package and a named AppArmor profile. Use `deepseek-team setup --runtime codex --with-sandbox --no-key` for that explicit, administrator-authorized step. Ordinary setup never invokes `sudo`; on other distributions install the system prerequisites yourself.
-- For Claude Code, substitute `claude` for `codex` in `--runtime` and `--coordinator`, or pass `both` to prepare both coordinators.
-- Codex owns native hook trust: review and trust the installed hook once with `/hooks`. In Claude Code, start a fresh session and check `/hooks` there. The package cannot trust hooks for you, and after an update you should restart the session so refreshed guidance loads.
+- For Claude Code, substitute `claude` for `codex` in `--runtime` and `--coordinator`, or pass `both` to prepare both coordinators. For Qwen inside the DeepSeek Harness, use `qwen` (or `all` for every coordinator); the DSH bridge plugin and the shared `AGENTS.md` block are described in the [DSH guide](https://github.com/kirill31337/deepseek-team/blob/main/docs/DSH.md).
+- Codex owns native hook trust: review and trust the installed hook once with `/hooks`. In Claude Code, start a fresh session and check `/hooks` there. The package cannot trust hooks for you, and after an update you should restart the session so refreshed guidance loads. For Qwen (DSH), reload the DSH profile or restart DSH so the bridge plugin loads, then start a new session.
 - Attached projects keep their own managed blocks: on each session start and prompt, an explicitly attached project checks and, when stale, updates both existing `AGENTS.md` and `CLAUDE.md` blocks from the current packaged template and effective settings. Unattached projects are never created, scanned or registered.
 - Starting with 0.8.12, when you launch Codex or Claude Code from a common parent directory, select one explicitly attached repository with `DEEPSEEK_TEAM_PROJECT_ROOT=/absolute/repo/root`. This selects the DeepSeek hook context only: it does not make Codex or Claude Code discover child or native instructions automatically. Keep using the real project directory for tool and worker commands, and pass `--path` to coordination commands. An attached, enabled target without a bound selection keeps showing selection guidance, a workdir in a different repository cannot reuse another plan, and an ambiguous working-directory change stays unscoped. The variable never attaches a project, widens access or changes the mandatory OS sandbox.
 - `setup` refreshes only managed blocks that already exist in the nearest ancestor Git repository. Unrelated ancestor Git metadata without an owned block is ignored, while a real corrupt-control error in an owned block is still reported.
@@ -109,7 +109,7 @@ A few notes:
   owned block - in your own text or a fenced example - has no effect. The package then
   regenerates a compact (under 4 KB) block that mandates reading the human-maintained
   `docs/agents/delegation.md` at the repository root and points at the live
-  `deepseek-team status` and `config show --effective --instructions --runtime codex|claude`
+  `deepseek-team status` and `config show --effective --instructions --runtime codex|claude|qwen`
   commands instead of embedding an effective-profile snapshot.
 - Before enabling linked mode in a project, upgrade to 0.8.8 or newer and create a nonempty,
   regular, UTF-8 `docs/agents/delegation.md` at the repository root that holds the actual
@@ -327,7 +327,7 @@ Once setup and attachment are done, you do not run workers by hand. Ask in your 
 
 The coordinator splits that into bounded assignments, runs them through the worker queue and reports the accepted work.
 
-Final-summary guidance ships with the package for both Codex and Claude Code. While DeepSeek Team is enabled, summaries of performed work include short bullets separating the coordinator's personal work from accepted DeepSeek results, including any rework or failed attempts, and then an approximate coordinator/DeepSeek split in whole-number percentages labelled **“subjective estimate, not measured.”** The split reflects accepted scope and complexity with review and rework; it is never derived from call, task, file, line, token or time counts and is not router feedback. Session start injects the current policy for Codex and Claude Code; when a block refresh changes or fails, the next prompt supplies fresh guidance so a stale loaded block does not linger. Updating the package refreshes hook guidance, each attached project refreshes its own blocks at the next session or prompt, and `setup` refreshes the blocks in its current repository. Run `init` only to attach a project for the first time or to deliberately repair its blocks.
+Final-summary guidance ships with the package for Codex, Claude Code and Qwen (DSH). While DeepSeek Team is enabled, summaries of performed work include short bullets separating the coordinator's personal work from accepted DeepSeek results, including any rework or failed attempts, and then an approximate coordinator/DeepSeek split in whole-number percentages labelled **“subjective estimate, not measured.”** The split reflects accepted scope and complexity with review and rework; it is never derived from call, task, file, line, token or time counts and is not router feedback. Session start injects the current policy for every coordinator runtime; when a block refresh changes or fails, the next prompt supplies fresh guidance so a stale loaded block does not linger. Updating the package refreshes hook guidance, each attached project refreshes its own blocks at the next session or prompt, and `setup` refreshes the blocks in its current repository. Run `init` only to attach a project for the first time or to deliberately repair its blocks.
 
 ## Current defaults
 
@@ -440,7 +440,7 @@ deepseek-team update --json          # one JSON report on stdout; notices on std
 deepseek-team update --manager uv --version 0.12.0 --runtime both
 ```
 
-It supports pip inside a virtual environment, pipx and uv, and accepts `--manager auto|pip|pipx|uv`, `--runtime auto|codex|claude|both` (default `auto`), `--version VERSION` and `--json`. Ambiguous, editable or local-source installations, and a conflicting explicit manager, are refused before replacement with recovery guidance. Exit status `0` means the package update and hook refresh completed; `3` means they completed with `status` `action_required` and entries in `required_actions`; `78` means failure, including an incomplete post-upgrade refresh. The report includes `schema_version`, `version`, `status`, `hooks`, `required_actions` and `requires_user_action`.
+It supports pip inside a virtual environment, pipx and uv, and accepts `--manager auto|pip|pipx|uv`, `--runtime auto|codex|claude|qwen|both|all` (default `auto`), `--version VERSION` and `--json`. Ambiguous, editable or local-source installations, and a conflicting explicit manager, are refused before replacement with recovery guidance. Exit status `0` means the package update and hook refresh completed; `3` means they completed with `status` `action_required` and entries in `required_actions`; `78` means failure, including an incomplete post-upgrade refresh. The report includes `schema_version`, `version`, `status`, `hooks`, `required_actions` and `requires_user_action`.
 
 Existing installations must upgrade once through the manager they already use, because the `update` command appears only with the new package:
 
@@ -466,10 +466,11 @@ deepseek-team reset --runtime codex                         # remove managed int
 pipx uninstall deepseek-team
 ```
 
-`detach` preserves your own instruction content, and `reset` removes only the package-owned provider block and hooks; your primary authentication and unrelated configuration are kept. Saved keys are **not** deleted by uninstall. For uv use `uv tool uninstall deepseek-team`; for a venv use its `python -m pip uninstall deepseek-team`. Substitute `claude` or `both` for `codex` wherever your runtime differs.
+`detach` preserves your own instruction content, and `reset` removes only the package-owned provider block and hooks; your primary authentication and unrelated configuration are kept. Saved keys are **not** deleted by uninstall. For uv use `uv tool uninstall deepseek-team`; for a venv use its `python -m pip uninstall deepseek-team`. Substitute `claude`, `qwen`, `both` or `all` for `codex` wherever your runtime differs; `reset --runtime qwen` removes only the owned bridge block from the DSH profile patch.
 
 ## Further reading
 
+- [DSH guide](https://github.com/kirill31337/deepseek-team/blob/main/docs/DSH.md) - the Qwen coordinator inside the DeepSeek Harness: bridge plugin, event coverage and profile loading.
 - [Routing guide](https://github.com/kirill31337/deepseek-team/blob/main/docs/ROUTING.md) - classifier, router, admission, evidence and feedback.
 - [Overhead contract](https://github.com/kirill31337/deepseek-team/blob/main/docs/OVERHEAD_CONTRACT.md) - shipped software guarantees and agent recommendations for check reuse, preparation memory, waiting and review.
 - [Delegation lessons](https://github.com/kirill31337/deepseek-team/blob/main/docs/DELEGATION_LESSONS.md) - the private journal, review cadence and bounded advisory rules.

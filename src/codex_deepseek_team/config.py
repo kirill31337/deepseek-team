@@ -1,4 +1,6 @@
 """Reversible provider setup and private credentials; never change primary auth."""
+from dataclasses import dataclass
+import functools
 import json
 import os
 from pathlib import Path
@@ -8,13 +10,36 @@ import tempfile
 import time
 import tomllib
 
-from . import worker
-
 BEGIN = b'# >>> codex-deepseek-team provider >>>'
 END = b'# <<< codex-deepseek-team provider <<<'
-BLOCK = (b'\n\n' + BEGIN + b'\n[model_providers.deepseek]\n' +
-         '\n'.join(f'{key} = {json.dumps(value)}' for key, value in worker.PROVIDER.items()).encode() +
-         b'\n' + END + b'\n')
+
+
+def _worker():
+    """Resolve the worker module lazily; it reads this module for credentials.
+
+    A module-level import would make the dependency circular, so provider
+    constants and error types are resolved through this single accessor.
+    """
+    from . import worker
+    return worker
+
+
+@functools.lru_cache(maxsize=1)
+def provider_block():
+    """Managed provider block built from the single provider definition."""
+    return (b'\n\n' + BEGIN + b'\n[model_providers.deepseek]\n' +
+            '\n'.join(f'{key} = {json.dumps(value)}'
+                      for key, value in _worker().PROVIDER.items()).encode() +
+            b'\n' + END + b'\n')
+
+
+def __getattr__(name):
+    # Former module-level names, resolved lazily so the worker import stays one-way.
+    if name == 'worker':
+        return _worker()
+    if name == 'BLOCK':
+        return provider_block()
+    raise AttributeError(name)
 
 
 CODEX_HOOK_COMMAND = 'deepseek-team coordinator-hook'
@@ -42,6 +67,62 @@ class ConfigError(Exception):
     pass
 
 
+CREDENTIAL_VARIABLE = 'DEEPSEEK_TEAM_CREDENTIAL_FILE'
+DEFAULT_CREDENTIAL_PATH = '.config/codex-deepseek/api-key'
+MAX_CREDENTIAL_BYTES = 4096
+
+
+@dataclass(frozen=True)
+class CredentialLocation:
+    """One provider credential file shared by reads, writes and deletion."""
+
+    path: Path
+    override: bool
+
+    def describe(self):
+        return f'{CREDENTIAL_VARIABLE}={self.path}' if self.override else str(self.path)
+
+
+def credential_location():
+    """Environment override > the private HOME default; never silently fall back.
+
+    ``DEEPSEEK_TEAM_CREDENTIAL_FILE`` names the key file itself and fully replaces
+    the HOME-derived location. A relative path or parent traversal is rejected
+    instead of being resolved against an unpredictable working directory, and an
+    invalid override never falls back to the user default.
+    """
+    configured = os.environ.get(CREDENTIAL_VARIABLE)
+    if not configured:
+        return CredentialLocation(Path.home() / DEFAULT_CREDENTIAL_PATH, False)
+    path = Path(configured)
+    if not path.is_absolute() or '..' in path.parts or not path.name:
+        raise ConfigError(
+            f'{CREDENTIAL_VARIABLE} must be an absolute path to the credential file; '
+            f'the ~/{DEFAULT_CREDENTIAL_PATH} default was not used.')
+    return CredentialLocation(path, True)
+
+
+def credential_search_hint():
+    """Searched location(s) and effective HOME; never key material or file content."""
+    home = Path.home()
+    configured = os.environ.get(CREDENTIAL_VARIABLE)
+    if configured:
+        return (f'{CREDENTIAL_VARIABLE}={configured} '
+                f'(replaces the home default), effective HOME={home}')
+    return f'{home / DEFAULT_CREDENTIAL_PATH} (home default), effective HOME={home}'
+
+
+def credential_source():
+    """Describe where the effective credential comes from; never its value."""
+    environment = _worker().PROVIDER['env_key']
+    if environment in os.environ:
+        return f'the {environment} environment variable'
+    location = credential_location()
+    if location.override:
+        return f'{location.path} (selected by {CREDENTIAL_VARIABLE})'
+    return str(location.path)
+
+
 def read_regular(path):
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -56,11 +137,11 @@ def read_regular(path):
         return source.read()
 
 
-def private_directory(path):
+def private_directory(path, label='Credential/backup directory'):
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     info = path.lstat()
     if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
-        raise ConfigError('Credential/backup directory must be owned by you with mode 700, without symlinks.')
+        raise ConfigError(f'{label} must be owned by you with mode 700, without symlinks.')
 
 
 def sync_directory(path):
@@ -117,13 +198,13 @@ def configure(home):
         raise ConfigError('Invalid model_providers section.')
     if 'deepseek' in providers:
         try:
-            worker.provider_config(home)
-        except worker.WorkerError:
+            _worker().provider_config(home)
+        except _worker().WorkerError:
             raise ConfigError('Existing DeepSeek provider conflicts with this package; no settings changed.') from None
         return False
     if raw and (BEGIN in raw or END in raw):
         raise ConfigError('Managed provider markers are inconsistent; no settings changed.')
-    updated = (raw or b'') + BLOCK
+    updated = (raw or b'') + provider_block()
     parse_config(updated)
     write_config(home, raw, updated)
     return True
@@ -134,13 +215,13 @@ def remove_provider(home):
     raw = read_regular(home / 'config.toml')
     if raw is None or (BEGIN not in raw and END not in raw):
         return False
-    if raw.count(BEGIN) != 1 or raw.count(END) != 1 or BLOCK not in raw:
+    if raw.count(BEGIN) != 1 or raw.count(END) != 1 or provider_block() not in raw:
         raise ConfigError('Managed provider was edited; refusing to remove user changes.')
     try:
-        worker.provider_config(home)
-    except worker.WorkerError:
+        _worker().provider_config(home)
+    except _worker().WorkerError:
         raise ConfigError('Provider was edited; no settings removed.') from None
-    updated = raw.replace(BLOCK, b'', 1)
+    updated = raw.replace(provider_block(), b'', 1)
     parse_config(updated)
     write_config(home, raw, updated)
     return True
@@ -334,25 +415,107 @@ def codex_hooks_status(home):
     return True
 
 
+def _credential_failure(location, reason):
+    """Describe an unsafe or invalid credential by path and reason, never content."""
+    if not location.override:
+        return ConfigError('Saved DeepSeek credential is invalid or not private; review '
+                           '~/.config/codex-deepseek/api-key (directory 700, file 600, current user owner).')
+    return ConfigError(
+        f'Saved DeepSeek credential is invalid or not private ({reason}): '
+        f'{location.describe()}. The override replaces the home default, so '
+        f'~/{DEFAULT_CREDENTIAL_PATH} was not used; require an owned 700 directory '
+        'and a 600 regular file for the current user.')
+
+
+def _open_credential(location):
+    """Open the credential without following links; ``None`` when it is absent.
+
+    Ownership, file type and group/other permission bits are validated on the
+    opened descriptors, so symlinks, foreign-owned entries and shared permissions
+    fail closed instead of being read or written through.
+    """
+    path = location.path
+    try:
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise _credential_failure(location, 'unsafe or inaccessible directory') from None
+    try:
+        info = os.fstat(directory)
+        if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise _credential_failure(location, 'the directory must be owned by you with mode 700')
+        try:
+            descriptor = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                                 dir_fd=directory)
+        except FileNotFoundError:
+            return None
+        except OSError:
+            raise _credential_failure(location, 'unsafe or inaccessible file') from None
+    finally:
+        os.close(directory)
+    try:
+        info = os.fstat(descriptor)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise _credential_failure(location, 'the file must be a regular file owned by you with mode 600')
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def read_credential(location=None):
+    """Read one validated credential; ``None`` means the safe location is empty.
+
+    A missing directory or file is reported as absent only after the directory was
+    opened without following links. Error messages never include stored content.
+    """
+    location = location or credential_location()
+    descriptor = _open_credential(location)
+    if descriptor is None:
+        return None
+    with os.fdopen(descriptor, 'rb') as source:
+        raw = source.read(MAX_CREDENTIAL_BYTES + 1)
+    if len(raw) > MAX_CREDENTIAL_BYTES:
+        raise _credential_failure(location, 'the file is larger than 4096 bytes')
+    try:
+        value = raw.decode('ascii').rstrip('\r\n')
+    except UnicodeDecodeError:
+        raise _credential_failure(location, 'the file is not single ASCII text') from None
+    if not re.fullmatch(r'[!-~]+', value):
+        raise _credential_failure(location, 'the file is not a single nonempty value without whitespace')
+    return value
+
+
 def save_key(value):
     value = value.rstrip('\r\n')
-    if len(value) > 4096 or not re.fullmatch(r'[!-~]+', value):
+    if len(value) > MAX_CREDENTIAL_BYTES or not re.fullmatch(r'[!-~]+', value):
         raise ConfigError('Key must be a single nonempty ASCII value without whitespace, up to 4096 characters.')
-    directory = Path.home() / '.config/codex-deepseek'
-    private_directory(directory)
-    path = directory / 'api-key'
-    previous = read_regular(path)
-    atomic_write(path, value.encode(), previous)
+    location = credential_location()
+    label = (f'{CREDENTIAL_VARIABLE} credential directory {location.path.parent}'
+             if location.override else 'Credential/backup directory')
+    private_directory(location.path.parent, label)
+    previous = read_regular(location.path)
+    atomic_write(location.path, value.encode(), previous)
 
 
 def delete_key():
-    directory = Path.home() / '.config/codex-deepseek'
+    location = credential_location()
+    directory = location.path.parent
     if not directory.exists():
         return False
-    private_directory(directory)
-    path = directory / 'api-key'
-    if read_regular(path) is None:
+    label = (f'{CREDENTIAL_VARIABLE} credential directory {directory}'
+             if location.override else 'Credential/backup directory')
+    private_directory(directory, label)
+    if location.override:
+        # The override is validated exactly like a read; the HOME default keeps its
+        # existing removal behavior.
+        descriptor = _open_credential(location)
+        if descriptor is None:
+            return False
+        os.close(descriptor)
+    elif read_regular(location.path) is None:
         return False
-    path.unlink()
+    location.path.unlink()
     sync_directory(directory)
     return True

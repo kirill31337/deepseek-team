@@ -1,10 +1,10 @@
 """Refresh already configured coordinator hooks after a package upgrade.
 
 This module never installs a first integration. It recognizes package-owned
-records already present in the user's Codex/Claude configuration, migrates
-their definitions with the existing atomic installers, and reports every
-action the user still has to take (native restart/trust or an explicit
-enable/install decision).
+records already present in the user's Codex/Claude configuration or DSH profile
+patch, migrates their definitions with the existing atomic installers, and
+reports every action the user still has to take (native restart/trust or an
+explicit enable/install decision).
 """
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from pathlib import Path
 import shutil
 import sys
 
-from . import __version__, claude_config, config, worker
+from . import __version__, claude_config, config, dsh_config, worker
 
 
 SCHEMA_VERSION = 1
@@ -23,7 +23,7 @@ EXIT_COMPLETED = 0
 EXIT_ACTION_REQUIRED = 3
 EXIT_FAILED = 78
 
-_RUNTIME_NAMES = {'codex': 'Codex', 'claude': 'Claude Code'}
+_RUNTIME_NAMES = {'codex': 'Codex', 'claude': 'Claude Code', 'qwen': 'Qwen (DSH)'}
 _CLI_AUTO_REFRESH = frozenset({
     'config', 'coordination', 'doctor', 'lessons', 'on', 'off', 'routing',
     'sandbox', 'status', 'workspace',
@@ -45,6 +45,13 @@ def _action(code: str, runtime: str, message: str, command: str) -> dict:
 
 def _review_action(runtime: str) -> dict:
     name = _display(runtime)
+    if runtime == 'qwen':
+        return _action(
+            'review_native_hooks', runtime,
+            f'Reload the DeepSeek Harness profile (or restart DSH) and start a new {name} '
+            'session so the bridge plugin loads from the profile patch. DeepSeek Team cannot '
+            'inspect or grant the native profile load. User confirmation remains pending.',
+            'deepseek-team hooks status --runtime qwen')
     return _action(
         'review_native_hooks', runtime,
         f'Start a new {name} session and review DeepSeek Team in /hooks. '
@@ -66,24 +73,29 @@ def _disabled_action(runtime: str) -> dict:
 
 def _install_action(runtime: str) -> dict:
     name = _display(runtime)
+    tail = ('then reload the DSH profile (or restart DSH) and start a new session.'
+            if runtime == 'qwen' else
+            f'then start a new {name} session and review DeepSeek Team in /hooks.')
     return _action(
         'install_hooks', runtime,
         f'No existing DeepSeek Team {name} hook integration was found. Refresh never '
         'creates a new integration; configure it explicitly with the command below, '
-        f'then start a new {name} session and review DeepSeek Team in /hooks. '
-        'User confirmation remains pending.',
+        + tail + ' User confirmation remains pending.',
         f'deepseek-team hooks install --runtime {runtime}')
 
 
 def _repair_action(runtime: str, error) -> dict:
     name = _display(runtime)
+    tail = ('After repair, reload the DSH profile (or restart DSH) and start a new session.'
+            if runtime == 'qwen' else
+            f'After repair, start a new {name} session and review DeepSeek Team in /hooks. '
+            'Approve native hook trust if prompted.')
     return _action(
         'repair_hooks', runtime,
         f'DeepSeek Team could not refresh the {name} coordination hooks: {_detail(error)}. '
         'Existing configuration was preserved where possible. Repair the reported '
         'problem, then rerun the command below. '
-        f'After repair, start a new {name} session and review DeepSeek Team in /hooks. '
-        'Approve native hook trust if prompted. User confirmation remains pending.',
+        + tail + ' User confirmation remains pending.',
         f'deepseek-team hooks refresh --runtime {runtime} --notify')
 
 
@@ -139,14 +151,47 @@ def _refresh_claude(home: Path):
     return _rowed('claude', 'refreshed' if changed else 'current', changed), []
 
 
+def _qwen_executable():
+    """Use recorded owned evidence before any PATH coordinator discovery."""
+    recorded = dsh_config.owned_entrypoints()
+    if len(recorded) == 1:
+        return recorded[0]
+    running = Path(sys.argv[0])
+    if running.name == 'deepseek-team' and _looks_executable(running):
+        return running
+    try:
+        found = shutil.which('deepseek-team')
+    except OSError:
+        found = None
+    if found:
+        return Path(found)
+    candidate = Path(sys.executable).parent / 'deepseek-team'
+    if _looks_executable(candidate):
+        return candidate
+    if recorded:
+        return recorded[0]
+    return None
+
+
+def _refresh_qwen():
+    """Return ``(row, extra_actions)`` or ``None`` for no owned integration."""
+    if not dsh_config.owned():
+        return None, []
+    executable = _qwen_executable()
+    changed = dsh_config.install(executable=executable)
+    return _rowed('qwen', 'refreshed' if changed else 'current', changed), []
+
+
 def _selected_runtimes(runtime: str) -> tuple[str, ...]:
     if runtime == 'auto':
-        return ('codex', 'claude')
+        return ('codex', 'claude', 'qwen')
     if runtime == 'both':
         return ('codex', 'claude')
-    if runtime in ('codex', 'claude'):
+    if runtime == 'all':
+        return ('codex', 'claude', 'qwen')
+    if runtime in ('codex', 'claude', 'qwen'):
         return (runtime,)
-    raise ValueError('runtime must be auto, codex, claude or both')
+    raise ValueError('runtime must be auto, codex, claude, qwen, both or all')
 
 
 def _status(hooks: list[dict], actions: list[dict]) -> str:
@@ -157,26 +202,38 @@ def _status(hooks: list[dict], actions: list[dict]) -> str:
     return 'completed'
 
 
-def refresh_installed(runtime: str = 'auto', *, notify: bool = False) -> dict:
+def refresh_installed(runtime: str = 'auto', *, notify: bool = False,
+                      implicit: bool = False) -> dict:
     """Refresh package-owned hook definitions already present in user config.
 
     ``runtime='auto'`` discovers ownership only from existing configuration files.
     Missing or foreign-only auto integrations are quiet no-ops and are never
     created. Explicit runtimes report missing integrations as user action.
+    ``implicit`` marks the best-effort first-use CLI refresh: it never touches
+    the DSH profile, whose bridge migration stays an explicit user action.
     """
     selected = _selected_runtimes(runtime)
+    if implicit and runtime == 'auto':
+        selected = tuple(name for name in selected if name != 'qwen')
     automatic = runtime == 'auto'
     hooks: list[dict] = []
     actions: list[dict] = []
     for name in selected:
         try:
-            home = worker.codex_home() if name == 'codex' else claude_config.claude_home()
-            if name == 'codex':
-                outcome = _refresh_codex(home)
-                extra_actions = []
+            if name == 'qwen':
+                outcome, extra_actions = _refresh_qwen()
             else:
-                outcome, extra_actions = _refresh_claude(home)
+                home = worker.codex_home() if name == 'codex' else claude_config.claude_home()
+                if name == 'codex':
+                    outcome = _refresh_codex(home)
+                    extra_actions = []
+                else:
+                    outcome, extra_actions = _refresh_claude(home)
         except Exception as error:
+            if automatic and name == 'qwen' and isinstance(error, config.ConfigError):
+                # Auto discovery stays quiet when DSH is absent or its profile
+                # choice is ambiguous; an explicit --runtime qwen still reports it.
+                continue
             row = _rowed(name, 'failed', False)
             hooks.append(row)
             actions.append(_repair_action(name, error))
@@ -218,7 +275,7 @@ def render_required_actions(report: dict) -> str:
 
 
 def _failure_report(error, runtime: str) -> dict:
-    name = runtime if runtime in ('codex', 'claude') else 'codex'
+    name = runtime if runtime in ('codex', 'claude', 'qwen') else 'codex'
     action = _repair_action(name, error)
     return {
         'schema_version': SCHEMA_VERSION,
@@ -241,8 +298,8 @@ def _exit_code(report: dict) -> int:
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog='deepseek-team hooks refresh',
-        description='Refresh already configured Codex/Claude coordination hooks.')
-    parser.add_argument('--runtime', choices=['auto', 'codex', 'claude', 'both'],
+        description='Refresh already configured Codex/Claude/Qwen coordination hooks.')
+    parser.add_argument('--runtime', choices=['auto', 'codex', 'claude', 'qwen', 'both', 'all'],
                         default='auto', help='Existing integrations to refresh; default auto.')
     parser.add_argument('--notify', action='store_true',
                         help='Always report restart and native /hooks review guidance.')
@@ -290,7 +347,7 @@ def refresh_for_cli(argv) -> None:
     if not _automatic_allowed(argv):
         return
     try:
-        report = refresh_installed('auto')
+        report = refresh_installed('auto', implicit=True)
         text = render_required_actions(report)
         if text:
             print(text, file=sys.stderr)

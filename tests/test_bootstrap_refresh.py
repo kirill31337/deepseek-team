@@ -39,6 +39,8 @@ class BootstrapRefreshCase(unittest.TestCase):
         (self.root / 'home').mkdir()
         environment = mock.patch.dict(os.environ, {
             'HOME': str(self.root / 'home'),
+            'DSH_HOME': str(self.root / 'dsh-home'),
+            'DEEPSEEK_TEAM_DSH_PROFILE': '',
             'CODEX_HOME': str(self.root / 'codex'),
             'CLAUDE_CONFIG_DIR': str(self.root / 'claude'),
             'XDG_CONFIG_HOME': str(self.root / 'config'),

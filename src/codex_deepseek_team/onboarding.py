@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import sys
 
-from . import claude_config, config, doctor, project, sandbox, settings, state_storage, worker
+from . import claude_config, config, doctor, dsh_config, project, sandbox, settings, state_storage, worker
 
 
 def _configure(runtimes):
@@ -26,6 +26,14 @@ def _configure(runtimes):
               else 'Claude coordination hooks already installed.')
         print('Claude model, permissions, authentication and unrelated hooks were preserved.')
         print('Start a new Claude session and check /hooks; native settings may disable hooks.')
+    if 'qwen' in runtimes:
+        changed = dsh_config.install()
+        print('Qwen DSH bridge installed.' if changed
+              else 'Qwen DSH bridge already installed.')
+        print('DSH model, authentication, profile bundles and unrelated plugin rows were preserved.')
+        print('Reload the DSH profile (or restart DSH) and start a new session; the bridge '
+              'loads from the profile patch. Workers use the package-native DeepSeek loop; '
+              'no Codex/Claude CLI is required.')
 
 
 def _current_repository():
@@ -49,8 +57,8 @@ def _current_repository_owns_blocks(repository):
     return any(project.owns_block(repository, runtime) for runtime in project.TARGETS)
 
 
-def _refresh_current_repository():
-    """Refresh both owned blocks in the current repository only.
+def _refresh_current_repository(runtimes=('codex', 'claude')):
+    """Refresh owned blocks in the current repository only.
 
     Detection runs before any Git or policy work: when the nearest repository
     carries no owned block at all (for example an unrelated ancestor with a stray
@@ -69,9 +77,10 @@ def _refresh_current_repository():
         return False
     if not owned:
         return True
+    coordinator = 'qwen' if tuple(runtimes) == ('qwen',) else 'both'
     try:
         policy = settings.resolve(repository)
-        changed, problem = project.refresh_attached(repository, policy, coordinator='both')
+        changed, problem = project.refresh_attached(repository, policy, coordinator=coordinator)
     except (settings.SettingsError, project.ProjectError) as error:
         print('Managed instruction refresh skipped: ' + str(error))
         return False
@@ -127,6 +136,13 @@ def _ubuntu_sandbox():
 
 def _prerequisites(runtimes, with_sandbox):
     for runtime in runtimes:
+        if runtime == 'qwen':
+            if dsh_config.detect_profile() is None:
+                raise ValueError('No DeepSeek Harness profile was found under '
+                                 + str(dsh_config.profiles_root()) + '. Install/start DSH once '
+                                 'or set DEEPSEEK_TEAM_DSH_PROFILE, then rerun '
+                                 'deepseek-team setup --runtime qwen.')
+            continue
         if not shutil.which(runtime):
             name = 'Codex CLI' if runtime == 'codex' else 'Claude Code CLI'
             raise ValueError(f'{name} ({runtime}) is not on PATH. Install it and restart your '
@@ -176,16 +192,21 @@ def run(runtimes, *, no_key=False, with_sandbox=False):
         return error.code
     print(f'Worker storage: ready ({selected_state}).')
     _configure(runtimes)
-    if not _refresh_current_repository():
+    if not _refresh_current_repository(runtimes):
         print('Setup incomplete: resolve the managed instruction refresh error and rerun setup.')
         return 78
-    runtime_arg = 'both' if len(runtimes) == 2 else runtimes[0]
-    code = doctor.main(['--runtime', runtime_arg, '--offline'])
-    if code:
-        print('Setup incomplete: resolve the local diagnostic above and rerun setup.')
-        return code
+    selector = {('codex',): 'codex', ('claude',): 'claude', ('qwen',): 'qwen',
+                ('codex', 'claude'): 'both',
+                ('codex', 'claude', 'qwen'): 'all'}.get(tuple(runtimes))
+    doctor_targets = [selector] if selector else list(runtimes)
+    for target in doctor_targets:
+        code = doctor.main(['--runtime', target, '--offline'])
+        if code:
+            print('Setup incomplete: resolve the local diagnostic above and rerun setup.')
+            return code
     for runtime in runtimes:
         healthy = (config.codex_hooks_status(worker.codex_home()) if runtime == 'codex'
+                   else dsh_config.status() if runtime == 'qwen'
                    else claude_config.status())
         if not healthy:
             print(f'Setup incomplete: {runtime} hooks are missing or disabled. '
@@ -193,9 +214,14 @@ def run(runtimes, *, no_key=False, with_sandbox=False):
             return 78
     if not _credential(no_key):
         return 78
-    print('Local setup checks passed. Native hook trust/session loading still requires /hooks.')
-    print(f'Attach your project explicitly: deepseek-team init --coordinator {runtime_arg} /path/to/project')
-    print(f'Then in that project: deepseek-team doctor --runtime {runtime_arg} --offline')
+    attach_args = [selector] if selector else list(runtimes)
+    if tuple(runtimes) == ('qwen',):
+        print('Local setup checks passed. Reload the DSH profile (or restart DSH) and start a new session.')
+    else:
+        print('Local setup checks passed. Native hook trust/session loading still requires /hooks.')
+    for arg in attach_args:
+        print(f'Attach your project explicitly: deepseek-team init --coordinator {arg} /path/to/project')
+        print(f'Then in that project: deepseek-team doctor --runtime {arg} --offline')
     print('Fresh Auto access is read-only: workers inspect and report, they do not change the project.')
     print('To let them implement inside an isolated copy, opt in explicitly from that project:')
     print('deepseek-team config set --project --access full-access')
@@ -203,8 +229,10 @@ def run(runtimes, *, no_key=False, with_sandbox=False):
           'configured hooks together, or rerun setup once per installed runtime. If you '
           'upgraded directly with a package manager, run deepseek-team hooks refresh --runtime '
           'auto --notify --json from the new package, then start a new session and review '
-          'DeepSeek Team in /hooks; setup cannot grant native trust. New sessions then refresh '
-          'the managed blocks in each attached project automatically.')
-    print('Use init only for a first attachment: '
-          f'deepseek-team init --coordinator {runtime_arg} /path/to/project')
+          'DeepSeek Team in /hooks (or reload the DSH profile for Qwen); setup cannot grant '
+          'native trust. New sessions then refresh the managed blocks in each attached project '
+          'automatically.')
+    for arg in attach_args:
+        print('Use init only for a first attachment: '
+              f'deepseek-team init --coordinator {arg} /path/to/project')
     return 0

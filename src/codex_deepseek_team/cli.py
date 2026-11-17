@@ -12,15 +12,26 @@ from . import __version__
 def _runtimes(value):
     if value == 'both':
         return ('codex', 'claude')
-    if value in ('codex', 'claude'):
+    if value == 'all':
+        return ('codex', 'claude', 'qwen')
+    if value in ('codex', 'claude', 'qwen'):
         return (value,)
     if value == 'auto':
         found = tuple(name for name in ('codex', 'claude') if shutil.which(name))
+        from . import dsh_config
+        try:
+            if dsh_config.detect_profile() is not None:
+                found += ('qwen',)
+        except Exception:
+            # An ambiguous or inaccessible DSH profile never breaks CLI auto
+            # detection for the installed coordinator CLIs.
+            pass
         if found:
             return found
-        raise ValueError('Neither Codex CLI nor Claude Code CLI is on PATH. Install a coordinator, '
-                         'restart your terminal, and rerun with --runtime auto.')
-    raise ValueError('runtime must be codex, claude, both or auto')
+        raise ValueError('Neither Codex CLI, Claude Code CLI nor a DeepSeek Harness profile '
+                         'is available. Install a coordinator, restart your terminal, and '
+                         'rerun with --runtime auto.')
+    raise ValueError('runtime must be codex, claude, qwen, both, all or auto')
 
 
 def _sandbox_status(sandbox):
@@ -51,7 +62,7 @@ def _upgrade_cleanup():
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if sys.platform != 'linux':
-        print('This release supports Linux with Python 3.11+ and Codex and/or Claude Code.', file=sys.stderr)
+        print('This release supports Linux with Python 3.11+ and Codex, Claude Code or Qwen (DSH).', file=sys.stderr)
         return 78
     from . import hook_refresh
     hook_refresh.refresh_for_cli(argv)
@@ -61,7 +72,7 @@ def main(argv=None):
     if argv and argv[0] == 'update':
         from . import updates
         return updates.main(argv[1:])
-    from . import activation, claude_config, config, doctor, sandbox, settings, worker
+    from . import activation, claude_config, config, doctor, dsh_config, sandbox, settings, worker
     if argv and argv[0] == 'coordinator-hook':
         from . import coordinator_hooks
         return coordinator_hooks.main(argv[1:])
@@ -95,18 +106,18 @@ def main(argv=None):
         toggle.add_argument('path', nargs='?', type=Path, default=Path.cwd())
         toggle.add_argument('--json', action='store_true', help='Print effective and saved activation as JSON.')
     setup = commands.add_parser('setup', help='Configure DeepSeek and check local readiness; preserve primary auth/model.')
-    setup.add_argument('--runtime', choices=['codex', 'claude', 'both', 'auto'], default='auto',
-                       help='Coordinator runtime(s) to prepare; default auto detects installed CLIs.')
+    setup.add_argument('--runtime', choices=['codex', 'claude', 'qwen', 'both', 'all', 'auto'], default='auto',
+                       help='Coordinator runtime(s) to prepare; default auto detects installed CLIs and DSH profiles.')
     setup.add_argument('--no-key', action='store_true', help='Defer authentication without reading or prompting for a key.')
     setup.add_argument('--with-sandbox', action='store_true',
                        help='Explicitly allow Ubuntu package/AppArmor setup with administrator privileges.')
     reset = commands.add_parser('reset', help='Remove only package-owned coordinator configuration; retain keys and primary auth.')
-    reset.add_argument('--runtime', choices=['codex', 'claude', 'both', 'auto'], default='codex')
+    reset.add_argument('--runtime', choices=['codex', 'claude', 'qwen', 'both', 'all', 'auto'], default='codex')
     for name, help_text in [('init', 'Attach delegation instructions to a Git repository.'),
                             ('detach', 'Remove the managed instructions and preserve user content.')]:
         sub = commands.add_parser(name, help=help_text)
-        sub.add_argument('--coordinator', choices=['codex', 'claude', 'both'], default='codex',
-                         help='Instruction file(s) to manage; default codex.')
+        sub.add_argument('--coordinator', choices=['codex', 'claude', 'qwen', 'both', 'all'], default='codex',
+                         help='Instruction file(s) to manage; default codex. Qwen shares AGENTS.md with Codex.')
         sub.add_argument('path', nargs='?', type=Path, default=Path.cwd())
     auth = commands.add_parser('auth', help='Manage the private user-level DeepSeek credential.')
     auth_commands = auth.add_subparsers(dest='auth_command', required=True)
@@ -114,15 +125,15 @@ def main(argv=None):
     setter.add_argument('--stdin', action='store_true', help='Read from a pipe; never pass a key as a command argument.')
     auth_commands.add_parser('status', help='Report whether a usable key is present, without displaying it.')
     auth_commands.add_parser('remove', help='Delete the saved key; environment overrides are unaffected.')
-    hooks_cmd = commands.add_parser('hooks', help='Manage user-level Codex/Claude coordination hooks.')
+    hooks_cmd = commands.add_parser('hooks', help='Manage user-level Codex/Claude coordination hooks and the Qwen DSH bridge.')
     hooks_commands = hooks_cmd.add_subparsers(dest='hooks_command', required=True)
     for name in ('install', 'status', 'remove'):
         hook_action = hooks_commands.add_parser(name)
-        hook_action.add_argument('--runtime', choices=['codex', 'claude', 'both', 'auto'], default='codex',
+        hook_action.add_argument('--runtime', choices=['codex', 'claude', 'qwen', 'both', 'all', 'auto'], default='codex',
                                  help='Coordinator hooks to manage; default codex.')
     refresh = hooks_commands.add_parser(
         'refresh', help='Refresh already configured hooks; never installs a new integration.')
-    refresh.add_argument('--runtime', choices=['codex', 'claude', 'both', 'auto'], default='auto',
+    refresh.add_argument('--runtime', choices=['auto', 'codex', 'claude', 'qwen', 'both', 'all'], default='auto',
                          help='Existing coordinator hooks to refresh; default auto.')
     refresh.add_argument('--notify', action='store_true',
                          help='Always report restart and native /hooks review guidance.')
@@ -171,6 +182,9 @@ def main(argv=None):
             if 'claude' in runtimes:
                 print('Managed Claude coordination hooks removed.' if claude_config.remove()
                       else 'No package-owned Claude hooks to remove.')
+            if 'qwen' in runtimes:
+                print('Managed Qwen DSH bridge removed.' if dsh_config.remove()
+                      else 'No package-owned Qwen DSH bridge to remove.')
         elif args.command in ['init', 'detach']:
             from . import project
             if args.command == 'init':
@@ -193,7 +207,10 @@ def main(argv=None):
                 print('Saved key removed.' if config.delete_key() else 'No saved key was present.')
             else:
                 present = bool(worker.load_api_key().strip())
-                print('Key available; value omitted.' if present else 'No key configured.')
+                if present:
+                    print(f'Key available from {config.credential_source()}; value omitted.')
+                else:
+                    print(f'No key configured; searched {config.credential_search_hint()}.')
                 return 0 if present else 78
         elif args.command == 'hooks':
             if args.hooks_command == 'refresh':
@@ -205,6 +222,21 @@ def main(argv=None):
                 return hook_refresh.main(refresh_argv)
             healthy = True
             for runtime in _runtimes(args.runtime):
+                if runtime == 'qwen':
+                    if args.hooks_command == 'install':
+                        changed = dsh_config.install()
+                        print('Qwen DSH bridge installed.' if changed else 'Qwen DSH bridge already installed.')
+                        print('Reload the DSH profile (or restart DSH) and start a new session; '
+                              'the bridge loads from the profile patch.')
+                    elif args.hooks_command == 'remove':
+                        print('Qwen DSH bridge removed.' if dsh_config.remove()
+                              else 'No package-owned Qwen DSH bridge was present.')
+                    else:
+                        installed = dsh_config.status()
+                        print('Qwen DSH bridge installed; the DSH profile must load it (profile reload or restart).'
+                              if installed else 'Qwen DSH bridge is missing or modified in the DSH profile patch.')
+                        healthy = healthy and installed
+                    continue
                 if runtime == 'claude':
                     if args.hooks_command == 'install':
                         changed = claude_config.install()

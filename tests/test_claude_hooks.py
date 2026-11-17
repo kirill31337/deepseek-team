@@ -39,7 +39,7 @@ class ClaudeHooksTests(unittest.TestCase):
         self.settings = self.claude / 'settings.json'
         self.state = self.root / 'state'
         environment = mock.patch.dict(os.environ, {
-            'HOME': str(self.home), 'CLAUDE_CONFIG_DIR': str(self.claude),
+            'HOME': str(self.home), 'DSH_HOME': str(self.root / 'dsh-home'), 'DEEPSEEK_TEAM_DSH_PROFILE': '', 'CLAUDE_CONFIG_DIR': str(self.claude),
             'CODEX_HOME': str(self.home / '.codex'),
             'XDG_CONFIG_HOME': str(self.root / 'config'),
             'XDG_STATE_HOME': str(self.root / 'xdg-state'),

@@ -11,6 +11,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -714,7 +715,10 @@ def verify_checks(copy: Workspace, commands: list[str] | None = None,
                 binary if runtime == 'codex' else 'codex',
                 binary if runtime == 'claude' else 'claude', context_factory,
                 explicit_codex=runtime == 'codex' and explicit,
-                explicit_claude=runtime == 'claude' and explicit)
+                explicit_claude=runtime == 'claude' and explicit,
+                qwen=(binary if runtime == 'qwen' and explicit
+                      else str(Path(sys.executable).resolve())),
+                explicit_qwen=runtime == 'qwen' and explicit)
             layout, env = selection.layout, selection.environment
             directory = copy.directory / 'diagnostics'
             before = prepared_inputs.input_snapshot(copy)

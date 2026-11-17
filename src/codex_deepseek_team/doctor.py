@@ -124,15 +124,34 @@ def api_probe():
 def selected_runtimes(value):
     if value == 'both':
         return ('codex', 'claude')
-    if value in ('codex', 'claude'):
+    if value == 'all':
+        return ('codex', 'claude', 'qwen')
+    if value in ('codex', 'claude', 'qwen'):
         return (value,)
     found = tuple(name for name in ('codex', 'claude') if shutil.which(name))
+    from codex_deepseek_team import dsh_config
+    try:
+        if dsh_config.detect_profile() is not None:
+            found += ('qwen',)
+    except Exception:
+        pass
     if found:
         return found
-    raise worker.WorkerError(78, 'Neither Codex nor Claude Code is available for --runtime auto.')
+    raise worker.WorkerError(78, 'Neither Codex, Claude Code nor a DeepSeek Harness profile '
+                                 'is available for --runtime auto.')
 
 
 def check_runtime(runtime):
+    if runtime == 'qwen':
+        # The native qwen harness is the package's own DeepSeek loop; it needs
+        # no Codex/Claude CLI. Verify the interpreter and the packaged script.
+        from codex_deepseek_team import development, native_worker
+        development.check_runtime(str(Path(sys.executable).resolve()), 'qwen')
+        if not Path(native_worker.__file__).is_file():
+            raise worker.WorkerError(78, 'The packaged native worker script is missing.')
+        print(sys.version.split()[0])
+        print('Qwen (DSH) coordinator: native DeepSeek worker loop; no Codex/Claude CLI required.')
+        return
     if runtime == 'codex':
         config = worker.provider_config(worker.codex_home())
         version = subprocess.check_output(['codex', '--version'], text=True).strip()
@@ -182,7 +201,8 @@ def check_policy_runtime(runtime, policy):
                 return development.prepared_context(empty, backend, home, control,
                     binary, selected, writable=True)
 
-            selection = runtime_preflight.select_runtime(runtime, 'codex', 'claude', context_factory)
+            selection = runtime_preflight.select_runtime(runtime, 'codex', 'claude',
+                context_factory, qwen=str(Path(sys.executable).resolve()))
     except (development.DevelopmentError, runtime_preflight.RuntimePreflightError) as error:
         raise worker.WorkerError(error.code, str(error)) from None
     except (OSError, subprocess.SubprocessError):
@@ -194,12 +214,14 @@ def check_policy_runtime(runtime, policy):
 
 def coordination_status(runtime, root=None):
     """Describe coordinator-process integration without guessing native trust state."""
-    if runtime not in ('codex', 'claude'):
+    if runtime not in ('codex', 'claude', 'qwen'):
         raise worker.WorkerError(64, f'Unsupported coordination runtime: {runtime}.')
-    from codex_deepseek_team import claude_config, config, project, settings
+    from codex_deepseek_team import claude_config, config, dsh_config, project, settings
     try:
         if runtime == 'claude':
             installed = 'installed' if claude_config.status() else 'missing-or-disabled'
+        elif runtime == 'qwen':
+            installed = 'installed' if dsh_config.status() else 'missing-or-modified'
         else:
             installed = 'installed' if config.codex_hooks_status(worker.codex_home()) else 'missing'
     except config.ConfigError as error:
@@ -212,9 +234,13 @@ def coordination_status(runtime, root=None):
             attached = 'attached' if project.is_attached(project_root, runtime) else 'not-attached'
         except project.ProjectError:
             attached = 'invalid-project-binding'
-    trust = ('check effective settings with Claude /hooks; project/managed settings or --bare may disable hooks'
-             if runtime == 'claude' else
-             'native trust must be checked with Codex /hooks; DeepSeek Team does not bypass or infer it')
+    if runtime == 'claude':
+        trust = 'check effective settings with Claude /hooks; project/managed settings or --bare may disable hooks'
+    elif runtime == 'qwen':
+        trust = ('the DSH profile must load the bridge plugin; check deepseek-team hooks status '
+                 '--runtime qwen, then reload the profile or restart DSH and start a new session')
+    else:
+        trust = 'native trust must be checked with Codex /hooks; DeepSeek Team does not bypass or infer it'
     return installed, attached, trust
 
 
@@ -238,13 +264,14 @@ def live_tests(runtimes=('codex',), os_sandbox='required', state_dir=None):
     state = state_storage.state_root(state_dir)
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
     for runtime in runtimes:
+        worker_runtime = runtime
         with tempfile.TemporaryDirectory(prefix='doctor-', dir=state) as directory:
             root = Path(directory)
             subprocess.run(['git', 'init', '-q', str(root)], check=True, capture_output=True)
             (root / 'evidence.txt').write_text('DEEPSEEK_TEAM_SYNTHETIC_EVIDENCE')
             before = repository_fingerprint(root)
             print(f'Running one {runtime} read-only worker on synthetic data; no total deadline...', flush=True)
-            result = call('Read only evidence.txt. Return its exact content and DEEPSEEK_TEAM_OK. Do not read other files, run tests, use network or write anything.', cwd=root, runtime=runtime, os_sandbox=os_sandbox, state_dir=state)
+            result = call('Read only evidence.txt. Return its exact content and DEEPSEEK_TEAM_OK. Do not read other files, run tests, use network or write anything.', cwd=root, runtime=worker_runtime, os_sandbox=os_sandbox, state_dir=state)
             ok = (result.returncode == 0 and 'DEEPSEEK_TEAM_SYNTHETIC_EVIDENCE' in result.stdout
                   and 'DEEPSEEK_TEAM_OK' in result.stdout and before == repository_fingerprint(root))
             print(f'Synthetic {runtime} worker check: ' + ('PASS' if ok else 'FAIL'))
@@ -260,7 +287,7 @@ def main(argv=None):
     group = parser.add_mutually_exclusive_group()
     group.add_argument('--offline', action='store_true', help='Local checks only (default); no network or key reads.')
     group.add_argument('--live', action='store_true', help='Also verify DeepSeek API routing and synthetic worker(s); API charges apply.')
-    parser.add_argument('--runtime', choices=['codex', 'claude', 'both', 'auto'], default='codex',
+    parser.add_argument('--runtime', choices=['codex', 'claude', 'qwen', 'both', 'all', 'auto'], default='codex',
                         help='Runtime(s) to verify; default: codex.')
     parser.add_argument('--os-sandbox', choices=['required'], default='required',
                         help='Verify the required Bubblewrap/AppArmor containment.')

@@ -50,7 +50,7 @@ DOMAIN_VALUES = frozenset((
 OPERATION_VALUES = frozenset((
     "diagnose", "fix", "extend", "refactor", "test", "document", "review", "unknown",
 ))
-RUNTIME_VALUES = frozenset(("codex", "claude"))
+RUNTIME_VALUES = frozenset(("codex", "claude", "qwen"))
 CANONICAL_EFFORTS = frozenset(("low", "high", "max"))
 LEGACY_EFFORT_ALIASES = {"medium": "high"}
 UNKNOWN = "unknown"

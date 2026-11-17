@@ -24,7 +24,7 @@ class StorageTests(unittest.TestCase):
         self.home.mkdir()
         self.codex = self.root / 'codex'
         self.environment = mock.patch.dict(os.environ, {
-            'HOME': str(self.home), 'CODEX_HOME': str(self.codex),
+            'HOME': str(self.home), 'DSH_HOME': str(self.home / 'dsh-home'), 'DEEPSEEK_TEAM_DSH_PROFILE': '', 'CODEX_HOME': str(self.codex),
             'CLAUDE_CONFIG_DIR': str(self.root / 'claude'),
             'XDG_CONFIG_HOME': str(self.root / 'config'),
             'DEEPSEEK_TEAM_STATE_DIR': str(self.state),

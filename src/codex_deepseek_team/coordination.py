@@ -1272,6 +1272,163 @@ def _cleaned_job_evidence(copy, lease):
             'reason_code': (result.get('capture') or {}).get('reason_code')}
 
 
+def _replay_legacy_cancelled_finalization(root, task_id, assignment_id, copy,
+                                          report):
+    """Corroborate one completed no-execution cancellation without repairing it.
+
+    The coordinator may have allocated at a newer source base than the task that
+    owns the assignment. A normal authority repair would need a request and the
+    original A == B baseline, so this narrow replay only accepts the exact
+    publication already persisted for a terminal cleaned cancellation.
+    """
+    from . import workspace_gc, workspace_lifecycle as lifecycle
+
+    task = load_task(root, task_id)
+    row = _assignment(task, assignment_id)
+    persisted = row.get('job_finalization')
+    if persisted is None:
+        return False
+    lease = lifecycle.read(copy)
+    if lease is None or lease.get('phase') != 'cancelled':
+        return False
+    cleanup = lease.get('cleanup')
+    if not isinstance(cleanup, dict):
+        raise CoordinationError('Legacy cancellation cleanup evidence is malformed.', 73)
+    if cleanup.get('state') != 'cleaned':
+        return False
+    if (type(lease.get('schema')) is not int or lease['schema'] != 1
+            or type(cleanup.get('device')) is not int
+            or type(cleanup.get('inode')) is not int
+            or cleanup['device'] < 0 or cleanup['inode'] < 0
+            or not isinstance(cleanup.get('name'), str)
+            or re.fullmatch('[0-9a-f]{32}', cleanup['name']) is None):
+        raise CoordinationError('Legacy cancellation cleanup evidence is malformed.', 73)
+    extras = cleanup.get('extras', [])
+    if (not isinstance(extras, list) or any(
+            not isinstance(extra, dict) or not isinstance(extra.get('name'), str)
+            for extra in extras)):
+        raise CoordinationError('Legacy cancellation cleanup evidence is malformed.', 73)
+    if (lease.get('binding') is not None
+            or lease.get('binding_history') not in (None, [])
+            or lease.get('attempts') != []
+            or lease.get('pending_attempt') is not None):
+        return False
+    lifecycle.authorize_finalization(lease)
+    if not isinstance(report, dict) or report != persisted:
+        raise CoordinationError(
+            'Legacy cancellation replay does not match the saved publication.', 73)
+
+    copy = workspace_gc._load_record(_state_root(), copy.id)
+    if (task.get('id') != task_id or not _task_belongs_to(task, root)
+            or copy.source.resolve() != root):
+        raise CoordinationError('Legacy cancellation belongs to another project/task.', 78)
+    task_head = task.get('base_head')
+    if (not isinstance(task_head, str)
+            or re.fullmatch('(?:[0-9a-f]{40}|[0-9a-f]{64})', task_head) is None):
+        raise CoordinationError('Legacy cancellation task has no valid source baseline.', 73)
+    if (row.get('workspace_id') != copy.id or row.get('job_id') != lease['job_id']
+            or row.get('status') != 'failed'
+            or row.get('error_kind') not in ('environment', 'cancelled')
+            or row.get('failure_stage') != 'preparation'
+            or row.get('job_finalization_request') is not None
+            or row.get('correction_of') is not None
+            or row.get('started_at') is not None
+            or row.get('attempt_id') is not None
+            or row.get('execution_snapshot') is not None
+            or row.get('attempt_history') not in (None, [])
+            or row.get('worker_changes') not in (None, [])
+            or row.get('checks') not in (None, [])):
+        raise CoordinationError(
+            'Legacy cancellation assignment has conflicting execution history.', 73)
+    disposition = row.get('disposition')
+    if (not isinstance(disposition, dict) or disposition.get('kind') != 'rejected'
+            or not isinstance(disposition.get('evidence'), str)
+            or not disposition['evidence'].strip()):
+        raise CoordinationError('Legacy cancellation has no rejected disposition.', 73)
+    item = assignment_deliverable(task, assignment_id)
+    if item.get('correction_of') is not None:
+        raise CoordinationError('Legacy cancellation is linked to a correction.', 73)
+
+    metadata = copy.metadata
+    base_head = metadata.get('base_head')
+    if (copy.metadata.get('coord_task') != task_id
+            or copy.metadata.get('coord_assignment') != assignment_id
+            or metadata.get('job_id') != lease['job_id']
+            or metadata.get('work_inode') != lease['work_inode']
+            or not isinstance(base_head, str)
+            or re.fullmatch('(?:[0-9a-f]{40}|[0-9a-f]{64})', base_head) is None
+            or metadata.get('source_head') not in (None, base_head)
+            or type(metadata.get('attempt')) is not int or metadata['attempt'] != 0
+            or metadata.get('attempt_id') is not None
+            or metadata.get('started_at') is not None
+            or metadata.get('operation') is not None):
+        raise CoordinationError(
+            'Legacy cancellation workspace identity or baseline is inconsistent.', 73)
+    if os.path.lexists(copy.path):
+        raise CoordinationError(
+            'Legacy cancellation workspace has replacement execution data; history preserved.', 73)
+
+    finalization = lease.get('finalization')
+    if finalization is not None and (not isinstance(finalization, dict)
+            or finalization.get('cancelled') is not True
+            or finalization.get('discard_result') is not False
+            or type(finalization.get('result_schema')) is not int
+            or finalization['result_schema'] != 1
+            or finalization.get('discarded') is not False
+            or finalization.get('reason_code') is not None):
+        raise CoordinationError('Legacy cancellation lease decision is inconsistent.', 73)
+    cleaned = _cleaned_job_evidence(copy, lease)
+    if cleaned['schema'] != 1 or cleaned['discarded']:
+        raise CoordinationError('Legacy cancellation retained result is not schema 1.', 73)
+    with lifecycle.directory(copy) as fd:
+        result = workspace_gc.read_result(copy, fd=fd, lease=lease)
+    patch = result.get('patch') if isinstance(result, dict) else None
+    if (not isinstance(result, dict) or type(result.get('schema')) is not int
+            or result['schema'] != 1
+            or result.get('source') != str(copy.source)
+            or result.get('workspace_id') != copy.id
+            or result.get('base_head') != base_head
+            or result.get('job_id') not in (None, lease['job_id'])
+            or result.get('attempt_id') is not None
+            or not isinstance(patch, dict)
+            or type(patch.get('bytes')) is not int or patch['bytes'] != 0
+            or patch.get('sha256') != hashlib.sha256(b'').hexdigest()):
+        raise CoordinationError(
+            'Legacy cancellation retained result does not prove an empty capture.', 73)
+
+    allowed = {'id', 'workspace_id', 'job_id', 'action', 'reason',
+               'allocated_bytes', 'inodes', 'cancelled', 'discarded',
+               'result_schema', 'reason_code', 'evidence', 'at'}
+    if (set(report) - allowed
+            or type(report.get('id')) is not str or report['id'] != copy.id
+            or type(report.get('job_id')) is not str
+            or report['job_id'] != lease['job_id']
+            or ('workspace_id' in report
+                and (type(report['workspace_id']) is not str
+                     or report['workspace_id'] != copy.id))
+            or type(report.get('action')) is not str
+            or report['action'] not in ('cleaned', 'already-cleaned')
+            or ('cancelled' in report and report['cancelled'] is not True)
+            or ('discarded' in report and report['discarded'] is not False)
+            or ('result_schema' in report
+                and (type(report['result_schema']) is not int
+                     or report['result_schema'] != 1))
+            or report.get('reason_code') is not None
+            or not isinstance(report.get('evidence'), str)
+            or not report['evidence'].strip()):
+        raise CoordinationError(
+            'Legacy cancellation publication is malformed or changes its decision.', 73)
+    for key in ('allocated_bytes', 'inodes'):
+        if key in report and (type(report[key]) is not int or report[key] < 0):
+            raise CoordinationError('Legacy cancellation publication usage is malformed.', 73)
+    if ('reason' in report and (not isinstance(report['reason'], str)
+                                or not report['reason'].strip())
+            or ('at' in report and (type(report['at']) not in (int, float)
+                                    or not math.isfinite(report['at'])))):
+        raise CoordinationError('Legacy cancellation publication metadata is malformed.', 73)
+    return True
+
+
 def _preparation_only_history(copy, lease):
     """Accept actual preparation attempts without fabricating execution history."""
     attempts = lease['attempts']
@@ -1491,6 +1648,9 @@ def _publish_job_finalization(root: Path, task_id: str, assignment_id: str,
             with lifecycle.fence(_state_root()), _lock(root):
                 discarding = (report.get('discarded')
                               if type(report.get('discarded')) is bool else None)
+                if _replay_legacy_cancelled_finalization(
+                        root, task_id, assignment_id, copy, report):
+                    return
                 lease, chain, _ = _finalization_authority(
                     root, task_id, assignment_id, copy, discarding=discarding)
                 if lease['phase'] not in lifecycle.FINAL_PHASES:

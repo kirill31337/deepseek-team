@@ -83,7 +83,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument('--manager', choices=('auto', 'pip', 'pipx', 'uv'), default='auto',
                         help='Installation manager; auto verifies installation provenance.')
-    parser.add_argument('--runtime', choices=('auto', 'codex', 'claude', 'both'), default='auto',
+    parser.add_argument('--runtime', choices=('auto', 'codex', 'claude', 'qwen', 'both', 'all'), default='auto',
                         help='Coordinator hooks to refresh; default auto uses owned records.')
     parser.add_argument('--version', metavar='VERSION',
                         help='Install an explicit release, for example 0.12.0.')

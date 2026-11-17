@@ -1,4 +1,4 @@
-"""Shared coordination gates for Codex and Claude Code lifecycle hooks."""
+"""Shared coordination gates for Codex, Claude Code and Qwen (DSH) lifecycle hooks."""
 from __future__ import annotations
 
 import argparse
@@ -144,7 +144,7 @@ def _mutation(payload: dict) -> tuple[bool, list[str], bool]:
         else:
             patch = ''
         return True, _paths_from_apply_patch(patch), False
-    if tool in ("Edit", "Write", "NotebookEdit"):
+    if tool in ("Edit", "Write", "NotebookEdit", "edit", "write"):
         if not isinstance(data, dict):
             return True, [], False
         path = data.get("file_path") or data.get("notebook_path") or data.get("path")
@@ -157,10 +157,18 @@ def _mutation(payload: dict) -> tuple[bool, list[str], bool]:
             value = data.get(key)
             if not command and isinstance(value, str):
                 command = value
+        # DSH terminal_send carries the submitted shell text in ``text``.
+        if not command and tool == "terminal_send":
+            value = data.get("text")
+            if isinstance(value, str):
+                command = value
     return classify_shell_mutation_scoped(command if isinstance(command, str) else "")
 
 
-_NATIVE_START = frozenset(('spawn_agent', 'Agent', 'Task'))
+_NATIVE_START = frozenset(('spawn_agent', 'Agent', 'Task',
+                           # DSH native dispatch tools (Qwen coordinator).
+                           'subagent', 'subagent_fork', 'review_code',
+                           'spawn_teammate', 'workflow', 'ralph'))
 _NATIVE_MESSAGE = frozenset(('send_message', 'send_input', 'followup_task',
                              'assign_agent_task', 'resume_agent'))
 _NATIVE_CONTROLS = frozenset(('id', 'agent_id', 'receiver', 'recipient', 'target',
@@ -177,7 +185,8 @@ def _native_work(payload: dict) -> tuple[bool, str]:
     data = payload.get('tool_input')
     if not isinstance(data, dict):
         return True, ''
-    supplied = [data[key] for key in ('prompt', 'message', 'input', 'items') if key in data]
+    supplied = [data[key] for key in ('prompt', 'message', 'input', 'items',
+                                      'objective', 'script') if key in data]
     has_work = name in _NATIVE_START or any(
         value for key, value in data.items() if key not in _NATIVE_CONTROLS)
     # Accept supported text items, but never treat an unknown nonempty shape as
@@ -291,11 +300,12 @@ def _unbound_event(payload: dict, event: str, resolution, runtime: str) -> dict:
 
 
 def _handle(payload: dict, runtime: str = 'codex') -> dict:
-    if runtime not in ('codex', 'claude'):
+    if runtime not in ('codex', 'claude', 'qwen'):
         raise ValueError('Unsupported coordinator runtime.')
-    # Claude also invokes user hooks inside native subagents. The main thread
-    # owns this ledger; subagents must not open or complete its task.
-    if runtime == 'claude' and payload.get('agent_id'):
+    # Claude also invokes user hooks inside native subagents, and the DSH bridge
+    # can report child-agent events. The main thread owns this ledger; subagents
+    # must not open or complete its task.
+    if runtime in ('claude', 'qwen') and payload.get('agent_id'):
         return {}
     event = payload.get("hook_event_name")
     resolution = coordinator_context.resolve(payload, runtime)
@@ -347,7 +357,11 @@ def _handle(payload: dict, runtime: str = 'codex') -> dict:
         except settings.SettingsError as error:
             resolve_error = error
         if policy is not None:
-            refresh_changed, problem = project.refresh_attached(root, policy)
+            # Qwen shares AGENTS.md with Codex; a Qwen session refreshes that
+            # shared block with its own rendering, while Codex/Claude sessions
+            # keep refreshing both of their native files.
+            refresh_changed, problem = project.refresh_attached(
+                root, policy, coordinator='qwen' if runtime == 'qwen' else 'both')
             if problem:
                 diagnostic = _refresh_diagnostic(problem, runtime)
         enabled = policy.enabled if policy is not None else activation.resolve(root).enabled
@@ -403,7 +417,7 @@ def _handle(payload: dict, runtime: str = 'codex') -> dict:
             "[deepseek-team:TASK_ID:DELIVERABLE_ID] in an approved native prompt/message. "
             "New work sent to an existing agent also requires routing. Simple coordinator-only "
             "answers need no artificial worker. " + effort_context +
-            f"Run assigned workers with --runtime {runtime}. "
+            f"Run assigned workers with --runtime {settings.worker_runtime(runtime)}. "
             "Do not report a useful-work percentage from counts. "
             "Capture a structured features card before execution. In delegation Auto, use executor:auto "
             "to resolve each eligible task from local learning and bounded public evidence. Saved manual "
@@ -443,9 +457,9 @@ def _handle(payload: dict, runtime: str = 'codex') -> dict:
             'Worker storage root: ' + json.dumps(str(selected_state)) + '.\n' +
             f"DeepSeek Team effective profile: {str(policy.delegation_level) + '%' if policy.delegation_level != 'auto' else 'Auto'}/"
             f"{policy.effective_access}; effort={policy.effort}. "
-            f"{'Claude Code' if runtime == 'claude' else 'Codex'} lifecycle enforcement "
+            f"{ {'codex': 'Codex', 'claude': 'Claude Code', 'qwen': 'Qwen (DSH)'}[runtime] } lifecycle enforcement "
             "is active for this explicitly attached project. "
-            f"Run assigned workers with --runtime {runtime}. "
+            f"Run assigned workers with --runtime {settings.worker_runtime(runtime)}. "
         )
         if task:
             base += coordination.summary(task)
@@ -615,8 +629,9 @@ def _hook_refresh_notice(payload, runtime: str) -> str:
     if event not in ('SessionStart', 'UserPromptSubmit'):
         return ''
     # Claude invokes user hooks in native subagents too; only the main thread
-    # may touch the coordinator's user-level integration.
-    if runtime == 'claude' and payload.get('agent_id'):
+    # may touch the coordinator's user-level integration. The DSH bridge only
+    # binds root agents, but the same guard applies defensively.
+    if runtime in ('claude', 'qwen') and payload.get('agent_id'):
         return ''
     from . import hook_refresh
     try:
@@ -669,6 +684,9 @@ _CLAUDE_EVENTS = frozenset({
 _CLAUDE_NONBLOCKING_ERROR_EVENTS = frozenset({
     'SessionStart', 'Stop', 'SubagentStop',
 })
+# Qwen (DSH) speaks the same Claude-compatible hook JSON protocol.
+_CLAUDE_PROTOCOL_RUNTIMES = ('claude', 'qwen')
+_PROTOCOL_LABELS = {'claude': 'Claude', 'qwen': 'Qwen (DSH)'}
 
 
 def _error_detail(error) -> str:
@@ -704,17 +722,18 @@ def _upgrade_notice_diagnostic(runtime: str) -> str:
               'Do not print a second JSON response.')
 
 
-def _claude_input_error(error) -> int:
-    print('DeepSeek Team Claude hook rejected its JSON input because it could not parse '
+def _claude_input_error(error, runtime='claude') -> int:
+    print('DeepSeek Team ' + _PROTOCOL_LABELS.get(runtime, 'Claude') + ' hook rejected its JSON input because it could not parse '
           'one JSON object: ' + _error_detail(error)
-          + '. No Claude action was approved; repair the hook installation and retry.',
+          + '. No coordinator action was approved; repair the hook installation and retry.',
           file=sys.stderr)
     return 2
 
 
-def _claude_processing_error(error, payload) -> int:
+def _claude_processing_error(error, payload, runtime='claude') -> int:
     """Emit an explicit PreToolUse denial or block an unparsed lifecycle action."""
     detail = _error_detail(error)
+    label = _PROTOCOL_LABELS.get(runtime, 'Claude')
     event = payload.get('hook_event_name') if isinstance(payload, dict) else None
     if not isinstance(event, str):
         event = None
@@ -741,7 +760,7 @@ def _claude_processing_error(error, payload) -> int:
               'then submit the prompt again; report this diagnostic if it persists.',
               file=sys.stderr)
         return 2
-    print('DeepSeek Team blocked a Claude lifecycle event because the hook input '
+    print('DeepSeek Team blocked a ' + label + ' lifecycle event because the hook input '
           'identified no supported safe action: ' + detail + '. No action was approved. '
           'Check the native hook definition and local DeepSeek Team settings, then retry.',
           file=sys.stderr)
@@ -750,23 +769,24 @@ def _claude_processing_error(error, payload) -> int:
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog='deepseek-team coordinator-hook')
-    parser.add_argument('--runtime', choices=['codex', 'claude'], default='codex')
+    parser.add_argument('--runtime', choices=['codex', 'claude', 'qwen'], default='codex')
     args = parser.parse_args(argv)
+    claude_protocol = args.runtime in _CLAUDE_PROTOCOL_RUNTIMES
     try:
         payload = json.load(sys.stdin)
     except Exception as error:
-        return (_claude_input_error(error) if args.runtime == 'claude'
+        return (_claude_input_error(error, args.runtime) if claude_protocol
                 else _codex_hook_error(error))
     if not isinstance(payload, dict):
         error = ValueError('hook input must be a JSON object')
-        return (_claude_input_error(error) if args.runtime == 'claude'
+        return (_claude_input_error(error, args.runtime) if claude_protocol
                 else _codex_hook_error(error))
     try:
-        if args.runtime == 'claude':
+        if claude_protocol:
             event = payload.get('hook_event_name')
             if not isinstance(event, str) or event not in _CLAUDE_EVENTS:
                 return _claude_processing_error(
-                    ValueError('unsupported or missing hook event'), payload)
+                    ValueError('unsupported or missing hook event'), payload, args.runtime)
         result = handle(payload, runtime=args.runtime)
         notice = None
         try:
@@ -788,5 +808,5 @@ def main(argv=None) -> int:
                 print(_upgrade_receipt_diagnostic(error), file=sys.stderr, flush=True)
         return 0
     except Exception as error:
-        return (_claude_processing_error(error, payload) if args.runtime == 'claude'
+        return (_claude_processing_error(error, payload, args.runtime) if claude_protocol
                 else _codex_hook_error(error))

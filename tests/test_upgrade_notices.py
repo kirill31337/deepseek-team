@@ -38,6 +38,8 @@ class UpgradeNoticeCase(unittest.TestCase):
         self.entrypoint.chmod(0o700)
         self.environment = mock.patch.dict(os.environ, {
             'HOME': str(self.home),
+            'DSH_HOME': str(self.home / 'dsh-home'),
+            'DEEPSEEK_TEAM_DSH_PROFILE': '',
             'CODEX_HOME': str(self.codex_home),
             'CLAUDE_CONFIG_DIR': str(self.claude_home),
             'XDG_CONFIG_HOME': str(self.xdg_config),

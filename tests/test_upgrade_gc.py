@@ -36,6 +36,8 @@ class UpgradeGcCase(unittest.TestCase):
                             'commit', '-qm', 'base'], check=True)
         environment = mock.patch.dict(os.environ, {
             'HOME': str(self.home),
+            'DSH_HOME': str(self.root / 'dsh-home'),
+            'DEEPSEEK_TEAM_DSH_PROFILE': '',
             'CODEX_HOME': str(self.root / 'codex'),
             'CLAUDE_CONFIG_DIR': str(self.root / 'claude'),
             'XDG_CONFIG_HOME': str(self.root / 'config'),

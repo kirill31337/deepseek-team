@@ -41,7 +41,7 @@ EXCERPT_LIMIT = 240
 SYSTEM_DIRECTORIES = ('/usr/local/bin', '/usr/bin')
 BUDGET_EXIT_CODE = 124
 
-RUNTIME_LABELS = {'codex': 'Codex', 'claude': 'Claude Code'}
+RUNTIME_LABELS = {'codex': 'Codex', 'claude': 'Claude Code', 'qwen': 'Qwen (native)'}
 
 # Coordinator exceptions carrying an explicitly safe, human-written
 # ``.message``. Anything else that escapes ``context_factory`` (including
@@ -64,6 +64,12 @@ CAPABILITIES = {
         ('--bare', '--tools', '--allowedTools', '--disallowedTools', '--permission-mode',
          'dontAsk', '--disable-slash-commands', '--setting-sources', '--strict-mcp-config',
          '--mcp-config', '--no-session-persistence', '--output-format'),
+    ),
+    # The native qwen harness is a Python interpreter running the copied
+    # self-contained loop; readiness is the interpreter plus stdlib JSON/HTTP.
+    'qwen': (
+        ('-I', '-c', 'import json, urllib.request, http.client'),
+        (),
     ),
 }
 
@@ -282,16 +288,19 @@ def _factory_reason(error: BaseException) -> str:
 def select_runtime(requested: str, codex: str, claude: str,
                    context_factory, *, explicit_codex: bool = False,
                    explicit_claude: bool = False,
+                   qwen: str = '', explicit_qwen: bool = False,
                    deadline: float | None = None) -> RuntimeSelection:
     """Select the first runtime that really runs in its prepared namespace.
 
-    ``explicit_codex``/``explicit_claude`` must reflect whether the CLI flag was
-    present, even when its value is the default name: an explicit executable is
-    probed alone and a failure is fatal, never silently replaced by PATH, system
-    or cross-runtime fallback. Default names enumerate deduplicated candidates in
-    PATH order, then ``/usr/local/bin`` and ``/usr/bin``. ``runtime='auto'`` may
-    try Codex and then Claude, but only past runtimes that were not explicitly
-    pinned.
+    ``explicit_codex``/``explicit_claude``/``explicit_qwen`` must reflect whether
+    the CLI flag was present, even when its value is the default name: an explicit
+    executable is probed alone and a failure is fatal, never silently replaced by
+    PATH, system or cross-runtime fallback. Default names enumerate deduplicated
+    candidates in PATH order, then ``/usr/local/bin`` and ``/usr/bin``.
+    ``runtime='auto'`` may try Codex, then Claude, then the native qwen harness,
+    but only past runtimes that were not explicitly pinned. The qwen value is a
+    Python interpreter path (the running interpreter by default), so the native
+    harness remains available without any coordinator CLI installation.
 
     ``deadline`` is an optional ``time.monotonic()`` timestamp shared by the
     whole traversal, both probes of each candidate and the caller's context
@@ -299,7 +308,7 @@ def select_runtime(requested: str, codex: str, claude: str,
     candidate or runtime is attempted; without it every probe keeps its local
     ``PROBE_TIMEOUT`` ceiling (code 78) and normal fallback applies.
     """
-    if requested not in ('auto', 'codex', 'claude'):
+    if requested not in ('auto', 'codex', 'claude', 'qwen'):
         raise RuntimePreflightError(f'Unsupported worker runtime: {requested}.', 64)
     if deadline is not None:
         try:
@@ -311,8 +320,11 @@ def select_runtime(requested: str, codex: str, claude: str,
         plans = [('codex', codex, explicit_codex)]
     elif requested == 'claude':
         plans = [('claude', claude, explicit_claude)]
+    elif requested == 'qwen':
+        plans = [('qwen', qwen, explicit_qwen)]
     else:
-        plans = [('codex', codex, explicit_codex), ('claude', claude, explicit_claude)]
+        plans = [('codex', codex, explicit_codex), ('claude', claude, explicit_claude),
+                 ('qwen', qwen, explicit_qwen)]
 
     failures: list[str] = []
     for runtime, value, explicit in plans:

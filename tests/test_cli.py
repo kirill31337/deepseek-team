@@ -19,7 +19,7 @@ class CliTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        self.env = dict(os.environ, HOME=str(self.root), CODEX_HOME=str(self.root / 'codex'),
+        self.env = dict(os.environ, HOME=str(self.root), DSH_HOME=str(self.root / 'dsh-home'), DEEPSEEK_TEAM_DSH_PROFILE='', CODEX_HOME=str(self.root / 'codex'),
                         XDG_CONFIG_HOME=str(self.root / 'config'),
                         PYTHONPATH=str(Path(__file__).resolve().parents[1] / 'src'))
         self.env.pop('DEEPSEEK_API_KEY', None)

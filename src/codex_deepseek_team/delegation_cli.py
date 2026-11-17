@@ -220,7 +220,7 @@ def main(argv):
         show.add_argument('--path', type=Path)
         show.add_argument('--json', action='store_true')
         show.add_argument('--instructions', action='store_true')
-        show.add_argument('--runtime', choices=('codex', 'claude'), default='codex')
+        show.add_argument('--runtime', choices=('codex', 'claude', 'qwen'), default='codex')
         policy_options(show)
     else:
         check = subs.add_parser('check', help='Preflight committed HEAD for preparation '

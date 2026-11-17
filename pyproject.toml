@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "deepseek-team"
-version = "0.12.0"
-description = "Delegate bounded coding tasks from Codex and/or Claude Code to isolated DeepSeek workers."
+version = "0.13.0"
+description = "Delegate bounded coding tasks from Codex, Claude Code or Qwen (DSH) to isolated DeepSeek workers."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -31,4 +31,4 @@ deepseek-team = "codex_deepseek_team.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-codex_deepseek_team = ["data/*.md", "data/apparmor/*"]
+codex_deepseek_team = ["data/*.md", "data/apparmor/*", "data/dsh-bridge/*"]

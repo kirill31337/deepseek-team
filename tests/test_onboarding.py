@@ -25,7 +25,7 @@ class SetupTests(unittest.TestCase):
         self.codex = self.root / 'codex'
         self.claude = self.root / 'claude'
         environment = mock.patch.dict(os.environ, {
-            'HOME': str(self.root), 'CODEX_HOME': str(self.codex),
+            'HOME': str(self.root), 'DSH_HOME': str(self.root / 'dsh-home'), 'DEEPSEEK_TEAM_DSH_PROFILE': '', 'CODEX_HOME': str(self.codex),
             'CLAUDE_CONFIG_DIR': str(self.claude), 'DEEPSEEK_API_KEY': '',
             'XDG_CONFIG_HOME': str(self.root / 'config'),
         })

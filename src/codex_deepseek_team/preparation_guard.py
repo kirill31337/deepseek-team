@@ -599,21 +599,26 @@ def _check_condition(command: str, path_value: str):
     return {'command': command, 'executable': lookup}
 
 
-def _runtime_plans(runtime, codex, claude, explicit_codex, explicit_claude):
+def _runtime_plans(runtime, codex, claude, explicit_codex, explicit_claude,
+                   qwen='', explicit_qwen=False):
     if runtime == 'codex':
         return [('codex', codex, explicit_codex)]
     if runtime == 'claude':
         return [('claude', claude, explicit_claude)]
+    if runtime == 'qwen':
+        return [('qwen', qwen, explicit_qwen)]
     return [('codex', codex, explicit_codex),
-            ('claude', claude, explicit_claude)]
+            ('claude', claude, explicit_claude),
+            ('qwen', qwen, explicit_qwen)]
 
 
 def _runtime_conditions(runtime, codex, claude, explicit_codex, explicit_claude,
-                        path_value):
+                        path_value, qwen='', explicit_qwen=False):
     unknown = []
     plans = []
     for name, value, explicit in _runtime_plans(
-            runtime, codex, claude, explicit_codex, explicit_claude):
+            runtime, codex, claude, explicit_codex, explicit_claude,
+            qwen, explicit_qwen):
         candidates = []
         if isinstance(value, str) and value:
             separator = os.sep in value or (os.altsep is not None and os.altsep in value)
@@ -890,7 +895,7 @@ def _digest(payload: dict) -> str:
 
 def worker_conditions(source, *, runtime, codex, claude, codex_explicit,
                       claude_explicit, state, declarations=None, environ=None,
-                      copy=None):
+                      copy=None, qwen='', qwen_explicit=False):
     """Fingerprint a managed job before any copy allocation or provider read."""
     env = os.environ if environ is None else environ
     project = _canonical(copy.source if copy is not None else source)
@@ -913,7 +918,8 @@ def worker_conditions(source, *, runtime, codex, claude, codex_explicit,
             unknown.append('source-head')
     path_value = env.get('PATH', '')
     runtimes, runtime_unknown = _runtime_conditions(
-        runtime, codex, claude, codex_explicit, claude_explicit, path_value)
+        runtime, codex, claude, codex_explicit, claude_explicit, path_value,
+        qwen, qwen_explicit)
     unknown.extend(runtime_unknown)
     platform_values = _platform_conditions(path_value)
     if platform_values is None:
